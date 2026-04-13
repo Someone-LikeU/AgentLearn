@@ -8,174 +8,259 @@ import json
 import os
 import subprocess
 import sys
-
+from typing import Any
 from openai import OpenAI
 
-# 创建openai请求客户端
-client = OpenAI(
-	base_url=os.environ.get('OPENAI_BASE_URL'),
-	api_key=os.environ.get("OPENAI_API_KEY")
-)
-# 前提，ollama要是正常运行的状态
 
-# 这个列表是给大模型看的
-tools = [
-	{
-		"type": "function",
-		"function": {
-			"name": "execute_bash",
-			"description": "Execute bash command",
-			"params": {
-				"type": "object",
-				"properties": {"command": {"type": "string"}},
-				"required": ["command"]
-			},
-		},
-	},
-	{
-		"type": "function",
-		"function": {
-			"name": "read_file",
-			"description": "Read a file",
-			"parameters": {
-				"type": "object",
-				"properties": {"path": {"type": "string"}},
-				"required": ["path"]
-			},
-		},
-	},
-	{
-		"type": "function",
-		"function": {
-			"name": "write_file",
-			"description": "Write content to a file",
-			"parameters": {
-				"type": "object",
-				"properties": {
-					"path": {"type": "string"},
-					"content": {"type": "string"},
+# Agent 类定义
+# TODO 这个记忆实现方式很简单，直接写到一个md文件里，更优的做法为放到向量数据库中
+class Agent:
+	def __init__(self, model="qwen3.5:9b"):
+		"""
+		初始化agent对象
+		:param model: 使用什么模型，默认 qwen3.5:9b
+		"""
+		# 创建openai请求客户端
+		# 前提，ollama要是正常运行的状态
+		self.client = OpenAI(
+			base_url=os.environ.get('OPENAI_BASE_URL'),
+			api_key=os.environ.get("OPENAI_API_KEY")
+		)
+		# 可用的工具列表， TODO 这个可以优化为从json文件中load
+		self.tools = [
+			{
+				"type": "function",
+				"function": {
+					"name": "execute_bash",
+					"description": "Execute bash command",
+					"params": {
+						"type": "object",
+						"properties": {"command": {"type": "string"}},
+						"required": ["command"]
+					},
 				},
 			},
-			"required": ["path", "content"]
+			{
+				"type": "function",
+				"function": {
+					"name": "read_file",
+					"description": "Read a file",
+					"parameters": {
+						"type": "object",
+						"properties": {"path": {"type": "string"}},
+						"required": ["path"]
+					},
+				},
+			},
+			{
+				"type": "function",
+				"function": {
+					"name": "write_file",
+					"description": "Write content to a file",
+					"parameters": {
+						"type": "object",
+						"properties": {
+							"path": {"type": "string"},
+							"content": {"type": "string"},
+						},
+					},
+					"required": ["path", "content"]
+				}
+			}
+		]
+
+		# Agent可以调用的工具/方法有哪些，
+		self.available_functions = {
+			"execute_bash": self._execute_bash,
+			"read_file": self._read_file,
+			"write_file": self._write_file
 		}
-	}
-]
 
+		# 记忆文件，记录Agent执行过哪些任务，方便后续追溯
+		self.memory_file = "agent_memory.md"
 
-def execute_bash(command):
-	"""
-	执行bash命令
-	:param command: 命令
-	:return:  无
-	"""
-	result = subprocess.run(command, shell=True, capture_output=True, text=True)
-	return result.stdout + result.stderr
+		# 最大迭代次数，防止某个任务死循环
+		self.MAX_ITERATIONS = 10
 
+		# 使用的模型
+		self.MODEL = os.environ.get("OPENAI_MODEL", model)
 
-def read_file(path):
-	"""
-	读文件
-	:param path: 文件路径
-	:return: 文件内容
-	"""
-	with open(path, 'r') as f:
-		return f.read()
+	def _execute_bash(self, command):
+		"""
+		执行bash命令
+		:param command: 命令行
+		:return:  无
+		"""
+		result = subprocess.run(command, shell=True, capture_output=True, text=True)
+		return result.stdout + result.stderr
 
+	def _read_file(self, path):
+		"""
+		读文件
+		:param path: 文件路径
+		:return: 文件内容
+		"""
+		with open(path, 'r') as f:
+			return f.read()
 
-def write_file(path, content):
-	"""
-	往文件里面写内容
-	:param path: 文件路径
-	:param content: 内容
-	:return:
-	"""
-	with open(path, 'w') as f:
-		f.write(content)
-	return f"write to {path}"
+	def _write_file(self, path, content):
+		"""
+		往文件里面写内容
+		:param path: 文件路径
+		:param content: 内容
+		:return:
+		"""
+		with open(path, 'w') as f:
+			f.write(content)
+		return f"write to {path}"
 
+	def _save_memory(self, task, result):
+		timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+		entry = f"\n## {timestamp}\n**Task:** {task}\n**Result:** {result}\n"
+		try:
+			with open(self.memory_file, 'a') as f:
+				f.write(entry)
+		except Exception as e:
+			print(f"Error in saving memory: {task}, exception: {e}")
 
-# 定义可以调用的工具/方法有哪些，这个dict是给程序看的
-functions = {
-	"execute_bash": execute_bash,
-	"read_file": read_file,
-	"write_file": write_file
-}
+	def _load_memory(self):
+		if not os.path.exists(self.memory_file):
+			print("There is no memory file")
 
-MEMORY_FILE = "agent_memory.md"
+		try:
+			with open(self.memory_file, 'r') as f:
+				content = f.read()
+			lines = content.split("\n")
+			# TODO 这里取后50行有待修改
+			return '\n'.join(lines[-50:]) if len(lines) > 50 else content
+		except Exception as e:
+			print(f"Error in loading memory, exception: {e}")
 
-
-def save_memory(task, result):
-	timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-	entry = f"\n## {timestamp}\n**Task:** {task}\n**Result:** {result}\n"
-	try:
-		with open(MEMORY_FILE, 'a') as f:
-			f.write(entry)
-	except Exception as e:
-		print(f"Error in saving memory: {task}, exception: {e}")
-
-
-def load_memory():
-	if not os.path.exists(MEMORY_FILE):
-		print("There is no memory file")
-
-	try:
-		with open(MEMORY_FILE, 'r') as f:
-			content = f.read()
-		lines = content.split("\n")
-		# TODO 这里取后50行有待修改
-		return '\n'.join(lines[-50:]) if len(lines) > 50 else content
-	except Exception as e:
-		print(f"Error in loading memory, exception: {e}")
-
-
-def agent_run(user_message, max_iteration=10):
-	memory = load_memory()
-	system_prompt = "You are a helpful assistant that can interact with the system. Be concise."
-	# TODO 这里加载记忆的方式比较粗暴
-	if memory:
-		system_prompt += f"\n\nPrevious content:\n{memory}"
-
-	messages = [
-		# system prompt
-		{"role": "system", "content": system_prompt},
-		{"role": "user", "content": user_message}
-	]
-	for i in range(max_iteration):
-		response = client.chat.completions.create(
-			model='qwen3.5:9b',
-			messages=messages,
-			tools=tools,
-			# 还有温度可以设置
+	def _make_plan(self, task):
+		"""
+		将任务拆分成子步骤，调模型
+		:param task: 用户任务描述
+		:return:
+		"""
+		print("[Planning] Breaking down task...")
+		response = self.client.chat.completions.create(
+			model=self.MODEL,
+			messages=[
+				{"role": "system", "content": "You are a task planning assistant. Break down the task into simple, executable steps. Return as JSON array of strings."},
+				{"role": "user", "content": f"Task: {task}"}
+			],
+			response_format={"type": "json_object"}
 		)
-		message = response.choices[0].message
-		messages.append(message)
-		print(f"Step{i + 1}/{max_iteration} messages: {message}")
-		if not message.tool_calls:
-			print(f"Step{i + 1}/{max_iteration} No tool calls")
-			return message.content
-		for tool_call in message.tool_calls:
-			name = tool_call.function.name
-			args = json.loads(tool_call.function.arguments)
-			print(f"Step{i + 1}/{max_iteration}[Tool] {name}: {args}")
-			if name not in functions:
-				result = f"Error: Unknown tool '{name}'"
+		try:
+			plan_data = json.loads(response.choices[0].message.content)
+			if isinstance(plan_data, dict):
+				steps = plan_data.get("steps", [task])
+			elif isinstance(plan_data, list):
+				steps = plan_data
 			else:
-				result = functions[name](**args)
-			messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": result})
+				steps = [task]
+			print(f"[Plan] {len(steps)} steps created")
+			for i, step in enumerate(steps, 1):
+				print(f"{i}: {step}")
+			return steps
+		except Exception as e:
+			# 异常情况直接返回这个任务,至少保证流程能运行下去
+			print(f"[Plan] Failed to parse steps, returning original task {task}, exception {e}")
+			return [task]
 
-	return "Max iterations reached"
+	def _parse_tool_arguments(self, raw_arguments: str) -> dict[str, Any]:
+		"""
+		解析工具调用的参数
+		:param raw_arguments: 参数字符串
+		:return: 解析成字典
+		"""
+		if not raw_arguments:
+			return {}
+		try:
+			parsed = json.loads(raw_arguments)
+			return parsed if isinstance(parsed, dict) else {}
+		except json.JSONDecodeError as error:
+			return {"_argument_error": f"Invalid JSON arguments: {error}"}
+
+	def _run_agent_step(self, task, messages):
+		"""
+		拆分步骤执行任务
+		:param task: 	子任务
+		:param messages:  消息
+		:return: 消息内容，执行动作列表，消息列表
+		"""
+		messages.append({"role": "user", "content": task})
+		# 记录迭代过程中执行的动作
+		actions = []
+		for _ in range(self.MAX_ITERATIONS):
+			response = self.client.chat.completions.create(
+				model=self.MODEL,
+				messages=messages,
+				tools=self.tools
+			)
+			message = response.choices[0].message
+			messages.append(message)
+			# 如果某一个iter时不是工具调用，说明该任务结束了，返回消息内容，中间行动，消息列表
+			if not message.tool_calls:
+				return message.content, actions, messages
+
+			for tool_call in message.tool_calls:
+				function_payload = getattr(tool_call, "function", None)
+				if function_payload is None:
+					continue
+				function_name = str(getattr(function_payload, "name", ""))
+				raw_arguments = str(getattr(function_payload, "arguments", ""))
+				function_args = self._parse_tool_arguments(raw_arguments)
+				print(f"[Tool] {function_name}({function_args})")
+				func_impl = self.available_functions.get(function_name)
+				if func_impl is None:
+					function_response = f"Error: Unknown tool '{function_name}'"
+				elif "_argument_error" in function_args:
+					function_response = f"Error: {function_args['_argument_error']}"
+				else:
+					function_response = func_impl(**function_args)
+					actions.append({"tool": function_name, "args": function_args})
+				messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": function_response})
+
+		# 如果超过最大迭代次数，返回
+		return "Max iterations reached", actions, messages
+
+	def agent_run(self, task, use_plan=True):
+		"""
+		启动agent运行，入口
+		:param task 用户输入的任务
+		:param use_plan:  启动规划模式，默认True，# TODO 这个参数要用户给，这里比较挫，后面会优化
+		:return:
+		"""
+		# 先加载存在磁盘的长期记忆
+		memory = self._load_memory()
+		system_prompt = "You are a helpful assistant that can interact with the system. Be concise."
+		if memory:
+			system_prompt += f"\n\nPrevious content:\n{memory}"
+		messages = [{"role": "system", "content": system_prompt}]
+		if use_plan:
+			steps = self._make_plan(task)
+		else:
+			steps = [task]
+		all_results = []
+		total_steps = len(steps)
+		for i, step in enumerate(steps, 1):
+			print(f"\n[Step {i}/{total_steps}]: {step}")
+			result, actions, messages = self._run_agent_step(step, messages)
+			all_results.append(result)
+			print(f"\n{result}")
+
+		final_result = "\n".join(all_results)
+		self._save_memory(task, final_result)
+		return final_result
 
 
 if __name__ == '__main__':
-	# response = client.chat.completions.create(
-	#     model = 'qwen3.5:9b',
-	#     messages = [
-	#         {"role": "system", "content": "你是一个智能助手。"},
-	#         {"role": "user", "content": "你是谁？"}
-	#     ]
-	# )
-	# message = response.choices[0].message
-	# print(type(message))
-	# print(message)
-	task = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else "你好"
-	print(agent_run(task))
+	myAgent = Agent()
+	use_plan = "--plan" in sys.argv
+	if len(sys.argv) < 2:
+		print("Usage: python 02-memory/agent-memory.py [--plan] 'your task here'")
+		print("  --plan: Enable task planning and decomposition")
+		sys.exit(1)
+	task = " ".join(sys.argv[1:])
+	myAgent.agent_run(task, use_plan=use_plan)
