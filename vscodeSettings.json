@@ -1,0 +1,15 @@
+{
+    "claudeCode.disableLoginPrompt": true,
+    "claudeCode.environmentVariables": [
+        {
+            "name": "ANTHROPIC_AUTH_TOKEN",
+            "value": "ak_2UR4m62oO3wH6k27l50Bv3zU54045"
+        },
+        {
+            "name": "ANTHROPIC_BASE_URL",
+            "value": "http://127.0.0.1:8000"
+        }
+    ],
+    "editor.fontSize": 20,
+    "window.zoomLevel": 1.6
+}
