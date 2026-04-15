@@ -1,0 +1,17 @@
+{
+    "env": {
+      "NO_PROXY": "localhost,127.0.0.1,.rnd.huawei.com",
+      "no_proxy": "localhost,127.0.0.1,.rnd.huawei.com",
+      "ANTHROPIC_AUTH_TOKEN": "ak_2UR4m62oO3wH6k27l50Bv3zU54045",
+      "ANTHROPIC_BASE_URL": "http://127.0.0.1:8000",
+      "NODE_TLS_REJECT_UNAUTHORIZED": "0",
+      "ANTHROPIC_MODEL": "LongCat-Flash-Chat",
+      "ANTHROPIC_SMALL_FAST_MODEL": "LongCat-Flash-Chat",
+      "ANTHROPIC_DEFAULT_SONNET_MODEL": "LongCat-Flash-Chat",
+      "ANTHROPIC_DEFAULT_OPUS_MODEL": "LongCat-Flash-Chat"
+    },
+    "permissions": {
+        "allow": [],
+        "deny": []
+      }
+  }
