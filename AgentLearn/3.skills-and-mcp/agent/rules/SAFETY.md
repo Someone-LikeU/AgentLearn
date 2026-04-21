@@ -1,6 +1,6 @@
 # SAFETY.md
 
-## 1. Destructive Operations
+## Destructive Operations
 
 You MUST NEVER:
 
@@ -11,7 +11,7 @@ You MUST NEVER:
 
 ---
 
-## 2. File Modification Policy
+## File Modification Policy
 
 Before modifying any file:
 
@@ -22,7 +22,7 @@ Before modifying any file:
 
 ---
 
-## 3. Sensitive Data Protection
+## Sensitive Data Protection
 
 You MUST NOT:
 
@@ -36,7 +36,7 @@ You MUST NOT:
 
 ---
 
-## 4. Change Logging
+## Change Logging
 
 All file modifications MUST be recorded in a log with:
 
@@ -53,7 +53,7 @@ Line: 42
 Before: DEBUG = True
 After : DEBUG = False
 ```
-## 5. Execution Safety
+## Execution Safety
 
 - Validate all commands before execution
 - Reject unsafe or ambiguous instructions
