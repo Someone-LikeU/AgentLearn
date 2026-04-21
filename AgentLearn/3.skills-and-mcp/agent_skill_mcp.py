@@ -29,6 +29,10 @@ class Agent:
 			base_url=os.environ.get('OPENAI_BASE_URL') if base_url is None else base_url,
 			api_key=os.environ.get("OPENAI_API_KEY") if api_key is None else api_key
 		)
+		
+		# MCP服务器
+		self.MCP_SERVER = None
+		
 		# 可用的工具列表
 		self.base_tools = self._load_tools()
 		print(f"[Tool] loaded {len(self.base_tools)} base tools")
@@ -76,8 +80,7 @@ class Agent:
 		# skills目录
 		self.SKILLS_DIR = "./agent/skills"
 
-		# MCP服务器
-		self.MCP_SERVER = None
+
 
 	def _load_tools(self):
 		"""
@@ -371,7 +374,7 @@ class Agent:
 			response = self.client.chat.completions.create(
 				model=self.MODEL,
 				messages=messages,
-				tools=self.tools,
+				tools=self.all_tools,
 				temperature=self.temperature
 			)
 			message = response.choices[0].message
