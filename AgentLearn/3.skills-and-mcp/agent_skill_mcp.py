@@ -30,21 +30,29 @@ class Agent:
 			api_key=os.environ.get("OPENAI_API_KEY") if api_key is None else api_key
 		)
 		# 可用的工具列表
-		self.tools = self._load_tools()
+		self.base_tools = self._load_tools()
+		print(f"[Tool] loaded {len(self.base_tools)} base tools")
+		self.mcp_tools = self._load_mcp_tools()
+		print(f"[Tool] loaded {len(self.mcp_tools)} mcp tools")
+		self.all_tools = self.base_tools + self.mcp_tools
 
 		# Agent可以调用的工具/方法有哪些，
 		# TODO 有mcp server获取到之后怎么动态的添加到这个列表里
 		self.available_functions = {
 			"execute_bash": self._execute_bash,
 			"read_file": self._read_file,
-			"write_file": self._write_file
+			"write_file": self._write_file,
+			"edit": self._edit,
+			"glob": self._glob,
+			"grep": self._grep,
+			"plan": self._make_plan
 		}
 
 		# 记忆文件，记录Agent执行过哪些任务，方便后续追溯
 		self.memory_file = "agent_memory.md"
 
 		# 最大迭代次数，防止某个任务死循环
-		self.MAX_ITERATIONS = 10
+		self.MAX_ITERATIONS = 100
 
 		# 使用的模型
 		self.MODEL = model
@@ -52,22 +60,22 @@ class Agent:
 
 		# 温度
 		self.temperature = temperature
-		
+
 		# 是否规划模式
 		self.plan_mode = False
-		
+
 		# 当前任务的plan列表
 		self.current_plan = []
-		
+
 		# 记忆文件， TODO 后续修改成从向量数据库中找
-		self.MEMORY_FILE = "./agent_memory.md"
-		
+		self.MEMORY_FILE = "./agent/memory.md"
+
 		# 规则文件
 		self.RULES_DIR = "./agent/rules"
-		
+
 		# skills目录
 		self.SKILLS_DIR = "./agent/skills"
-		
+
 		# MCP服务器
 		self.MCP_SERVER = None
 
@@ -84,7 +92,7 @@ class Agent:
 			with open(tools_path, "r", encoding="utf-8") as f:
 				tools += json.load(f)
 				print(f"{len(tools)} local tools loaded")
-			
+
 			# TODO 从mcp服务器获取可用的工具列表
 			tools += self._load_mcp_from_server()
 			return tools
@@ -99,12 +107,12 @@ class Agent:
 		:return:
 		"""
 		mcp_tools = []
-		
+
 		print("loading mcp tools from local and remote mcp server")
-		
+
 		print(f"{len(mcp_tools)} mcp tools loaded")
 		return mcp_tools
-	
+
 	def _execute_bash(self, command):
 		"""
 		执行bash命令
@@ -118,7 +126,7 @@ class Agent:
 			return stdout + stderr
 		except Exception as e:
 			print(f"Exception when executing command '{command}': {str(e)}")
-	
+
 	def _decode_subprocess_result(self, result: CompletedProcess[bytes] | CompletedProcess[Any]):
 		"""
 		decode subprocess执行后的结果
@@ -136,10 +144,10 @@ class Agent:
 		else:
 			# 所有编码都失败，使用 replace 强制解码
 			print("all encoding failed, try to use replace")
-			stdout = result.stdout.decode('utf-8', errors = 'replace')
-			stderr = result.stderr.decode('utf-8', errors = 'replace')
+			stdout = result.stdout.decode('utf-8', errors='replace')
+			stderr = result.stderr.decode('utf-8', errors='replace')
 		return stdout, stderr
-	
+
 	def _read_file(self, path, offset=None, limit=None):
 		"""
 		读文件
@@ -151,11 +159,11 @@ class Agent:
 				lines = f.readlines()
 			start = offset if offset else 0
 			end = start + limit if limit else len(lines)
-			numbered = [f"{i+1:4d} {line}" for i, line in enumerate(lines[start:end], start)]
+			numbered = [f"{i + 1:4d} {line}" for i, line in enumerate(lines[start:end], start)]
 			return ''.join(numbered)
 		except Exception as e:
 			return f"Error in reading file: {str(e)}"
-	
+
 	def _write_file(self, path, content):
 		"""
 		往文件里面写内容
@@ -169,7 +177,7 @@ class Agent:
 			return f"Successfully wrote to {path}"
 		except Exception as e:
 			return f"Error in writing file: {str(e)}"
-	
+
 	def _edit(self, path, old_string, new_string):
 		"""
 		编辑文件
@@ -179,7 +187,7 @@ class Agent:
 		:return:
 		"""
 		try:
-			with open(path, 'r', encoding = 'utf-8') as f:
+			with open(path, 'r', encoding='utf-8') as f:
 				content = f.read()
 			if content.count(old_string) != 1:
 				return f"Error: old_string must appear exactly once"
@@ -189,23 +197,24 @@ class Agent:
 			return f"Successfully edited {path}"
 		except Exception as e:
 			return f"Error: {str(e)}"
-	
+
 	def _glob(self, pattern):
 		try:
-			files = glob_module.glob(pattern, recursive = True)
-			files.sort(key = lambda x: os.path.getmtime(x), reverse = True)
+			files = glob_module.glob(pattern, recursive=True)
+			files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
 			return '\n'.join(files) if files else "No files found"
 		except Exception as e:
 			return f"Exception when glob: {str(e)}"
-		
+
 	def _grep(self, pattern, path="."):
 		try:
-			result = subprocess.run(f"grep -r '{pattern}' {path}", shell = True, capture_output = True, text = True, timeout = 30)
+			result = subprocess.run(f"grep -r '{pattern}' {path}", shell=True, capture_output=True, text=True,
+									timeout=30)
 			stdout, _ = self._decode_subprocess_result(result)
 			return stdout if stdout else "No matches found"
 		except Exception as e:
 			return f"Exception when grep: {str(e)}"
-	
+
 	def _save_memory(self, task, result):
 		"""
 		保存长期记忆，往磁盘里写
@@ -217,7 +226,7 @@ class Agent:
 		timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 		entry = f"\n## {timestamp}\n**Task:** {task}\n**Result:** {result}\n"
 		try:
-			with open(self.memory_file, 'a', encoding = 'utf-8') as f:
+			with open(self.memory_file, 'a', encoding='utf-8') as f:
 				f.write(entry)
 		except Exception as e:
 			print(f"Error in saving memory: {task}, exception: {e}")
@@ -228,7 +237,7 @@ class Agent:
 			return ""
 
 		try:
-			with open(self.memory_file, 'r', encoding = 'utf-8') as f:
+			with open(self.memory_file, 'r', encoding='utf-8') as f:
 				content = f.read()
 				lines = content.split("\n")
 				# TODO 取记忆的逻辑需要改成从向量数据库里获取和当前任务相关的top n条记忆
@@ -248,9 +257,9 @@ class Agent:
 		print("[Planning] Breaking down task {}".format(task))
 		response = self.client.chat.completions.create(
 			model=self.MODEL,
-			messages = [
+			messages=[
 				{
-					"role"   : "system",
+					"role": "system",
 					"content": "You are a task planning assistant. Break down the task into simple, executable steps. Return as JSON array of strings. For example, you should return like {\"steps\" : [ \"step 1: dosomething\",\"step 2: dosomething\"]}"
 				},
 				{"role": "user", "content": f"Task: {task}"}
@@ -301,14 +310,14 @@ class Agent:
 			return rules
 		try:
 			for rule_file in Path(self.RULES_DIR).glob("*.md"):
-				with open(rule_file, 'r', encoding = 'utf-8') as f:
-					rules.append(f"# {rule_file.stem}\n{f.read()}")
-			
+				with open(rule_file, 'r', encoding='utf-8') as f:
+					rules.append(f.read())
+
 			return "\n\n".join(rules) if rules else []
 		except Exception as e:
 			print(f"Error in loading rules: {e}")
 			return []
-			
+
 	def _load_skill_meta_infos(self):
 		"""
 		加载skill元信息，有需要时再去加载完整的那个skill
@@ -327,13 +336,15 @@ class Agent:
 		except Exception as e:
 			print(f"Error in loading skills: {e}")
 			return []
-	
+
 	def _load_skill_by_name(self, skill_name):
 		"""
 		根据skill名称加载完整的skill
 		:param skill_name: skill名称
 		:return:
 		"""
+		pass
+
 		# TODO 实现根据名称加载完整skill
 
 	def _load_mcp_tools(self):
@@ -346,17 +357,16 @@ class Agent:
 			return []
 		# TODO 实现调MCP server地址获得mcp工具列表，还要实现一个mcp client来执行具体的工具逻辑
 		mcp_tools = []
-		
+
 		return mcp_tools
-		
-	def _run_agent_step(self, task, messages):
+
+	def _run_agent_step(self, messages, tools):
 		"""
 		拆分步骤执行任务
-		:param task: 	子任务
+		:param tools: 	工具列表
 		:param messages:  消息
-		:return: 消息内容，执行动作列表，消息列表
+		:return: 执行结果
 		"""
-		actions = []
 		for _ in range(self.MAX_ITERATIONS):
 			response = self.client.chat.completions.create(
 				model=self.MODEL,
@@ -368,8 +378,8 @@ class Agent:
 			messages.append(message)
 			# 如果某一个iter时不是工具调用，说明该任务结束了，返回消息内容，中间行动，消息列表
 			if not message.tool_calls:
-				return message.content, actions, messages
-
+				return message.content, messages
+			# 遍历工具列表
 			for tool_call in message.tool_calls:
 				function_payload = getattr(tool_call, "function", None)
 				if function_payload is None:
@@ -377,55 +387,66 @@ class Agent:
 				function_name = str(getattr(function_payload, "name", ""))
 				raw_arguments = str(getattr(function_payload, "arguments", ""))
 				function_args = self._parse_tool_arguments(raw_arguments)
-				print(f"[Tool call] {function_name}({function_args})")
+				print(f"[Tool call] {function_name}(params: {function_args})")
 				function_impl = self.available_functions.get(function_name)
-				if function_impl is None:
-					function_response = f"Error: Unknown tool '{function_name}'"
+				if function_impl is not None:
+					function_response = function_impl(**function_args)
 				elif "_argument_error" in function_args:
 					function_response = f"Error: {function_args['_argument_error']}"
 				elif function_name == "make_plan" and function_impl is not None:
+					# 如果是plan模式
 					self.plan_mode = True
 					function_response = function_impl(**function_args)
 					messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": function_response})
 					if self.current_plan:
 						results = []
+						plan_size = len(self.current_plan)
 						for i, step in enumerate(self.current_plan, 1):
-							pass
-						# TODO 搞清楚这里的实现逻辑，以及实现其他几个地方提到的MCP和Skill的实现
+							print(f"\n[Step {i}/{plan_size}]: {step}")
+							messages.append({"role": "user", "content": step})
+							result, messages = self._run_agent_step(messages, [t for t in tools if
+																			   t["function"]["name"] != "make_plan"])
+							results.append(result)
+							print(f"\n{result}")
+						self.plan_mode = False
+						self.current_plan = []
+						return "\n".join(results), messages
 				else:
-					function_response = function_impl(**function_args)
-					actions.append({"tool": function_name, "args": function_args})
+					function_response = f"Error: Unknown tool '{function_name}'"
 				messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": function_response})
 
 		# 如果超过最大迭代次数，返回
-		return "Max iterations reached", actions, messages
+		return "Max iterations reached", messages
 
-	def agent_run(self, task, use_plan=True):
+	def agent_run(self, task):
 		"""
 		启动agent运行，入口
 		:param task 用户输入的任务
-		:param use_plan:  启动规划模式，默认True，# TODO 这个参数要用户给，这里比较挫，后面会优化
 		:return:
 		"""
+		print("[Init] Initializing agent..")
 		# 先加载存在磁盘的长期记忆
 		memory = self._load_memory()
-		system_prompt = "You are a helpful assistant that can interact with the system. Be concise. You can't execute dangerous command directly such as 'rm -rf *', ':{:|:&};:' and so on"
+		rules = self._load_rules()
+		skills = self._load_skill_meta_infos()
+		mcp_tools = self._load_mcp_tools()
+		print(f"[MCP] Got {len(mcp_tools)} mcp tools.")
+		# 构造系统prompt，base prompt + rules + memory + skills + tools
+		# TODO 提示词加怎么让它用skill
+		system_prompt = ["You are an interactive agent that helps users with daily tasks or software engineering tasks. Use the instructions below and the tools available to you to assist the user."]
+		if rules:
+			system_prompt.append(f"\n# Rules\n{rules}")
+			print(f"[Rules] {len(rules.split('# '))} rule files loaded.")
+		if skills:
+			system_prompt.append(f"\n# Skills\n{skills}\n" + "\n".join([f"- {skill['name']}: {skill.get('description', '')}" for skill in skills]))
+			print(f"[Skills] {len(skills)} skill files loaded.")
+		if self.all_tools:
+			print(f"[Tools] {len(self.all_tools)} tools loaded.")
 		if memory:
-			system_prompt += f"\n\nPrevious content:\n{memory}"
-		messages = [{"role": "system", "content": system_prompt}]
-		if use_plan:
-			steps = self._make_plan(task)
-		else:
-			steps = [task]
-		all_results = []
-		total_steps = len(steps)
-		for i, step in enumerate(steps, 1):
-			print(f"\n[Step {i}/{total_steps}]: {step}")
-			result, actions, messages = self._run_agent_step(step, messages)
-			all_results.append(result)
-		print(f"\n{result}")
-
-		final_result = "\n".join(all_results)
+			system_prompt.append(f"\n# Previous context\n{memory}")
+		messages = [{"role": "system", "content": "\n".join(system_prompt)}, {"role": "user", "content": task}]
+		final_result, messages = self._run_agent_step(messages, self.all_tools)
+		print(f"\nFinal result: {final_result}")
 		self._save_memory(task, final_result)
 		return final_result
 
