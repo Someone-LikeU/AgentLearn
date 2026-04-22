@@ -45,5 +45,6 @@ def openRouter_format():
 
 if __name__ == '__main__':
 	openRouter_format()
+	# codex在线 https://chatgpt.com/codex/cloud
 
 
