@@ -12,3 +12,4 @@ The following outlines the user's personal preferences and habits. These should 
 - Enjoys movies in the genres of mystery, science fiction, and thriller
 - Prefers using Python over Java
 - Enjoys exploring and trying a wide variety of foods
+- Resident in Shanghai
