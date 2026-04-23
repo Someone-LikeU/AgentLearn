@@ -1,16 +1,21 @@
 # encoding: utf-8
-# @Time    : 2026/04/22 00:00
-import datetime
+# @Time    : 2026/04/22
 import json
-import re
+import ssl
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
+# 禁用 SSL 证书验证
+ssl._create_default_https_context = ssl._create_unverified_context
+
 
 @dataclass
 class MCPTool:
+	"""
+	封装一个MCP工具类
+	"""
 	name: str
 	description: str
 	parameters: dict[str, Any]
@@ -18,8 +23,11 @@ class MCPTool:
 
 
 class MCPToolsRegistry:
+	"""
+	MCP 工具注册、管理中心
+	"""
 	def __init__(self):
-		self._station_code_cache: dict[str, str] | None = None
+		# 城市编码缓存
 		self._city_code_cache: dict[str, str] = {
 			"北京": "BJS",
 			"上海": "SHA",
@@ -28,31 +36,54 @@ class MCPToolsRegistry:
 			"成都": "CTU",
 			"杭州": "HGH",
 		}
+		# 工具列表
 		self._tools: dict[str, MCPTool] = {}
+		# 注册工具
 		self._register_tools()
 
 	def _http_get_json(self, url: str, params: dict[str, Any] | None = None, headers: dict[str, str] | None = None):
+		"""
+		http请求得到json响应
+		:param url: 地址
+		:param params: 参数
+		:param headers: headers
+		:return:
+		"""
 		query = ""
 		if params:
 			query = urllib.parse.urlencode(params)
 		full_url = f"{url}?{query}" if query else url
 		request = urllib.request.Request(full_url, headers=headers or {})
 		with urllib.request.urlopen(request, timeout=20) as response:
-			body = response.read().decode("utf-8")
+			# 使用"utf-8-sig"解码解决处理不了BOM的问题
+			body = response.read().decode("utf-8-sig")
+			if not body:
+				raise ValueError(f"Empty response from {url}")
 			return json.loads(body)
 
 	def _http_get_text(self, url: str, params: dict[str, Any] | None = None):
+		"""
+		http请求得到文本响应
+		:param url: 地址
+		:param params: 参数
+		:return:
+		"""
 		query = ""
 		if params:
 			query = urllib.parse.urlencode(params)
 		full_url = f"{url}?{query}" if query else url
 		with urllib.request.urlopen(full_url, timeout=20) as response:
-			return response.read().decode("utf-8")
+			return response.read().decode("utf-8-sig")
 
 	def _register_tools(self):
+		"""
+		注册可用的工具
+		:return:
+		"""
+		# 查询某城市天气
 		self._tools["query_weather"] = MCPTool(
 			name="query_weather",
-			description="查询某个城市未来天气，days默认15天，最大16天。",
+			description="当用户任务可能涉及到需要查询天气时，调用该工具，例如'帮我规划未来3天假期去北京的旅游行程'、'明天需不需要穿羽绒服'等。该工具查询某个城市的未来天气，days参数默认15天，最大16天。",
 			parameters={
 				"type": "object",
 				"properties": {
@@ -63,23 +94,10 @@ class MCPToolsRegistry:
 			},
 			handler=self.query_weather,
 		)
-		self._tools["query_train_tickets"] = MCPTool(
-			name="query_train_tickets",
-			description="调用12306查询火车票余票信息。",
-			parameters={
-				"type": "object",
-				"properties": {
-					"from_city": {"type": "string", "description": "出发城市，如北京"},
-					"to_city": {"type": "string", "description": "到达城市，如上海"},
-					"date": {"type": "string", "description": "出发日期，格式YYYY-MM-DD"},
-				},
-				"required": ["from_city", "to_city", "date"],
-			},
-			handler=self.query_train_tickets,
-		)
+		# 机票查询工具
 		self._tools["query_flight_tickets"] = MCPTool(
 			name="query_flight_tickets",
-			description="调用携程公开接口查询机票价格趋势（最低价接口）。",
+			description="该工具调用携程公开接口查询机票价格趋势（最低价接口）。当用户任务可能涉及到查询机票信息时，调用该工具，例如'帮我规划未来5天假期去北京的旅游行程'、'未来10天有没有去北京的低于800的机票？'等。",
 			parameters={
 				"type": "object",
 				"properties": {
@@ -93,18 +111,34 @@ class MCPToolsRegistry:
 		)
 
 	def list_tools(self) -> list[dict[str, Any]]:
+		"""
+		返回可用工具列表，按照OpenAI的工具调用格式
+		:return:
+		"""
 		return [
 			{"name": tool.name, "description": tool.description, "parameters": tool.parameters}
 			for tool in self._tools.values()
 		]
 
 	def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+		"""
+		工具调用
+		:param name: 工具名
+		:param arguments: 参数列表
+		:return:
+		"""
 		tool = self._tools.get(name)
 		if tool is None:
 			raise ValueError(f"Unknown MCP tool '{name}'")
 		return tool.handler(**arguments)
 
 	def query_weather(self, city: str, days: int = 15) -> dict[str, Any]:
+		"""
+		调API查询天气
+		:param city: 	城市名
+		:param days: 	天数
+		:return:
+		"""
 		days = max(1, min(days, 16))
 		geo_data = self._http_get_json(
 			"https://geocoding-api.open-meteo.com/v1/search",
@@ -149,73 +183,15 @@ class MCPToolsRegistry:
 			"forecast": forecast,
 		}
 
-	def _load_station_codes(self) -> dict[str, str]:
-		if self._station_code_cache is not None:
-			return self._station_code_cache
-		text = self._http_get_text("https://kyfw.12306.cn/otn/resources/js/framework/station_name.js")
-		entries = re.findall(r"@([^|]+)\|([^|]+)\|([^|]+)\|([^|]+)\|", text)
-		mapping: dict[str, str] = {}
-		for pinyin, zh_name, code, _ in entries:
-			mapping[zh_name] = code
-			mapping[pinyin] = code
-			mapping[code] = code
-		self._station_code_cache = mapping
-		return mapping
-
-	def query_train_tickets(self, from_city: str, to_city: str, date: str) -> dict[str, Any]:
-		datetime.datetime.strptime(date, "%Y-%m-%d")
-		stations = self._load_station_codes()
-		from_station = stations.get(from_city)
-		to_station = stations.get(to_city)
-		if not from_station or not to_station:
-			return {
-				"error": "无法识别城市/车站名称，请尝试中文站名（如北京、上海）",
-				"from_city": from_city,
-				"to_city": to_city,
-			}
-		payload = self._http_get_json(
-			"https://kyfw.12306.cn/otn/leftTicket/query",
-			{
-				"leftTicketDTO.train_date": date,
-				"leftTicketDTO.from_station": from_station,
-				"leftTicketDTO.to_station": to_station,
-				"purpose_codes": "ADULT",
-			},
-		)
-		results = payload.get("data", {}).get("result", [])
-		tickets = []
-		for row in results[:20]:
-			parts = row.split("|")
-			if len(parts) < 33:
-				continue
-			tickets.append(
-				{
-					"train_no": parts[3],
-					"from_station_code": parts[6],
-					"to_station_code": parts[7],
-					"depart_time": parts[8],
-					"arrive_time": parts[9],
-					"duration": parts[10],
-					"business_seat": parts[32],
-					"first_class": parts[31],
-					"second_class": parts[30],
-					"soft_sleep": parts[23],
-					"hard_sleep": parts[28],
-					"hard_seat": parts[29],
-					"no_seat": parts[26],
-				}
-			)
-		return {
-			"date": date,
-			"from_city": from_city,
-			"to_city": to_city,
-			"count": len(tickets),
-			"tickets": tickets,
-		}
-
 	def _resolve_ctrip_city_code(self, city: str) -> str | None:
+		"""
+		处理城市编码，用于查询机票
+		:param city: 城市名
+		:return: 编码
+		"""
 		if city in self._city_code_cache:
 			return self._city_code_cache[city]
+		# 尝试解析非缓存城市然后加入缓存
 		payload = self._http_get_json(
 			"https://flights.ctrip.com/international/search/api/poi/getPoiSuggest",
 			{"keyword": city},
@@ -228,6 +204,13 @@ class MCPToolsRegistry:
 		return None
 
 	def query_flight_tickets(self, from_city: str, to_city: str, direct: bool = False) -> dict[str, Any]:
+		"""
+		查询航班信息
+		:param from_city: 出发城市
+		:param to_city: 到达城市
+		:param direct: 是否直飞，默认False
+		:return:
+		"""
 		from_code = self._resolve_ctrip_city_code(from_city)
 		to_code = self._resolve_ctrip_city_code(to_city)
 		if not from_code or not to_code:
