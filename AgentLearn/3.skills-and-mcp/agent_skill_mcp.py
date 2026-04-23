@@ -9,6 +9,7 @@ from pathlib import Path
 from subprocess import CompletedProcess
 from typing import Any
 
+from matplotlib.style.core import available
 from openai import OpenAI
 
 from mcp_client import MCPClient
@@ -22,8 +23,10 @@ class Agent:
 			base_url=os.environ.get("OPENAI_BASE_URL") if base_url is None else base_url,
 			api_key=os.environ.get("OPENAI_API_KEY") if api_key is None else api_key,
 		)
+		# 记忆文件
+		self.memory_file = ".agent/memory.md"
 
-		self.memory_file = "agent_memory.md"
+		# 最大迭代次数
 		self.MAX_ITERATIONS = 100
 		self.MODEL = model
 		self.temperature = temperature
@@ -32,7 +35,10 @@ class Agent:
 		self.RULES_DIR = "./agent/rules"
 		self.SKILLS_DIR = "./agent/skills"
 
+		# 本地工具
 		self.local_tools = self._load_local_tools()
+
+		# 本地可用的工具字典
 		self.local_functions = {
 			"execute_bash": self._execute_bash,
 			"read_file": self._read_file,
@@ -49,26 +55,38 @@ class Agent:
 
 		self.available_functions: dict[str, Any] = {}
 		self.available_functions.update(self.local_functions)
+		# 动态扩充可用买mcp工具列表
 		for tool in self.mcp_tools:
 			tool_name = tool["function"]["name"]
 			self.available_functions[tool_name] = self._make_mcp_executor(tool_name)
 
+		# 所有可用工具列表
 		self.all_tools = self.local_tools + self.mcp_tools
 
 	def _make_mcp_executor(self, tool_name: str):
+		"""为MCP工具生成执行器，就是调用mcp客户端的call_tool方法"""
 		def _executor(**kwargs):
 			return self.mcp_client.call_tool(tool_name, kwargs)
 
 		return _executor
 
 	def _load_local_tools(self) -> list[dict[str, Any]]:
+		"""
+		加载本地工具列表
+		:return:
+		"""
 		tools_path = os.path.join(os.path.dirname(__file__), "local_tools.json")
 		with open(tools_path, "r", encoding="utf-8") as f:
 			return json.load(f)
 
 	def _load_mcp_tools(self) -> list[dict[str, Any]]:
+		"""
+		加载远端可用mcp工具列表
+		:return:
+		"""
 		mcp_tools = self.mcp_client.list_tools()
 		tools_in_openai_format = []
+		# 按OpenAI的工具格式添加
 		for tool in mcp_tools:
 			tools_in_openai_format.append(
 				{
@@ -164,7 +182,7 @@ class Agent:
 			messages=[
 				{
 					"role": "system",
-					"content": "You are a task planning assistant. Break down the task into simple steps as JSON object with key steps.",
+					"content": "You are a task planning assistant. Break down the task into simple steps as JSON object with key 'steps'.",
 				},
 				{"role": "user", "content": f"Task: {task}"},
 			],
@@ -198,12 +216,30 @@ class Agent:
 		return "\n\n".join(rules) if rules else []
 
 	def _load_skill_meta_infos(self):
+		import yaml
 		skills = []
 		if not os.path.exists(self.SKILLS_DIR):
 			return []
-		for skill_file in Path(self.SKILLS_DIR).glob("*.json"):
-			with open(skill_file, "r", encoding="utf-8") as f:
-				skills.append(json.load(f))
+		for item in os.listdir(self.SKILLS_DIR):
+			skill_dir = os.path.join(self.SKILLS_DIR, item)
+			if not os.path.isdir(skill_dir):
+				continue
+			skill_md_file = os.path.join(skill_dir, "SKILL.md")
+			if not os.path.exists(skill_md_file):
+				continue
+			with open(skill_md_file, "r", encoding="utf-8") as f:
+				content = f.read()
+			# 解析 YAML frontmatter
+			if content.startswith("---"):
+				frontmatter_end = content.find("---", 3)
+				if frontmatter_end != -1:
+					frontmatter = content[3:frontmatter_end].strip()
+					meta = yaml.safe_load(frontmatter)
+					if meta and "name" in meta:
+						skills.append({
+							"name": meta.get("name"),
+							"description": meta.get("description", ""),
+						})
 		return skills
 
 	def _run_agent_step(self, messages, tools):
@@ -264,11 +300,18 @@ class Agent:
 		return "Max iterations reached", messages
 
 	def agent_run(self, task):
+		"""
+		Agent运行入口
+		TODO 把memory，rules这些提一个单独的类或者方法，context_builder
+		:param task: 用户任务
+		:return: 执行任务结果
+		"""
+		# 加载历史记忆、规则、技能
 		memory = self._load_memory()
 		rules = self._load_rules()
 		skills = self._load_skill_meta_infos()
 		system_prompt = [
-			"You are an interactive agent that helps users with daily tasks or software engineering tasks."
+			"You are an interactive agent that helps users with daily tasks or software engineering tasks. Use the instructions below and the tools available to you to assist the user."
 		]
 		if rules:
 			system_prompt.append(f"\n# Rules\n{rules}")
@@ -278,12 +321,14 @@ class Agent:
 			)
 		if memory:
 			system_prompt.append(f"\n# Previous context\n{memory}")
+		# 拼接完整上下文
 		messages = [{"role": "system", "content": "\n".join(system_prompt)}, {"role": "user", "content": task}]
 		final_result, _ = self._run_agent_step(messages, self.all_tools)
 		self._save_memory(task, final_result)
 		return final_result
 
 	def close(self):
+		# 关闭mcp客户端，TODO 后续修改为在agent loop前后进行打开和关闭，不要让外界感知
 		self.mcp_client.close()
 
 
@@ -294,3 +339,23 @@ if __name__ == "__main__":
 		my_agent.agent_run(task)
 	finally:
 		my_agent.close()
+
+	# fc-90a9530d614f483f8a26d7f427be688d firecrawl秘钥
+	"""
+	技能 (强制)
+回复前：扫描<available_skills><description>条目。
+·如果恰好一个技能明显适用：用 read 读取其位于<location>的SKILL.md，然后遵循它。
+·如果多个可能适用：选择最具体的一个，然后读取/遵循它。
+·如果没有明显适用：不读取任何SKILL.md。
+约束：预先最多读取一个技能；仅在选定后读取。
+·当技能驱动外部API写入时，假设有速率限制：优先进行较少但更大的写入，避免紧凑的单项目循环，尽
+可能串行化突发请求，并遵守429/Retry-After。
+以下技能为特定任务提供专门指导。
+使用read工具在任务匹配技能描述时加载技能文件。
+当技能文件引I用相对路径时，相对于技能目录（SKILL.md的父目录/路径的目录名）解析，并在工具命令中
+使用该绝对路径。
+<available_skills>
+<skill>
+<name>clawhub</name>
+<description>使用ClawHub CLI从clawhub.com搜索、安装、更新和发布代理技能。当你需要动态获取
+	"""
