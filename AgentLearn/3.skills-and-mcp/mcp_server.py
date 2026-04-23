@@ -1,5 +1,5 @@
 # encoding: utf-8
-# @Time    : 2026/04/22 00:00
+# @Time    : 2026/04/22
 import json
 import sys
 import traceback
@@ -9,10 +9,18 @@ from mcp_tools import MCPToolsRegistry
 
 
 class MCPServer:
+	"""
+	MCP 本地服务端实现
+	"""
 	def __init__(self):
 		self.registry = MCPToolsRegistry()
 
 	def handle_request(self, request: dict[str, Any]) -> dict[str, Any]:
+		"""
+		请求分发
+		:param request: JSON-RPC格式的请求体
+		:return:
+		"""
 		request_id = request.get("id")
 		method = request.get("method")
 		params = request.get("params", {})
@@ -38,6 +46,7 @@ class MCPServer:
 			}
 
 	def serve_stdio(self):
+		# 持续监听stdin的请求
 		for raw_line in sys.stdin:
 			line = raw_line.strip()
 			if not line:
@@ -51,6 +60,8 @@ class MCPServer:
 				}
 			else:
 				response = self.handle_request(request)
+
+			# 将响应写入stdout
 			sys.stdout.write(json.dumps(response, ensure_ascii=False) + "\n")
 			sys.stdout.flush()
 
