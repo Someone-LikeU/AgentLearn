@@ -20,3 +20,4 @@ if __name__ == '__main__':
 	# task = " ".join(sys.argv[1:])
 	task = "找到当前目录下所有TODO并整理到TODO.md文件中，如果TODO.md文件已存在，就先删除它"
 	myAgent.agent_run(task)
+	myAgent.close()
