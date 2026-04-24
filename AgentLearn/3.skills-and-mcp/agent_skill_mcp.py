@@ -9,10 +9,10 @@ from pathlib import Path
 from subprocess import CompletedProcess
 from typing import Any
 
-from matplotlib.style.core import available
 from openai import OpenAI
 
 from mcp_client import MCPClient
+from prompt_builder import PromptBuilder
 
 
 class Agent:
@@ -23,10 +23,8 @@ class Agent:
 			base_url=os.environ.get("OPENAI_BASE_URL") if base_url is None else base_url,
 			api_key=os.environ.get("OPENAI_API_KEY") if api_key is None else api_key,
 		)
-		# 记忆文件
 		self.memory_file = ".agent/memory.md"
 
-		# 最大迭代次数
 		self.MAX_ITERATIONS = 100
 		self.MODEL = model
 		self.temperature = temperature
@@ -35,10 +33,8 @@ class Agent:
 		self.RULES_DIR = "./agent/rules"
 		self.SKILLS_DIR = "./agent/skills"
 
-		# 本地工具
+		# 加载本地工具
 		self.local_tools = self._load_local_tools()
-
-		# 本地可用的工具字典
 		self.local_functions = {
 			"execute_bash": self._execute_bash,
 			"read_file": self._read_file,
@@ -49,19 +45,26 @@ class Agent:
 			"make_plan": self._make_plan,
 		}
 
+		# TODO 这里客户端后续要剥离出来，不在这里初始化，在一个编排类里面初始化
 		self.mcp_client = MCPClient(server_script=mcp_server_script)
 		self.mcp_client.start()
+		# 加载MCP工具
 		self.mcp_tools = self._load_mcp_tools()
 
 		self.available_functions: dict[str, Any] = {}
 		self.available_functions.update(self.local_functions)
-		# 动态扩充可用买mcp工具列表
+		# 动态更新可用的工具列表
 		for tool in self.mcp_tools:
 			tool_name = tool["function"]["name"]
 			self.available_functions[tool_name] = self._make_mcp_executor(tool_name)
 
-		# 所有可用工具列表
 		self.all_tools = self.local_tools + self.mcp_tools
+
+		self.base_prompt = "You are an interactive agent that helps users with daily tasks or software engineering tasks. Use the instructions below and the tools available to you to assist the user."
+		self.prompt_builder = PromptBuilder(
+			rules_dir=self.RULES_DIR,
+			skills_dir=self.SKILLS_DIR
+		)
 
 	def _make_mcp_executor(self, tool_name: str):
 		"""为MCP工具生成执行器，就是调用mcp客户端的call_tool方法"""
@@ -242,6 +245,10 @@ class Agent:
 						})
 		return skills
 
+	def _load_skill_detail_by_name(self, name):
+		# TODO 补充这部分实现在上面加载meta info的逻辑里顺手写一个缓存所有信息的逻辑
+		pass
+
 	def _run_agent_step(self, messages, tools):
 		for _ in range(self.MAX_ITERATIONS):
 			response = self.client.chat.completions.create(
@@ -302,7 +309,7 @@ class Agent:
 	def agent_run(self, task):
 		"""
 		Agent运行入口
-		TODO 把memory，rules这些提一个单独的类或者方法，context_builder
+		TODO 把memory，rules这些提一个单独的类或者方法，prompt_builder
 		:param task: 用户任务
 		:return: 执行任务结果
 		"""
@@ -311,7 +318,7 @@ class Agent:
 		rules = self._load_rules()
 		skills = self._load_skill_meta_infos()
 		system_prompt = [
-			"You are an interactive agent that helps users with daily tasks or software engineering tasks. Use the instructions below and the tools available to you to assist the user."
+			self.base_prompt
 		]
 		if rules:
 			system_prompt.append(f"\n# Rules\n{rules}")
@@ -341,7 +348,7 @@ if __name__ == "__main__":
 		my_agent.close()
 
 	# fc-90a9530d614f483f8a26d7f427be688d firecrawl秘钥
-	# TODO _load_skill_meta_infos方法可用，但是system prompt的拼接结果不对，需要改格式，新写一个context_builder类
+	# TODO 测试_load_skill_meta_infos方法，新写一个context_builder类
 	"""
 	技能 (强制)
 回复前：扫描<available_skills><description>条目。
