@@ -5,6 +5,7 @@ import ssl
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 # 禁用 SSL 证书验证
@@ -35,11 +36,28 @@ class MCPToolsRegistry:
 			"深圳": "SZX",
 			"成都": "CTU",
 			"杭州": "HGH",
+			"贵阳": "KWE"
 		}
+		self._city_code_cache_file = Path(__file__).resolve().parent / "cache" / "city_code_cache.json"
+		self._city_code_cache: dict[str, str] = self._load_city_code_cache()
 		# 工具列表
 		self._tools: dict[str, MCPTool] = {}
 		# 注册工具
 		self._register_tools()
+
+	def _load_city_code_cache(self) -> dict[str, str]:
+		"""从本地JSON文件加载城市三字码缓存。"""
+		try:
+			with open(self._city_code_cache_file, "r", encoding="utf-8") as f:
+				data = json.load(f)
+			if isinstance(data, dict):
+				# 仅保留字符串键值，避免脏数据污染
+				return {str(k): str(v).upper() for k, v in data.items() if isinstance(k, str) and isinstance(v, str)}
+		except FileNotFoundError:
+			return {}
+		except json.JSONDecodeError:
+			return {}
+		return {}
 
 	def _http_get_json(self, url: str, params: dict[str, Any] | None = None, headers: dict[str, str] | None = None):
 		"""
@@ -185,22 +203,67 @@ class MCPToolsRegistry:
 
 	def _resolve_ctrip_city_code(self, city: str) -> str | None:
 		"""
-		处理城市编码，用于查询机票
-		:param city: 城市名
-		:return: 编码
+		解析携程城市三字码。
+		响应结构兼容以下两类：
+		1) data 为列表；
+		2) data 为嵌套字典（热门是列表，其它分组按首字母再嵌套列表）。
 		"""
+		# 在缓存里就直接返回
 		if city in self._city_code_cache:
 			return self._city_code_cache[city]
-		# 尝试解析非缓存城市然后加入缓存
+
 		payload = self._http_get_json(
-			"https://flights.ctrip.com/international/search/api/poi/getPoiSuggest",
-			{"keyword": city},
+			"https://flights.ctrip.com/itinerary/api/poi/get",
+			{"query": city},
+			headers={"Referer": "https://flights.ctrip.com/"},
 		)
-		for item in payload.get("data") or []:
-			city_code = item.get("cityCode") or item.get("iataCode")
-			if city_code:
-				self._city_code_cache[city] = city_code
-				return city_code
+
+		def _collect_items(node):
+			if isinstance(node, list):
+				for item in node:
+					if isinstance(item, dict):
+						yield item
+			elif isinstance(node, dict):
+				for value in node.values():
+					yield from _collect_items(value)
+
+		def _extract_code(raw_data: str) -> str | None:
+			# 示例: "Fuzhou|福州(FOC)|258|FOC"
+			parts = raw_data.split("|")
+			if len(parts) >= 4 and parts[3]:
+				return parts[3].upper()
+			if len(parts) >= 2 and "(" in parts[1] and ")" in parts[1]:
+				return parts[1].split("(")[-1].split(")")[0].upper()
+			return None
+
+		items = list(_collect_items(payload.get("data")))
+		if not items:
+			return None
+
+		# 优先精确匹配 display（例如 city=广州，命中 display=广州）
+		for item in items:
+			if str(item.get("display", "")).strip() == city:
+				code = _extract_code(str(item.get("data", "")))
+				if code:
+					self._city_code_cache[city] = code
+					return code
+
+		# 次选：匹配 data 中中文城市名字段（如 "福州(FOC)"）
+		for item in items:
+			raw_data = str(item.get("data", ""))
+			parts = raw_data.split("|")
+			if len(parts) >= 2 and city in parts[1]:
+				code = _extract_code(raw_data)
+				if code:
+					self._city_code_cache[city] = code
+					return code
+
+		# 最后兜底：取第一个可解析条目，避免完全失败
+		for item in items:
+			code = _extract_code(str(item.get("data", "")))
+			if code:
+				self._city_code_cache[city] = code
+				return code
 		return None
 
 	def query_flight_tickets(self, from_city: str, to_city: str, direct: bool = False) -> dict[str, Any]:
