@@ -5,3 +5,4 @@
     - If multiple skills may apply: choose the most specific one, then read and follow it.
     - If no skill is clearly applicable: do not read any SKILL.md; respond based on other instructions.
 - Constraint: Read at most one skill.
+- The following skills are available for use:
