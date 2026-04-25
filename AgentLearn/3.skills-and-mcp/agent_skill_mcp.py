@@ -7,44 +7,61 @@ import os
 import subprocess
 from pathlib import Path
 from subprocess import CompletedProcess
-from typing import Any
-
+from typing import Any, Final
 from openai import OpenAI
-
 from mcp_client import MCPClient
-from prompt_builder import PromptBuilder
+
+class ToolNameConstant:
+	"""
+	工具名称常量类
+	"""
+	READ_FILE: Final = "READ_FILE"
+	WRITE_FILE: Final = "WRITE_FILE"
+	EDIT: Final = "EDIT"
+	GLOB: Final = "GLOB"
+	GREP: Final = "GREP"
+	EXECUTE_BASH: Final = "EXECUTE_BASH"
+	MAKE_PLAN: Final = "MAKE_PLAN"
+	LOAD_SKILL_DETAIL_BY_NAME: Final = "LOAD_SKILL_DETAIL_BY_NAME"
 
 
 class Agent:
 	"""支持本地工具 + MCP工具的Agent。"""
 
-	def __init__(self, model="qwen3.5:9b", temperature=0.0, base_url=None, api_key=None, mcp_server_script=None):
+	def __init__(self, model="qwen3.5:9b", 
+				 temperature=0.1,
+				 base_url=None, 
+				 api_key=None, 
+				 mcp_server_script=None):
 		self.client = OpenAI(
 			base_url=os.environ.get("OPENAI_BASE_URL") if base_url is None else base_url,
 			api_key=os.environ.get("OPENAI_API_KEY") if api_key is None else api_key,
 		)
 		self.memory_file = ".agent/memory.md"
 
-		self.MAX_ITERATIONS = 100
-		self.MODEL = model
+		self.max_iterations = 100
+		self.model = model
 		self.temperature = temperature
 		self.plan_mode = False
 		self.current_plan: list[str] = []
-		self.RULES_DIR = "./agent/rules"
-		self.SKILLS_DIR = "./agent/skills"
+		self.rules_dir = "./agent/rules"
+		self.skills_dir = "./agent/skills"
+
+		# 各SKILL.md缓存,key 为SKILL的name，value为SKILL.md完整内容
+		self._skills_cache = {}
 
 		# 加载本地工具
 		self.local_tools = self._load_local_tools()
 		self.local_functions = {
-			"execute_bash": self._execute_bash,
-			"read_file": self._read_file,
-			"write_file": self._write_file,
-			"edit": self._edit,
-			"glob": self._glob,
-			"grep": self._grep,
-			"make_plan": self._make_plan,
+			ToolNameConstant.EXECUTE_BASH: self._execute_bash,
+			ToolNameConstant.READ_FILE: self._read_file,
+			ToolNameConstant.WRITE_FILE: self._write_file,
+			ToolNameConstant.EDIT: self._edit,
+			ToolNameConstant.GLOB: self._glob,
+			ToolNameConstant.GREP: self._grep,
+			ToolNameConstant.MAKE_PLAN: self._make_plan,
+			ToolNameConstant.LOAD_SKILL_DETAIL_BY_NAME: self._load_skill_detail_by_name,
 		}
-
 		# TODO 这里客户端后续要剥离出来，不在这里初始化，在一个编排类里面初始化
 		self.mcp_client = MCPClient(server_script=mcp_server_script)
 		self.mcp_client.start()
@@ -60,11 +77,10 @@ class Agent:
 
 		self.all_tools = self.local_tools + self.mcp_tools
 
-		self.base_prompt = "You are an interactive agent that helps users with daily tasks or software engineering tasks. Use the instructions below and the tools available to you to assist the user."
-		self.prompt_builder = PromptBuilder(
-			rules_dir=self.RULES_DIR,
-			skills_dir=self.SKILLS_DIR
-		)
+		self._base_prompt = "You are an interactive agent that helps users with daily tasks or software engineering tasks. Use the instructions below and the tools available to you to assist the user."
+
+		# 缓存系统提示词,后续记忆压缩的时候可能会用到
+		self._cached_system_prompt = None
 
 	def _make_mcp_executor(self, tool_name: str):
 		"""为MCP工具生成执行器，就是调用mcp客户端的call_tool方法"""
@@ -181,7 +197,7 @@ class Agent:
 		if self.plan_mode:
 			return "Error: can't make plan within a plan"
 		response = self.client.chat.completions.create(
-			model=self.MODEL,
+			model=self.model,
 			messages=[
 				{
 					"role": "system",
@@ -201,6 +217,11 @@ class Agent:
 			return [task]
 
 	def _parse_tool_arguments(self, raw_arguments: str) -> dict[str, Any]:
+		"""
+		解析调用工具的参数
+		:param raw_arguments: 字符串形式的参数
+		:return: 解析的json格式参数
+		"""
 		if not raw_arguments:
 			return {}
 		try:
@@ -210,21 +231,31 @@ class Agent:
 			return {"_argument_error": f"Invalid JSON arguments: {error}"}
 
 	def _load_rules(self):
+		"""
+		加载所有规则md文档，字符串形式返回
+		:return:
+		"""
 		rules = []
-		if not os.path.exists(self.RULES_DIR):
+		if not os.path.exists(self.rules_dir):
 			return rules
-		for rule_file in Path(self.RULES_DIR).glob("*.md"):
+		for rule_file in Path(self.rules_dir).glob("*.md"):
 			with open(rule_file, "r", encoding="utf-8") as f:
 				rules.append(f.read())
 		return "\n\n".join(rules) if rules else []
 
 	def _load_skill_meta_infos(self):
+		"""
+		获取skill元信息，name和description，顺便缓存一下完整SKILL.md的内容
+		:return:
+		"""
 		import yaml
 		skills = []
-		if not os.path.exists(self.SKILLS_DIR):
+		if not os.path.exists(self.skills_dir):
 			return []
-		for item in os.listdir(self.SKILLS_DIR):
-			skill_dir = os.path.join(self.SKILLS_DIR, item)
+		# 先清空缓存
+		self._skills_cache.clear()
+		for item in os.listdir(self.skills_dir):
+			skill_dir = os.path.join(self.skills_dir, item)
 			if not os.path.isdir(skill_dir):
 				continue
 			skill_md_file = os.path.join(skill_dir, "SKILL.md")
@@ -243,16 +274,24 @@ class Agent:
 							"name": meta.get("name"),
 							"description": meta.get("description", ""),
 						})
+						# 缓存完整SKILL内容
+						self._skills_cache[meta.get("name")] = content
 		return skills
 
 	def _load_skill_detail_by_name(self, name):
-		# TODO 补充这部分实现在上面加载meta info的逻辑里顺手写一个缓存所有信息的逻辑
-		pass
+		"""
+		根据skill名称读取SKILL.md完整内容
+		:param name:
+		:return:
+		"""
+		if not self._skills_cache:
+			self._load_skill_meta_infos()
+		return self._skills_cache.get(name, "")
 
 	def _run_agent_step(self, messages, tools):
-		for _ in range(self.MAX_ITERATIONS):
+		for _ in range(self.max_iterations):
 			response = self.client.chat.completions.create(
-				model=self.MODEL,
+				model=self.model,
 				messages=messages,
 				tools=tools,
 				temperature=self.temperature,
@@ -275,7 +314,7 @@ class Agent:
 					function_response = f"Error: Unknown tool '{function_name}'"
 				elif "_argument_error" in function_args:
 					function_response = f"Error: {function_args['_argument_error']}"
-				elif function_name == "make_plan":
+				elif function_name == ToolNameConstant.MAKE_PLAN:
 					self.plan_mode = True
 					steps = function_impl(**function_args)
 					if not isinstance(steps, list):
@@ -285,7 +324,7 @@ class Agent:
 						for step in steps:
 							messages.append({"role": "user", "content": step})
 							result, messages = self._run_agent_step(
-								messages, [t for t in tools if t["function"]["name"] != "make_plan"]
+								messages, [t for t in tools if t["function"]["name"] != ToolNameConstant.MAKE_PLAN]
 							)
 							results.append(result)
 						function_response = "\n".join(results)
@@ -306,35 +345,38 @@ class Agent:
 				)
 		return "Max iterations reached", messages
 
-	def agent_run(self, task):
-		"""
-		Agent运行入口
-		TODO 把memory，rules这些提一个单独的类或者方法，prompt_builder
-		:param task: 用户任务
-		:return: 执行任务结果
-		"""
-		# 加载历史记忆、规则、技能
+	def _build_system_prompt(self):
+		from prompt_builder import build_system_prompt
+		# 置空当前prompt
+		self._cached_system_prompt = None
 		memory = self._load_memory()
 		rules = self._load_rules()
 		skills = self._load_skill_meta_infos()
-		system_prompt = [
-			self.base_prompt
+		base_prompt = [
+			self._base_prompt
 		]
-		if rules:
-			system_prompt.append(f"\n# Rules\n{rules}")
-		if skills:
-			system_prompt.append(
-				f"\n# Skills\n{skills}\n" + "\n".join([f"- {skill['name']}: {skill.get('description', '')}" for skill in skills])
-			)
-		if memory:
-			system_prompt.append(f"\n# Previous context\n{memory}")
+		self._cached_system_prompt = build_system_prompt(base_prompt, rules, skills, memory)
+		return self._cached_system_prompt
+
+	def agent_run(self, task):
+		"""
+		Agent运行入口
+		:param task: 用户任务
+		:return: 执行任务结果
+		"""
+		system_prompt = self._build_system_prompt()
 		# 拼接完整上下文
-		messages = [{"role": "system", "content": "\n".join(system_prompt)}, {"role": "user", "content": task}]
+		messages = [
+					{"role": "system", "content": system_prompt},
+					{"role": "user", "content": task}
+				]
 		final_result, _ = self._run_agent_step(messages, self.all_tools)
 		self._save_memory(task, final_result)
+
+		self._close()
 		return final_result
 
-	def close(self):
+	def _close(self):
 		# 关闭mcp客户端，TODO 后续修改为在agent loop前后进行打开和关闭，不要让外界感知
 		self.mcp_client.close()
 
@@ -342,28 +384,9 @@ class Agent:
 if __name__ == "__main__":
 	my_agent = Agent(model="minimax-m2.7:cloud")
 	task = "找到当前目录下所有文件中的TODO内容并整理到TODO.md文件中，如果TODO.md文件已存在，就先删除它"
-	try:
-		my_agent.agent_run(task)
-	finally:
-		my_agent.close()
+	my_agent.agent_run(task)
 
+	# TODO 新建一个编排类，由这个编排类来控制Agent的运行
+	# TODO 任务完成得不好，考虑设计一个评价器，调整温度重新生成
+	# TODO 实现后台定时任务，agent自主行动，类似车机上车后自动打开空调等
 	# fc-90a9530d614f483f8a26d7f427be688d firecrawl秘钥
-	# TODO 测试_load_skill_meta_infos方法，新写一个context_builder类
-	"""
-	技能 (强制)
-回复前：扫描<available_skills><description>条目。
-·如果恰好一个技能明显适用：用 read 读取其位于<location>的SKILL.md，然后遵循它。
-·如果多个可能适用：选择最具体的一个，然后读取/遵循它。
-·如果没有明显适用：不读取任何SKILL.md。
-约束：预先最多读取一个技能；仅在选定后读取。
-·当技能驱动外部API写入时，假设有速率限制：优先进行较少但更大的写入，避免紧凑的单项目循环，尽
-可能串行化突发请求，并遵守429/Retry-After。
-以下技能为特定任务提供专门指导。
-使用read工具在任务匹配技能描述时加载技能文件。
-当技能文件引I用相对路径时，相对于技能目录（SKILL.md的父目录/路径的目录名）解析，并在工具命令中
-使用该绝对路径。
-<available_skills>
-<skill>
-<name>clawhub</name>
-<description>使用ClawHub CLI从clawhub.com搜索、安装、更新和发布代理技能。当你需要动态获取
-	"""
