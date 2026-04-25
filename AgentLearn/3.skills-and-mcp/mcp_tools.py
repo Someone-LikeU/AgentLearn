@@ -99,9 +99,9 @@ class MCPToolsRegistry:
 		:return:
 		"""
 		# 查询某城市天气
-		self._tools["query_weather"] = MCPTool(
-			name="query_weather",
-			description="当用户任务可能涉及到需要查询天气时，调用该工具，例如'帮我规划未来3天假期去北京的旅游行程'、'明天需不需要穿羽绒服'等。该工具查询某个城市的未来天气，days参数默认15天，最大16天。",
+		self._tools["QUERY_WEATHER"] = MCPTool(
+			name="QUERY_WEATHER",
+			description="该工具接口查询某城市的天气数据，当用户任务可能涉及到需要查询天气时，调用该工具，例如'帮我规划未来3天假期去北京的旅游行程'、'明天需不需要穿羽绒服'等。该工具查询某个城市的未来天气，days参数默认15天，最大16天。",
 			parameters={
 				"type": "object",
 				"properties": {
@@ -113,8 +113,8 @@ class MCPToolsRegistry:
 			handler=self.query_weather,
 		)
 		# 机票查询工具
-		self._tools["query_flight_tickets"] = MCPTool(
-			name="query_flight_tickets",
+		self._tools["QUERY_FLIGHT_TICKETS"] = MCPTool(
+			name="QUERY_FLIGHT_TICKETS",
 			description="该工具调用携程公开接口查询机票价格趋势（最低价接口）。当用户任务可能涉及到查询机票信息时，调用该工具，例如'帮我规划未来5天假期去北京的旅游行程'、'未来10天有没有去北京的低于800的机票？'等。",
 			parameters={
 				"type": "object",
