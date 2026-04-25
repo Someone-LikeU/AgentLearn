@@ -27,11 +27,11 @@ def test_subprocess_mode():
         print(f"    - {tool.get('name')}: {tool.get('description', '')[:50]}...")
 
     print("\n[3] Call query_weather")
-    weather = client.call_tool("query_weather", {"city": "Beijing", "days": 3})
+    weather = client.call_tool("QUERY_WEATHER", {"city": "Beijing", "days": 3})
     print(f"    Result: {weather}")
 
     print("\n[4] Call query_flight_tickets")
-    flights = client.call_tool("query_flight_tickets", {
+    flights = client.call_tool("QUERY_FLIGHT_TICKETS", {
         "from_city": "北京",
         "to_city": "上海",
         "direct": False,
@@ -77,11 +77,11 @@ def test_tcp_mode():
             print(f"    - {tool.get('name')}: {tool.get('description', '')[:50]}...")
 
         print("\n[4] Call query_weather")
-        weather = client.call_tool("query_weather", {"city": "Shanghai", "days": 5})
+        weather = client.call_tool("QUERY_WEATHER", {"city": "Shanghai", "days": 5})
         print(f"    Result: {weather}")
 
         print("\n[5] Call query_flight_tickets")
-        flights = client.call_tool("query_flight_tickets", {
+        flights = client.call_tool("QUERY_FLIGHT_TICKETS", {
             "from_city": "北京",
             "to_city": "贵阳",
             "direct": True,
