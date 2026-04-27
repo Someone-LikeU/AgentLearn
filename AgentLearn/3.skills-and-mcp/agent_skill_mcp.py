@@ -33,17 +33,38 @@ class Agent:
 				 base_url=None, 
 				 api_key=None, 
 				 mcp_server_script=None):
+		"""
+		初始化Agent对象
+		:param model: 使用模型
+		:param temperature: 模型推理时温度
+		:param base_url: 模型的url
+		:param api_key: 模型api_key
+		:param mcp_server_script: mcp服务器脚本名
+		"""
+		# openAI 请求客户端
 		self.client = OpenAI(
 			base_url=os.environ.get("OPENAI_BASE_URL") if base_url is None else base_url,
 			api_key=os.environ.get("OPENAI_API_KEY") if api_key is None else api_key,
 		)
+		# 记忆文件
 		self.memory_file = ".agent/memory.md"
 
+		# 最大迭代次数
 		self.max_iterations = 100
+
+		# 使用模型
 		self.model = model
+
+		# llm温度参数
 		self.temperature = temperature
+
+		# 是否处在plan模式
 		self.plan_mode = False
+
+		# 当前plan列表
 		self.current_plan: list[str] = []
+
+		# 规则和技能目录
 		self.rules_dir = "./agent/rules"
 		self.skills_dir = "./agent/skills"
 
@@ -77,6 +98,7 @@ class Agent:
 
 		self.all_tools = self.local_tools + self.mcp_tools
 
+		# 基础提示词
 		self._base_prompt = "You are an interactive agent that helps users with daily tasks or software engineering tasks. Use the instructions below and the tools available to you to assist the user."
 
 		# 缓存系统提示词,后续记忆压缩的时候可能会用到
@@ -358,6 +380,7 @@ class Agent:
 		self._cached_system_prompt = build_system_prompt(base_prompt, rules, skills, memory)
 		return self._cached_system_prompt
 
+
 	def agent_run(self, task):
 		"""
 		Agent运行入口
@@ -389,4 +412,22 @@ if __name__ == "__main__":
 	# TODO 新建一个编排类，由这个编排类来控制Agent的运行
 	# TODO 任务完成得不好，考虑设计一个评价器，调整温度重新生成
 	# TODO 实现后台定时任务，agent自主行动，类似车机上车后自动打开空调等
+	# TODO 记忆系统修改，维护两个记忆md文档，一个放未压缩的，一个放压缩的，运行时写两个文件，load记忆时优先load压缩的，再结合RAG做运行时检索旧记忆
 	# fc-90a9530d614f483f8a26d7f427be688d firecrawl秘钥
+
+	"""
+	TODO 子agent，两种实现方式：
+	1、隐式定义：一个类似读写文件、执行bash命令等的工具，在工具中另起一个Agent对象，通过提示词区分角色，该agent临时启用，生命周期为本次对话，任务完成就丢失
+		需要扩展Agent对象的属性，新增is_main_agent、agent_name、agent id等属性，
+	
+	2、显式定义：针对特定任务预先定义一个独立的子agent，独立的设定，可用工具列表和主agent存在部分交集，可能完全继承所有工具，也可能有主agent没有的工具，
+		记忆可以存到磁盘里做永久，下次类似的任务唤起该子agent时能load上一次的工作记忆
+	
+	二者区别：
+	对比项	 |    隐式    |      显式
+	创建方式  | agent运行时动态创建 | 预先根据特定任务定义特定agent，代码/配置文件定义
+	生命周期  | 临时创建，任务完成即销毁 | 可复用，类似于程序可永久存活在磁盘
+	有无状态  |  有状态   |	无状态
+	可控性	| 灵活，可控性弱 | 可控性强，输出可预测
+	适用场景	| 不确定性任务，由Agent自主决策 | 流程可固化的企业工作流，可配合Skill一起实现
+	"""
