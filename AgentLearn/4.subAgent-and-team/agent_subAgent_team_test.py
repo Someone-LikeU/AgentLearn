@@ -18,5 +18,5 @@ if __name__ == '__main__':
 	# 	print("  --plan: Enable task planning and decomposition")
 	# 	sys.exit(1)
 	# task = " ".join(sys.argv[1:])
-	task = "找到当前目录下的所有TODO并整理到上一级目录的'开发过程问题记录.md'文件中，要包含TODO所在代码文件的位置、TODO内容，并给每个TODO项预留一行由我来记录该TODO的结果，如果该文件已存在，就在后面追加"
+	task = "找到当前目录的上一级目录下的所有子目录的python文件中的TODO项并整理到上一级目录的'开发过程所有todo.md'文件中，要包含TODO所在代码文件的位置、TODO内容，并给每个TODO项预留一行由我来记录该TODO的结果，如果该文件已存在，就在后面追加"
 	myAgent.agent_run(task)

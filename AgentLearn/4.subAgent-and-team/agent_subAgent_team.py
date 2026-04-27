@@ -84,6 +84,7 @@ class Agent:
 
 		# 加载本地工具
 		self.local_tools = self._load_local_tools()
+		print(f"{len(self.local_tools)} local tools loaded")
 		self.local_functions = {
 			ToolNameConstant.EXECUTE_BASH: self._execute_bash,
 			ToolNameConstant.READ_FILE: self._read_file,
@@ -99,6 +100,7 @@ class Agent:
 		self.mcp_client.start()
 		# 加载MCP工具
 		self.mcp_tools = self._load_mcp_tools()
+		print(f"{len(self.mcp_tools)} MCP tools loaded")
 
 		self.available_functions: dict[str, Any] = {}
 		self.available_functions.update(self.local_functions)
@@ -133,6 +135,7 @@ class Agent:
 		加载本地工具列表
 		:return:
 		"""
+		print("loading local tools...")
 		tools_path = os.path.join(os.path.dirname(__file__), "local_tools.json")
 		with open(tools_path, "r", encoding="utf-8") as f:
 			return json.load(f)
@@ -221,24 +224,30 @@ class Agent:
 	def _save_memory(self, task, result):
 		timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 		entry = f"\n## {timestamp}\n**Task:** {task}\n**Result:** {result}\n"
-		with open(self.memory_file, "a", encoding="utf-8") as f:
-			f.write(entry)
-
+		try:
+			with open(self.memory_file, "a", encoding="utf-8") as f:
+				f.write(entry)
+		except Exception as e:
+			print(f"Error in saving memory: {task}, exception: {e}")
+	
 	def _load_memory(self):
 		# 如果是子agent，就不给前面的记忆
 		if not self._is_main_agent:
 			return ""
 		memory_path = os.path.join(os.path.dirname(__file__), self.memory_file)
-		if not os.path.exists(memory_path):
-			print("The agent is initializing for the first time, creating the memory file")
-			with open(memory_path, "w", encoding="utf-8") as f:
-				f.write("")
-			return ""
-		with open(memory_path, "r", encoding="utf-8") as f:
-			content = f.read()
-			lines = content.split("\n")
-			return "\n".join(lines[-50:]) if len(lines) > 50 else content
-
+		try:
+			if not os.path.exists(memory_path):
+				print("The agent is initializing for the first time, creating the memory file")
+				with open(memory_path, "w", encoding="utf-8") as f:
+					f.write("")
+				return ""
+			with open(memory_path, "r", encoding="utf-8") as f:
+				content = f.read()
+				lines = content.split("\n")
+				return "\n".join(lines[-50:]) if len(lines) > 50 else content
+		except Exception as e:
+			print(f"Error in loading memory, exception: {e}")
+	
 	def _make_plan(self, task):
 		if self.plan_mode:
 			return "Error: can't make plan within a plan"
@@ -256,10 +265,13 @@ class Agent:
 		)
 		try:
 			plan_data = json.loads(response.choices[0].message.content)
+			print("make plan response is: ", response)
 			steps = plan_data.get("steps", [task]) if isinstance(plan_data, dict) else [task]
 			self.current_plan = steps
+			print(f"[Plan] {len(steps)} steps created")
 			return steps
 		except Exception:
+			print(f"[Plan] Failed to parse steps, returning original task {task}, exception {e}")
 			return [task]
 
 	def _parse_tool_arguments(self, raw_arguments: str) -> dict[str, Any]:
@@ -354,6 +366,7 @@ class Agent:
 				function_name = str(getattr(function_payload, "name", ""))
 				raw_arguments = str(getattr(function_payload, "arguments", ""))
 				function_args = self._parse_tool_arguments(raw_arguments)
+				print(f"[Tool call] {function_name} (args: {function_args})")
 				function_impl = self.available_functions.get(function_name)
 
 				if function_impl is None:
@@ -367,17 +380,22 @@ class Agent:
 						function_response = steps
 					else:
 						results = []
+						step_cnt = 0
 						for step in steps:
+							print(f"[Step {step_cnt + 1}]: {step}")
 							messages.append({"role": "user", "content": step})
 							result, messages = self._run_agent_step(
 								messages, [t for t in tools if t["function"]["name"] != ToolNameConstant.MAKE_PLAN]
 							)
+							print(f"[Step {step_cnt + 1}] result:{result}, messages: {messages}")
+							step_cnt += 1
 							results.append(result)
 						function_response = "\n".join(results)
 					self.plan_mode = False
 					self.current_plan = []
 				else:
 					try:
+						print(f"[Tool call] tool name: {function_name}, tool arguments: {raw_arguments}")
 						function_response = function_impl(**function_args)
 					except Exception as error:
 						function_response = f"Error when calling '{function_name}': {error}"
@@ -418,6 +436,7 @@ class Agent:
 					{"role": "user", "content": task}
 				]
 		final_result, _ = self._run_agent_step(messages, self.all_tools)
+		print(f"final result: {final_result}")
 		self._save_memory(task, final_result)
 
 		self._close()
