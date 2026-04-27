@@ -32,7 +32,7 @@ if __name__ == '__main__':
 	response = client.chat.completions.create(
 	    model="LongCat-Flash-Chat",
 	    messages=[
-	        {"role": "user", "content": "你好!"}
+	        {"role": "user", "content": "python怎么用os库来创建一个文件，详细解释一下参数用法"}
 	    ],
 	    max_tokens=10000
 	)
@@ -42,24 +42,24 @@ if __name__ == '__main__':
 	print(response)
 	
 	# 流式处理响应，同步方式
-	stream = client.chat.completions.create(
-		model = "LongCat-Flash-Chat",
-		messages = [
-			{"role": "user", "content": "输出一篇1000字的记叙文，主题是小美和小帅的恋爱故事"}
-		],
-		stream = True
-	)
-	all_content = ""
-	for chunk in stream:
-		content = chunk.choices[0].delta.content
-		print('chunk object:', chunk)
-		if content:
-			all_content += content
-			print(content, end = "", flush = True)
-	
-	print("all content: ", all_content)
-
-	# 异步方式
-	# TODO 将agent的调用方式改为流式，学习一下主流agent的调用处理方式
-	print("异步调用方式：")
-	asyncio.run(async_call())
+	# stream = client.chat.completions.create(
+	# 	model = "LongCat-Flash-Chat",
+	# 	messages = [
+	# 		{"role": "user", "content": "输出一篇1000字的记叙文，主题是小美和小帅的恋爱故事"}
+	# 	],
+	# 	stream = True
+	# )
+	# all_content = ""
+	# for chunk in stream:
+	# 	content = chunk.choices[0].delta.content
+	# 	print('chunk object:', chunk)
+	# 	if content:
+	# 		all_content += content
+	# 		print(content, end = "", flush = True)
+	#
+	# print("all content: ", all_content)
+	#
+	# # 异步方式
+	# # TODO 将agent的调用方式改为流式，学习一下主流agent的调用处理方式
+	# print("异步调用方式：")
+	# asyncio.run(async_call())
