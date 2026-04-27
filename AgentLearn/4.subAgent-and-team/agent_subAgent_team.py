@@ -58,7 +58,7 @@ class Agent:
 		)
 
 		# 记忆文件
-		self.memory_file = ".agent/memory.md"
+		self.memory_file = "agent/memory.md"
 
 		# 最大迭代次数
 		self.max_iterations = 100
@@ -76,8 +76,8 @@ class Agent:
 		self.current_plan: list[str] = []
 
 		# 规则和技能目录
-		self.rules_dir = "./agent/rules"
-		self.skills_dir = "./agent/skills"
+		self.rules_dir = "agent/rules"
+		self.skills_dir = "agent/skills"
 
 		# 各SKILL.md缓存,key 为SKILL的name，value为SKILL.md完整内容
 		self._skills_cache = {}
@@ -226,14 +226,15 @@ class Agent:
 
 	def _load_memory(self):
 		# 如果是子agent，就不给前面的记忆
-		if not self.memory_file:
+		if not self._is_main_agent:
 			return ""
-		if not os.path.exists(self.memory_file):
+		memory_path = os.path.join(os.path.dirname(__file__), self.memory_file)
+		if not os.path.exists(memory_path):
 			print("The agent is initializing for the first time, creating the memory file")
-			with open(self.memory_file, "w", encoding="utf-8") as f:
+			with open(memory_path, "w", encoding="utf-8") as f:
 				f.write("")
 			return ""
-		with open(self.memory_file, "r", encoding="utf-8") as f:
+		with open(memory_path, "r", encoding="utf-8") as f:
 			content = f.read()
 			lines = content.split("\n")
 			return "\n".join(lines[-50:]) if len(lines) > 50 else content
