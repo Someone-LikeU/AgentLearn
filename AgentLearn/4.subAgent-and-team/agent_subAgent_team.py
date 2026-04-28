@@ -1,12 +1,12 @@
 # encoding : utf-8
 # @Time    : 2026/4/19
-import datetime
 import glob as glob_module
 import json
 import os
 import subprocess
 from pathlib import Path
 from subprocess import CompletedProcess
+from types import SimpleNamespace
 from typing import Any, Final
 from openai import OpenAI
 from mcp_client import MCPClient
@@ -22,7 +22,8 @@ class ToolNameConstant:
 	GREP: Final = "GREP"
 	EXECUTE_BASH: Final = "EXECUTE_BASH"
 	MAKE_PLAN: Final = "MAKE_PLAN"
-	LOAD_SKILL_DETAIL_BY_NAME: Final = "LOAD_SKILL_DETAIL_BY_NAME"
+	LOAD_SKILL_DETAIL_BY_NAME: Final = "LOAD_SKILL_DETAIL_BY_NAME",
+	GET_TIME: Final = "GET_TIME"
 
 
 class Agent:
@@ -94,6 +95,7 @@ class Agent:
 			ToolNameConstant.GREP: self._grep,
 			ToolNameConstant.MAKE_PLAN: self._make_plan,
 			ToolNameConstant.LOAD_SKILL_DETAIL_BY_NAME: self._load_skill_detail_by_name,
+			ToolNameConstant.GET_TIME: self._get_time,
 		}
 		# TODO 这里客户端后续要剥离出来，不在这里初始化，在一个编排类里面初始化
 		self.mcp_client = MCPClient(server_script=mcp_server_script)
@@ -221,11 +223,15 @@ class Agent:
 		stdout, _ = self._decode_subprocess_result(result)
 		return stdout if stdout else "No matches found"
 
+	def _get_time(self):
+		from datetime import datetime
+		return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
 	def _save_memory(self, task, result):
 		if not self._is_main_agent:
 			# 如果不是主agent，即由主agent临时创建的子agent，就不保存记忆
 			return ""
-		timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+		timestamp = self._get_time()
 		entry = f"\n## {timestamp}\n**Task:** {task}\n**Result:** {result}\n"
 		try:
 			with open(self.memory_file, "a", encoding="utf-8") as f:
@@ -351,17 +357,38 @@ class Agent:
 
 	def _run_agent_step(self, messages, tools):
 		for i in range(self.max_iterations):
-			response = self.client.chat.completions.create(
+			response_stream = self.client.chat.completions.create(
 				model=self.model,
 				messages=messages,
 				tools=tools,
 				temperature=self.temperature,
+				stream=True,
 			)
-			print(f"[Iter {i}]: response is: {response}")
-			message = response.choices[0].message
-			messages.append(message)
+			# message = response_stream.choices[0].message
+			# messages.append(message)
+			message = self._deal_stream_response(response_stream)
+			print()
+			# 按照OpenAI的格式对message进行复原然后加回历史对话
+			messages.append({
+				"role": "assistant",
+				"content": message.content,
+				"tool_calls": [
+					{
+						"id": tc.id,
+						"type": "function",
+						"function": {
+							"name": tc.function.name,
+							"arguments": tc.function.arguments,
+						},
+					}
+					for tc in (message.tool_calls or [])
+				] if message.tool_calls else None,
+			})
+
+			# 无工具调用，结束
 			if not message.tool_calls:
 				return message.content, messages
+			print(f"[Iter {i}]: message is: {message}")
 
 			for tool_call in message.tool_calls:
 				function_payload = getattr(tool_call, "function", None)
@@ -425,6 +452,66 @@ class Agent:
 		self._cached_system_prompt = build_system_prompt(base_prompt, rules, skills, memory)
 		return self._cached_system_prompt
 
+	def _deal_stream_response(self, stream_response):
+		"""
+		为了用户体验，需要做流式响应，这里需要处理模型的流式响应，
+		所以需要 1）流式打印响应内容，2）累积工具调用的chunks,因为同一个工具调用的参数可能在两个chunk里分两次返回
+		TODO 抄一下那个执行bash命令的黑名单还有列出目录文件的工具逻辑,以及GPT给我的另外两个工具
+		:param stream_response:
+		:return: 转换后的一个message对象
+		"""
+		# 完整reply
+		full_reply = ""
+		# 累积工具调用
+		tool_calls = {}
+		for chunk in stream_response:
+			# 防御，有时delta可能不存在
+			choice = chunk.choices[0]
+			delta = choice.delta
+			# 1) 流式打印响应内容
+			content = getattr(delta, "content", None)
+			if content:
+				print(content, end="", flush=True)
+				full_reply += content
+
+			# 2) 累积还原工具调用
+			delta_tool_calls = getattr(delta, "tool_calls", None)
+			if delta_tool_calls:
+				for tc in delta_tool_calls:
+					idx = tc.idx
+					if idx not in tool_calls:
+						tool_calls[idx] = {
+							"id": getattr(tc, "id", None),
+							"name": "",
+							"arguments": "",
+						}
+					func = getattr(tc, "function", None)
+					if func is not None:
+						name = getattr(func, "name", None)
+						args = getattr(func, "arguments", None)
+						if name:
+							tool_calls[idx]["name"] = name
+						if args:
+							tool_calls[idx]["arguments"] += args
+
+		# 转换兼容的结构
+		ordered_tool_calls = []
+		for idx in sorted(tool_calls.keys()):
+			item = tool_calls[idx]
+			ordered_tool_calls.append(
+				SimpleNamespace(
+					id=item["id"],
+					function=SimpleNamespace(
+						name=item["name"],
+						arguments=item["arguments"],
+					),
+				)
+			)
+		message = SimpleNamespace(
+			content=full_reply if full_reply else None,
+			tool_calls=ordered_tool_calls if ordered_tool_calls else None,
+		)
+		return message
 
 	def agent_run(self, task):
 		"""
