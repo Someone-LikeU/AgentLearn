@@ -11,6 +11,10 @@ from typing import Any, Final
 from openai import OpenAI
 from mcp_client import MCPClient
 from duckduckgo_search import DDGS
+from rich.console import Console
+from rich.markdown import Markdown
+from rich.panel import Panel
+
 
 class ToolNameConstant:
 	"""
@@ -127,6 +131,8 @@ class Agent:
 
 		# 是否是主agent, False表示由Agent创建的子Agent,默认为True
 		self._is_main_agent = is_main_agent
+
+		self.console = Console()
 
 	def _make_mcp_executor(self, tool_name: str):
 		"""为MCP工具生成执行器，就是调用mcp客户端的call_tool方法"""
@@ -584,25 +590,6 @@ You are a professional research analyst. Please provide a summary based on the f
 		)
 		return message
 
-	def agent_run(self, task):
-		"""
-		Agent运行入口
-		:param task: 用户任务
-		:return: 执行任务结果
-		"""
-		system_prompt = self._build_system_prompt()
-		# 拼接完整上下文
-		messages = [
-					{"role": "system", "content": system_prompt},
-					{"role": "user", "content": task}
-				]
-		final_result, _ = self._run_agent_step(messages, self.all_tools)
-		print(f"final result: {final_result}")
-		self._save_memory(task, final_result)
-
-		self._close()
-		return final_result
-
 	def _close(self):
 		# 关闭mcp客户端，TODO 后续修改为在agent loop前后进行打开和关闭，不要让外界感知
 		self.mcp_client.close()
@@ -637,20 +624,93 @@ You are a professional research analyst. Please provide a summary based on the f
 						  role=role,
 						  is_main_agent=False
 						)
-		final_result, _ = sub_agent.agent_run(task)
+		final_result, _ = sub_agent.chat(task)
 		return final_result
 
+	def _clear_memory(self):
+		"""
+		清空记忆文件
+		:return:
+		"""
+		pass
+
+	def chat(self, task):
+		"""
+		Agent运行入口
+		:param task: 用户任务
+		:return: 执行任务结果
+		"""
+		system_prompt = self._build_system_prompt()
+		# 拼接完整上下文
+		messages = [
+					{"role": "system", "content": system_prompt},
+					{"role": "user", "content": task}
+				]
+		final_result, _ = self._run_agent_step(messages, self.all_tools)
+		print(f"final result: {final_result}")
+		self._save_memory(task, final_result)
+
+		self._close()
+		return final_result
+
+	def run(self):
+		"""
+		Agent loop实现，对话入口
+		:return:
+		"""
+		self.console.print(Panel(
+			"[bold green]JanVis[/] — At you service, sir! What can I do for you today?\n\n"
+			"  [blue]命令[/]: exit/q/quit 退出 | clear 清空当前会话历史 | clear memory",
+			border_style="green", padding=(1, 2),
+		))
+		self.console.print(f"[dim]当前工作目录：{os.getcwd()}[/]")
+		self.console.print(f"[dim]使用模型：{self.model}[/]")
+
+		confirm_choice = ("y", "yes", "是", "确认", "对", "")
+
+		while True:
+			try:
+				user_input = self.console.input("[bold cyan]You >[/] ")
+				cmd = user_input.strip().lower()
+				if cmd in ("exit", "q", "quit"):
+					self.console.print("\n[bold red] See you next time! [/]")
+					break
+				elif cmd == "clear":
+					user_input = self.console.input("[bold cyan]是否确认清除当前会话历史？(yes/y)[/] ")
+					cmd = user_input.strip().lower()
+					if cmd in confirm_choice:
+						self._build_system_prompt()
+						self.console.print("[dim]当前对话历史已清空[/]")
+					continue
+				elif cmd == "clear memory":
+					user_input = self.console.input("[bold cyan]是否确认清除历史记忆？(yes/y)[/] ")
+					cmd = user_input.strip().lower()
+					if cmd in confirm_choice:
+						self._clear_memory()
+						self.console.print("[dim]所有历史记忆已清空[/]")
+				elif not cmd:
+					continue
+				
+				# 上面分支都没中，就是用户任务了
+				self.chat(user_input)
+				self.console.print()
+			except KeyboardInterrupt:
+				self.console.print("\n[bold red] See you next time! [/]")
+				break
+		
 
 if __name__ == "__main__":
 	my_agent = Agent(model="minimax-m2.7:cloud")
 	task = "找到当前目录下所有文件中的TODO内容并整理到TODO.md文件中，如果TODO.md文件已存在，就先删除它"
-	my_agent.agent_run(task)
+	my_agent.run()
 
 	# TODO 新建一个编排类，由这个编排类来控制Agent的运行，需要剥离Agent的mcp_server属性
 	# TODO 任务完成得不好，考虑设计一个评价器，调整温度重新生成
 	# TODO 实现后台定时任务，agent自主行动，类似车机上车后自动打开空调等
 	# TODO 记忆系统修改，维护两个记忆md文档，一个放未压缩的，一个放压缩的，运行时写两个文件，load记忆时优先load压缩的，再结合RAG做运行时检索旧记忆
 	# TODO sub agent的记忆怎么处理
+	# TODO agent的角色问题，比如问你是谁，系统提示词里加角色扮演以及工具或者skills等东西无法回答用户问题时回答“对不起。。。。。”
+	# TODO 模型配置，比如api_key, model, base_url等，用一个json，再提供工具给用户来修改模型等参数
 	# fc-90a9530d614f483f8a26d7f427be688d firecrawl秘钥
 
 	"""
