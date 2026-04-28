@@ -222,6 +222,9 @@ class Agent:
 		return stdout if stdout else "No matches found"
 
 	def _save_memory(self, task, result):
+		if not self._is_main_agent:
+			# 如果不是主agent，即由主agent临时创建的子agent，就不保存记忆
+			return ""
 		timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 		entry = f"\n## {timestamp}\n**Task:** {task}\n**Result:** {result}\n"
 		try:
@@ -347,13 +350,14 @@ class Agent:
 		return self._skills_cache.get(name, "")
 
 	def _run_agent_step(self, messages, tools):
-		for _ in range(self.max_iterations):
+		for i in range(self.max_iterations):
 			response = self.client.chat.completions.create(
 				model=self.model,
 				messages=messages,
 				tools=tools,
 				temperature=self.temperature,
 			)
+			print(f"[Iter {i}]: response is: {response}")
 			message = response.choices[0].message
 			messages.append(message)
 			if not message.tool_calls:
@@ -366,7 +370,6 @@ class Agent:
 				function_name = str(getattr(function_payload, "name", ""))
 				raw_arguments = str(getattr(function_payload, "arguments", ""))
 				function_args = self._parse_tool_arguments(raw_arguments)
-				print(f"[Tool call] {function_name} (args: {function_args})")
 				function_impl = self.available_functions.get(function_name)
 
 				if function_impl is None:
@@ -463,14 +466,18 @@ class Agent:
 		#   3、本地工具列表里现在还没加主agent有的sub_agent方法，加上后新建子agent对象时怎么少给这个本地方法
 		#   4、子agent的运行结果怎么返回，主agent和子agent的提示词有哪些需要区分的，怎么用文件区分出来
 		#   5、子agent直接执行agent_run时，会有一步save_memory，会和主agent矛盾，写同一个memory文件，这个要怎么处理
+					# save_memory的时候先判断是否是主agent，否就直接返回
 		# TODO 如果把run的逻辑改为一个编排类来做，这里的逻辑可能还得改
 		# TODO 建一个记录过程中怎么设计架构的文档
 		# TODO 可能需要将现有逻辑拆解出一个编排类来解决以上关于子agent的问题
+
+		# TODO 28日最新，先改一版Agent loop的出来
 		sub_agent = Agent(model=self.model,
 						  temperature=self.temperature,
 						  base_url=self._base_url,
 						  api_key=self._api_key,
 						  role=role,
+						  is_main_agent=False
 						)
 		final_result, _ = sub_agent.agent_run(task)
 		return final_result
