@@ -40,7 +40,7 @@ class Agent:
 				 temperature: float=0.1,
 				 base_url: str=None,
 				 api_key: str=None,
-				 mcp_server_script: str=None,
+	             mcp_mode: str="subprocess",
 				 is_main_agent: bool = True,
 				 role: str="Main Agent"):
 		"""
@@ -49,9 +49,9 @@ class Agent:
 		:param temperature: 模型推理时温度
 		:param base_url: 模型的url
 		:param api_key: 模型api_key
-		:param mcp_server_script: mcp服务器脚本名
 		:param is_main_agent: 是否是主Agent，默认True
 		:param role: Agent角色，默认为主agent
+		:param mcp_mode: mcp运行模式，默认紫金城
 		"""
 		# base_url
 		self._base_url = os.environ.get("OPENAI_BASE_URL") if base_url is None else base_url
@@ -107,7 +107,7 @@ class Agent:
 			ToolNameConstant.LIST_DIR: self._list_dir,
 		}
 		# TODO 这里客户端后续要剥离出来，不在这里初始化，在一个编排类里面初始化
-		self.mcp_client = MCPClient(server_script=mcp_server_script)
+		self.mcp_client = MCPClient(mode=mcp_mode)
 		self.mcp_client.start()
 		# 加载MCP工具
 		self.mcp_tools = self._load_mcp_tools()
@@ -549,7 +549,6 @@ You are a professional research analyst. Please provide a summary based on the f
 		"""
 		为了用户体验，需要做流式响应，这里需要处理模型的流式响应，
 		所以需要 1）流式打印响应内容，2）累积工具调用的chunks,因为同一个工具调用的参数可能在两个chunk里分两次返回
-		TODO 抄一下那个执行bash命令的黑名单还有列出目录文件的工具逻辑,以及GPT给我的另外两个工具
 		:param stream_response:
 		:return: 转换后的一个message对象
 		"""
@@ -571,7 +570,7 @@ You are a professional research analyst. Please provide a summary based on the f
 			delta_tool_calls = getattr(delta, "tool_calls", None)
 			if delta_tool_calls:
 				for tc in delta_tool_calls:
-					idx = tc.idx
+					idx = tc.index
 					if idx not in tool_calls:
 						tool_calls[idx] = {
 							"id": getattr(tc, "id", None),
@@ -648,7 +647,17 @@ You are a professional research analyst. Please provide a summary based on the f
 		清空记忆文件
 		:return:
 		"""
-		pass
+		if not self._is_main_agent:
+			return
+		memory_path = os.path.join(os.path.dirname(__file__), self.memory_file)
+		try:
+			if not os.path.exists(memory_path):
+				return
+			else:
+				with open(memory_path, "w", encoding="utf-8") as f:
+					f.write("")
+		except Exception as e:
+			print(f"Error in loading memory, exception: {e}")
 
 	def chat(self, task):
 		"""
@@ -663,7 +672,7 @@ You are a professional research analyst. Please provide a summary based on the f
 					{"role": "user", "content": task}
 				]
 		final_result, _ = self._run_agent_step(messages, self.all_tools)
-		print(f"final result: {final_result}")
+		# print(f"final result: {final_result}")
 		self._save_memory(task, final_result)
 
 		self._close()
@@ -704,6 +713,7 @@ You are a professional research analyst. Please provide a summary based on the f
 					if cmd in confirm_choice:
 						self._clear_memory()
 						self.console.print("[dim]所有历史记忆已清空[/]")
+					continue
 				elif not cmd:
 					continue
 				
