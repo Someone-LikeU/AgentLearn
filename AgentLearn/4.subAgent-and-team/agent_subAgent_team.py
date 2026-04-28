@@ -29,7 +29,8 @@ class ToolNameConstant:
 	MAKE_PLAN: Final = "MAKE_PLAN"
 	LOAD_SKILL_DETAIL_BY_NAME: Final = "LOAD_SKILL_DETAIL_BY_NAME",
 	GET_TIME: Final = "GET_TIME",
-	WEB_SEARCH: Final = "WEB_SEARCH"
+	WEB_SEARCH: Final = "WEB_SEARCH",
+	LIST_DIR: Final = "LIST_DIR",
 
 
 class Agent:
@@ -103,6 +104,7 @@ class Agent:
 			ToolNameConstant.LOAD_SKILL_DETAIL_BY_NAME: self._load_skill_detail_by_name,
 			ToolNameConstant.GET_TIME: self._get_time,
 			ToolNameConstant.WEB_SEARCH: self._web_search,
+			ToolNameConstant.LIST_DIR: self._list_dir,
 		}
 		# TODO 这里客户端后续要剥离出来，不在这里初始化，在一个编排类里面初始化
 		self.mcp_client = MCPClient(server_script=mcp_server_script)
@@ -304,6 +306,20 @@ You are a professional research analyst. Please provide a summary based on the f
 		except Exception as e:
 			return f"WEB_SEARCH 执行失败: {e}"
 
+	def _list_dir(self, path):
+		"""
+		列出目录path下的所有内容，忽略.git等
+		:param path: 路径
+		:return: 该路径下的所有内容
+		"""
+		entries = sorted(os.listdir(path))
+		result = []
+		for entry in entries:
+			full = os.path.join(path, entry)
+			prefix = "[dir]" if os.path.isdir(full) else "[file]"
+			result.append(f"{prefix} {entry}")
+		return "\n".join(result) or "Empty directory"
+		
 	def _save_memory(self, task, result):
 		if not self._is_main_agent:
 			# 如果不是主agent，即由主agent临时创建的子agent，就不保存记忆
