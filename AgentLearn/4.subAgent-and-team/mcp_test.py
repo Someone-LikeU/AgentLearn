@@ -7,7 +7,7 @@ import time
 from mcp_client import MCPClient
 
 
-def test_subprocess_mode():
+def subprocess_mode_test():
     """Test subprocess mode (STDIO communication)"""
     print("=" * 60)
     print("Test Mode: Subprocess Mode (STDIO)")
@@ -42,7 +42,7 @@ def test_subprocess_mode():
     print("\nSubprocess mode test PASSED")
 
 
-def test_tcp_mode():
+def tcp_mode_test():
     """Test TCP mode"""
     print("\n" + "=" * 60)
     print("Test Mode: TCP Mode")
@@ -103,13 +103,13 @@ if __name__ == "__main__":
     print("Verify subprocess mode and TCP mode work correctly\n")
 
     print("[Part 1] Test Subprocess Mode")
-    test_subprocess_mode()
+    subprocess_mode_test()
 
     print("\n" + "=" * 60)
     print("[Part 2] Test TCP Mode")
     print("=" * 60)
-
-    test_tcp_mode()
+    
+    tcp_mode_test()
 
     print("\n" + "=" * 60)
     print("All tests completed!")

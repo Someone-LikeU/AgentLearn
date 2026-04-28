@@ -26,6 +26,7 @@ class MCPClient:
 		base_dir = __import__("os").path.dirname(__import__("os").path.abspath(__file__))
 		self.server_script = server_script or __import__("os").path.join(base_dir, "mcp_server.py")
 		self.mode = mode
+		print(f"MCP client working mode {self.mode}")
 		self.host = host
 		self.port = port
 		
