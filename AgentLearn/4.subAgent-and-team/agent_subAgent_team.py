@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from typing import Any, Final
 from openai import OpenAI
 from mcp_client import MCPClient
+from duckduckgo_search import DDGS
 
 class ToolNameConstant:
 	"""
@@ -23,7 +24,8 @@ class ToolNameConstant:
 	EXECUTE_BASH: Final = "EXECUTE_BASH"
 	MAKE_PLAN: Final = "MAKE_PLAN"
 	LOAD_SKILL_DETAIL_BY_NAME: Final = "LOAD_SKILL_DETAIL_BY_NAME",
-	GET_TIME: Final = "GET_TIME"
+	GET_TIME: Final = "GET_TIME",
+	WEB_SEARCH: Final = "WEB_SEARCH"
 
 
 class Agent:
@@ -96,6 +98,7 @@ class Agent:
 			ToolNameConstant.MAKE_PLAN: self._make_plan,
 			ToolNameConstant.LOAD_SKILL_DETAIL_BY_NAME: self._load_skill_detail_by_name,
 			ToolNameConstant.GET_TIME: self._get_time,
+			ToolNameConstant.WEB_SEARCH: self._web_search,
 		}
 		# TODO 这里客户端后续要剥离出来，不在这里初始化，在一个编排类里面初始化
 		self.mcp_client = MCPClient(server_script=mcp_server_script)
@@ -226,6 +229,73 @@ class Agent:
 	def _get_time(self):
 		from datetime import datetime
 		return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+	def _web_search(self, query: str, max_results: int = 10) -> str:
+		"""
+		使用duckduckgo_search 搜索网络结果，然后再叫模型进行总结
+		:param query: 搜索内容
+		:param max_results: 最多搜索条数，默认10
+		:return: 经过模型总结后的结果
+		"""
+		max_results = int(max_results) if max_results else 10
+		max_results = max(1, min(max_results, 10))
+
+		try:
+			# 1) 搜索网络
+			with DDGS() as ddgs:
+				results = list(ddgs.text(query, max_results=max_results))
+
+			if not results:
+				return f"未搜索到与“{query}”相关的结果。"
+
+			# 2) 整理搜索结果，给模型做总结
+			search_text_lines = []
+			for i, item in enumerate(results, 1):
+				title = item.get("title", "").strip()
+				body = item.get("body", "").strip()
+				href = item.get("href", "").strip()
+
+				search_text_lines.append(
+					f"{i}. 标题: {title}\n"
+					f"   摘要: {body}\n"
+					f"   链接: {href}\n"
+				)
+
+			search_text = "\n".join(search_text_lines)
+
+			summarization_prompt = f"""
+				你是一个信息总结助手。请根据以下联网搜索结果，给出中文总结。
+			
+				要求：
+				1. 只基于提供的搜索结果总结，不要编造不属于搜索结果的事实。
+				2. 先给出简洁结论，再给出要点。
+				3. 如果结果之间有冲突，请明确说明。
+				4. 如果信息不足，请明确说明信息不足。
+				5. 输出要适合直接给用户阅读。
+			
+				搜索关键词：{query}
+			
+				搜索结果：
+				{search_text}
+				""".strip()
+
+			# 3) 调用模型总结
+			# TODO 修改这里的提示词方式
+			summary_response = self.client.chat.completions.create(
+				model=self.model,
+				messages=[
+					{"role": "system", "content": "You are a precise and concise information summarizer."},
+					{"role": "user", "content": summarization_prompt},
+				],
+				temperature=0,
+			)
+
+			summary = summary_response.choices[0].message.content
+			return summary if summary else "未能生成总结。"
+
+		except Exception as e:
+			return f"WEB_SEARCH 执行失败: {e}"
+
 
 	def _save_memory(self, task, result):
 		if not self._is_main_agent:
@@ -568,9 +638,6 @@ class Agent:
 						)
 		final_result, _ = sub_agent.agent_run(task)
 		return final_result
-
-
-
 
 
 if __name__ == "__main__":
