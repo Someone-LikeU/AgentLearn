@@ -31,7 +31,7 @@ class ToolNameConstant:
 class Agent:
 	"""支持本地工具 + MCP工具的Agent。"""
 
-	def __init__(self, model="qwen3.5:9b", 
+	def __init__(self, model="qwen3.5:9b",
 				 temperature: float=0.1,
 				 base_url: str=None,
 				 api_key: str=None,
@@ -167,6 +167,10 @@ class Agent:
 		return tools_in_openai_format
 
 	def _execute_bash(self, command):
+		# 安全检查：拦截危险命令
+		dangerous = ["rm -rf /", "mkfs", "dd if=", "> /dev/sd"]
+		if any(d in command for d in dangerous):
+			return "The command is dangerous, refused to execute it.", "The command is dangerous, refused to execute it."
 		result = subprocess.run(command, shell=True, capture_output=True)
 		stdout, stderr = self._decode_subprocess_result(result)
 		return stdout + stderr
@@ -260,32 +264,30 @@ class Agent:
 					f"   摘要: {body}\n"
 					f"   链接: {href}\n"
 				)
-
 			search_text = "\n".join(search_text_lines)
 
 			summarization_prompt = f"""
-				你是一个信息总结助手。请根据以下联网搜索结果，给出中文总结。
-			
-				要求：
-				1. 只基于提供的搜索结果总结，不要编造不属于搜索结果的事实。
-				2. 先给出简洁结论，再给出要点。
-				3. 如果结果之间有冲突，请明确说明。
-				4. 如果信息不足，请明确说明信息不足。
-				5. 输出要适合直接给用户阅读。
-			
-				搜索关键词：{query}
-			
-				搜索结果：
-				{search_text}
-				""".strip()
-
+You are a professional research analyst. Please provide a summary based on the following user search content and web search results.
+# Requirements:
+1.Source Fidelity: Summarize based only on the provided search results; do not fabricate facts or include external information.
+2.Structure: Provide a concise conclusion first, followed by a bulleted list of key points.
+3.Conflict Resolution: If there are contradictions or conflicts between different sources, clearly point them out.
+4.Sufficiency Check: If the provided information is insufficient to answer the query, explicitly state that information is lacking.
+5.Language Consistency: If the user's query is in Chinese, respond in Chinese. If the query is in English, respond in English.
+6.Tone: The output must be polished and suitable for direct presentation to the end user.
+"""
+			user_content = f"""
+# User search content
+{query}
+# Search Results
+{search_text}
+"""
 			# 3) 调用模型总结
-			# TODO 修改这里的提示词方式
 			summary_response = self.client.chat.completions.create(
 				model=self.model,
 				messages=[
-					{"role": "system", "content": "You are a precise and concise information summarizer."},
-					{"role": "user", "content": summarization_prompt},
+					{"role": "system", "content": summarization_prompt},
+					{"role": "user", "content": user_content},
 				],
 				temperature=0,
 			)
@@ -295,7 +297,6 @@ class Agent:
 
 		except Exception as e:
 			return f"WEB_SEARCH 执行失败: {e}"
-
 
 	def _save_memory(self, task, result):
 		if not self._is_main_agent:
@@ -308,7 +309,7 @@ class Agent:
 				f.write(entry)
 		except Exception as e:
 			print(f"Error in saving memory: {task}, exception: {e}")
-	
+
 	def _load_memory(self):
 		# 如果是子agent，就不给前面的记忆
 		if not self._is_main_agent:
@@ -326,7 +327,7 @@ class Agent:
 				return "\n".join(lines[-50:]) if len(lines) > 50 else content
 		except Exception as e:
 			print(f"Error in loading memory, exception: {e}")
-	
+
 	def _make_plan(self, task):
 		if self.plan_mode:
 			return "Error: can't make plan within a plan"
