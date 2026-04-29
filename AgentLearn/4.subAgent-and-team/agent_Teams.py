@@ -1,0 +1,1021 @@
+# encoding : utf-8
+# @Time    : 2026/4/19
+import glob as glob_module
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+from subprocess import CompletedProcess
+from types import SimpleNamespace
+from typing import Any, Final
+from openai import OpenAI
+from mcp_client import MCPClient
+from duckduckgo_search import DDGS
+from rich.console import Console
+from rich.markdown import Markdown
+from rich.panel import Panel
+
+
+class ToolNameConstant:
+    """
+    工具名称常量类
+    """
+    READ_FILE: Final = "READ_FILE"
+    WRITE_FILE: Final = "WRITE_FILE"
+    EDIT: Final = "EDIT"
+    GLOB: Final = "GLOB"
+    GREP: Final = "GREP"
+    EXECUTE_BASH: Final = "EXECUTE_BASH"
+    MAKE_PLAN: Final = "MAKE_PLAN"
+    LOAD_SKILL_DETAIL_BY_NAME: Final = "LOAD_SKILL_DETAIL_BY_NAME",
+    GET_TIME: Final = "GET_TIME",
+    WEB_SEARCH: Final = "WEB_SEARCH",
+    LIST_DIR: Final = "LIST_DIR",
+    SUB_AGENT: Final = "SUB_AGENT",
+
+
+# 定义 Hook 管道
+before_hooks = [check_blacklist, ask_confirmation, log_command]
+after_hooks  = [truncate_output, log_result]
+
+class Agent:
+    """支持本地工具 + MCP工具的Agent。"""
+
+    def __init__(self, model="qwen3.5:9b",
+                 temperature: float = 0.1,
+                 base_url: str = None,
+                 api_key: str = None,
+                 mcp_client=None,
+                 is_main_agent: bool = True,
+                 role: str = "Main Agent",
+                 name: str = None):
+        """
+        初始化Agent对象
+        :param model: 使用模型
+        :param temperature: 模型推理时温度
+        :param base_url: 模型的url
+        :param api_key: 模型api_key
+        :param mcp_client: MCP客户端实例（由外部传入）
+        :param is_main_agent: 是否是主Agent，默认True
+        :param role: Agent角色，默认为主agent
+        :param name: Agent名称，默认为主agent
+        """
+        # 角色和名字
+        self.role = role
+        self.name = name
+
+        # 通信信道
+        self.inbox = []
+
+        # base_url
+        self._base_url = os.environ.get("OPENAI_BASE_URL") if base_url is None else base_url
+
+        # api_key
+        self._api_key = os.environ.get("OPENAI_API_KEY") if api_key is None else api_key
+
+        # openAI 请求客户端
+        self.client = OpenAI(
+            base_url=self._base_url,
+            api_key=self._api_key,
+        )
+
+        # 是否是主agent, False表示由Agent创建的子Agent,默认为True
+        self._is_main_agent = is_main_agent
+
+        # 记忆文件
+        self.memory_file = "agent/memory.md"
+
+        # 最大迭代次数
+        self.max_iterations = 100
+
+        # 使用模型
+        self.model = model
+
+        # llm温度参数
+        self.temperature = temperature
+
+        # 是否处在plan模式
+        self.plan_mode = False
+
+        # 当前plan列表
+        self.current_plan: list[str] = []
+
+        # 规则和技能目录
+        self.rules_dir = "agent/rules"
+        self.skills_dir = "agent/skills"
+
+        # 各SKILL.md缓存,key 为SKILL的name，value为SKILL.md完整内容
+        self._skills_cache = {}
+
+        # 加载本地工具
+        self.local_tools = self._load_local_tools()
+        print(f"{len(self.local_tools)} local tools loaded")
+        self.local_functions = {
+            ToolNameConstant.EXECUTE_BASH: self._execute_bash,
+            ToolNameConstant.READ_FILE: self._read_file,
+            ToolNameConstant.WRITE_FILE: self._write_file,
+            ToolNameConstant.EDIT: self._edit,
+            ToolNameConstant.GLOB: self._glob,
+            ToolNameConstant.GREP: self._grep,
+            ToolNameConstant.MAKE_PLAN: self._make_plan,
+            ToolNameConstant.LOAD_SKILL_DETAIL_BY_NAME: self._load_skill_detail_by_name,
+            ToolNameConstant.GET_TIME: self._get_time,
+            ToolNameConstant.WEB_SEARCH: self._web_search,
+            ToolNameConstant.LIST_DIR: self._list_dir
+        }
+        # 主agent才加subagent工具
+        if self._is_main_agent:
+            self.local_functions[ToolNameConstant.SUB_AGENT] = self._sub_agent
+
+        # MCP客户端（由外部传入，不在Agent内部创建）
+        self.mcp_client = mcp_client
+        # 加载MCP工具
+        if self.mcp_client:
+            self.mcp_tools = self._load_mcp_tools()
+            print(f"{len(self.mcp_tools)} MCP tools loaded")
+        else:
+            self.mcp_tools = []
+            print("No MCP client provided, MCP tools not loaded")
+
+        self.available_functions: dict[str, Any] = {}
+        self.available_functions.update(self.local_functions)
+        # 动态更新可用的工具列表
+        for tool in self.mcp_tools:
+            tool_name = tool["function"]["name"]
+            self.available_functions[tool_name] = self._make_mcp_executor(tool_name)
+
+        self.all_tools = self.local_tools + self.mcp_tools
+
+        # 基础提示词，用于主agent
+        self._base_prompt_main_agent = "You are an interactive agent that helps users with daily tasks or software engineering tasks. Use the instructions below and the tools available to you to assist the user."
+
+        # 子agent提示词
+        self._base_prompt_sub_agent = f"You are a {role} that helps users with a specific task, focus on the task. Use the instructions below and the tools available to you to assist the user."
+
+        # 缓存系统提示词,后续记忆压缩的时候可能会用到
+        self._cached_system_prompt = self._build_system_prompt()
+
+        # 单次会话中的短期记忆，可以跨多次chat
+        self.messages = [
+            {"role": "system", "content": self._cached_system_prompt}
+        ]
+
+        self.console = Console()
+
+    def receive(self, sender, message):
+        """
+        通信，接收来自其他agent的信息
+        :param sender: 发送者
+        :param message: 消息
+        :return: 无
+        """
+        self.inbox.append({"from": sender, "content": message})
+
+    def _make_mcp_executor(self, tool_name: str):
+        """为MCP工具生成执行器，就是调用mcp客户端的call_tool方法"""
+
+        def _executor(**kwargs):
+            return self.mcp_client.call_tool(tool_name, kwargs)
+
+        return _executor
+
+    def _load_local_tools(self) -> list[dict[str, Any]]:
+        """
+        加载本地工具列表
+        :return:
+        """
+        print("loading local tools...")
+        tools_path = os.path.join(os.path.dirname(__file__), "local_tools.json")
+        with open(tools_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    def _load_mcp_tools(self) -> list[dict[str, Any]]:
+        """
+        加载远端可用mcp工具列表
+        :return:
+        """
+        mcp_tools = self.mcp_client.list_tools()
+        tools_in_openai_format = []
+        # 按OpenAI的工具格式添加
+        for tool in mcp_tools:
+            tools_in_openai_format.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool["name"],
+                        "description": tool.get("description", ""),
+                        "parameters": tool.get("parameters", {"type": "object", "properties": {}}),
+                    },
+                }
+            )
+        return tools_in_openai_format
+
+    def _execute_bash(self, command):
+        # 安全检查：拦截危险命令
+        dangerous = ["rm -rf /", "mkfs", "dd if=", "> /dev/sd"]
+        if any(d in command for d in dangerous):
+            return "The command is dangerous, refused to execute it.", "The command is dangerous, refused to execute it."
+        result = subprocess.run(command, shell=True, capture_output=True)
+        stdout, stderr = self._decode_subprocess_result(result)
+        return stdout + stderr
+
+    def _decode_subprocess_result(self, result: CompletedProcess[bytes] | CompletedProcess[Any]):
+        if isinstance(result.stdout, str):
+            stdout = result.stdout
+        else:
+            stdout = b"" if result.stdout is None else result.stdout
+        if isinstance(result.stderr, str):
+            stderr = result.stderr
+        else:
+            stderr = b"" if result.stderr is None else result.stderr
+
+        if isinstance(stdout, str) and isinstance(stderr, str):
+            return stdout, stderr
+
+        for enc in ("utf-8", "gbk", "gb18030"):
+            try:
+                decoded_out = stdout.decode(enc)
+                decoded_err = stderr.decode(enc)
+                return decoded_out, decoded_err
+            except UnicodeDecodeError:
+                continue
+        return stdout.decode("utf-8", errors="replace"), stderr.decode("utf-8", errors="replace")
+
+    def _read_file(self, path, offset=None, limit=None):
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        start = offset if offset else 0
+        end = start + limit if limit else len(lines)
+        numbered = [f"{i + 1:4d} {line}" for i, line in enumerate(lines[start:end], start)]
+        return "".join(numbered)
+
+    def _write_file(self, path, content):
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        return f"Successfully wrote to {path}"
+
+    def _edit(self, path, old_string, new_string):
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read()
+        if content.count(old_string) != 1:
+            return "Error: old_string must appear exactly once"
+        new_content = content.replace(old_string, new_string)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(new_content)
+        return f"Successfully edited {path}"
+
+    def _glob(self, pattern):
+        files = glob_module.glob(pattern, recursive=True)
+        files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+        return "\n".join(files) if files else "No files found"
+
+    def _grep(self, pattern, path="."):
+        result = subprocess.run(f"grep -r '{pattern}' {path}", shell=True, capture_output=True)
+        stdout, _ = self._decode_subprocess_result(result)
+        return stdout if stdout else "No matches found"
+
+    def _get_time(self):
+        from datetime import datetime
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    def _web_search(self, query: str, max_results: int = 10) -> str:
+        """
+        使用duckduckgo_search 搜索网络结果，然后再叫模型进行总结
+        :param query: 搜索内容
+        :param max_results: 最多搜索条数，默认10
+        :return: 经过模型总结后的结果
+        """
+        max_results = int(max_results) if max_results else 10
+        max_results = max(1, min(max_results, 10))
+
+        try:
+            # 1) 搜索网络
+            with DDGS() as ddgs:
+                results = list(ddgs.text(query, max_results=max_results))
+
+            if not results:
+                return f"未搜索到与“{query}”相关的结果。"
+
+            # 2) 整理搜索结果，给模型做总结
+            search_text_lines = []
+            for i, item in enumerate(results, 1):
+                title = item.get("title", "").strip()
+                body = item.get("body", "").strip()
+                href = item.get("href", "").strip()
+
+                search_text_lines.append(
+                    f"{i}. 标题: {title}\n"
+                    f"   摘要: {body}\n"
+                    f"   链接: {href}\n"
+                )
+            search_text = "\n".join(search_text_lines)
+
+            summarization_prompt = f"""
+You are a professional research analyst. Please provide a summary based on the following user search content and web search results.
+# Requirements:
+1.Source Fidelity: Summarize based only on the provided search results; do not fabricate facts or include external information.
+2.Structure: Provide a concise conclusion first, followed by a bulleted list of key points.
+3.Conflict Resolution: If there are contradictions or conflicts between different sources, clearly point them out.
+4.Sufficiency Check: If the provided information is insufficient to answer the query, explicitly state that information is lacking.
+5.Language Consistency: If the user's query is in Chinese, respond in Chinese. If the query is in English, respond in English.
+6.Tone: The output must be polished and suitable for direct presentation to the end user.
+"""
+            user_content = f"""
+# User search content
+{query}
+# Search Results
+{search_text}
+"""
+            # 3) 调用模型总结
+            summary_response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": summarization_prompt},
+                    {"role": "user", "content": user_content},
+                ],
+                temperature=0,
+            )
+
+            summary = summary_response.choices[0].message.content
+            return summary if summary else "未能生成总结。"
+
+        except Exception as e:
+            return f"WEB_SEARCH 执行失败: {e}"
+
+    def _list_dir(self, path):
+        """
+        列出目录path下的所有内容，忽略.git等
+        :param path: 路径
+        :return: 该路径下的所有内容
+        """
+        entries = sorted(os.listdir(path))
+        result = []
+        for entry in entries:
+            full = os.path.join(path, entry)
+            prefix = "[dir]" if os.path.isdir(full) else "[file]"
+            result.append(f"{prefix} {entry}")
+        return "\n".join(result) or "Empty directory"
+
+    def _save_memory(self, task, result):
+        if not self._is_main_agent:
+            # 如果不是主agent，即由主agent临时创建的子agent，就不保存记忆
+            return ""
+        timestamp = self._get_time()
+        entry = f"\n## {timestamp}\n**Task:** {task}\n**Result:** {result}\n"
+        try:
+            with open(self.memory_file, "a", encoding="utf-8") as f:
+                f.write(entry)
+        except Exception as e:
+            print(f"Error in saving memory: {task}, exception: {e}")
+
+    def _load_memory(self):
+        # 如果是子agent，就不给前面的记忆
+        if not self._is_main_agent:
+            return ""
+        memory_path = os.path.join(os.path.dirname(__file__), self.memory_file)
+        try:
+            if not os.path.exists(memory_path):
+                print("The agent is initializing for the first time, creating the memory file")
+                with open(memory_path, "w", encoding="utf-8") as f:
+                    f.write("")
+                return ""
+            with open(memory_path, "r", encoding="utf-8") as f:
+                content = f.read()
+                lines = content.split("\n")
+                return "\n".join(lines[-50:]) if len(lines) > 50 else content
+        except Exception as e:
+            print(f"Error in loading memory, exception: {e}")
+
+    def _make_plan(self, task):
+        if self.plan_mode:
+            return "Error: can't make plan within a plan"
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a task planning assistant. Break down the task into simple steps as JSON object with key 'steps'.",
+                },
+                {"role": "user", "content": f"Task: {task}"},
+            ],
+            response_format={"type": "json_object"},
+            temperature=self.temperature,
+        )
+        try:
+            plan_data = json.loads(response.choices[0].message.content)
+            print("make plan response is: ", response)
+            steps = plan_data.get("steps", [task]) if isinstance(plan_data, dict) else [task]
+            self.current_plan = steps
+            print(f"[Plan] {len(steps)} steps created")
+            return steps
+        except Exception:
+            print(f"[Plan] Failed to parse steps, returning original task {task}, exception {e}")
+            return [task]
+
+    def _parse_tool_arguments(self, raw_arguments: str) -> dict[str, Any]:
+        """
+        解析调用工具的参数
+        :param raw_arguments: 字符串形式的参数
+        :return: 解析的json格式参数
+        """
+        if not raw_arguments:
+            return {}
+        try:
+            parsed = json.loads(raw_arguments)
+            return parsed if isinstance(parsed, dict) else {}
+        except json.JSONDecodeError as error:
+            return {"_argument_error": f"Invalid JSON arguments: {error}"}
+
+    def _load_rules(self):
+        """
+        加载所有规则md文档，字符串形式返回
+        :return:
+        """
+        rules = []
+        if not os.path.exists(self.rules_dir):
+            return rules
+        for rule_file in Path(self.rules_dir).glob("*.md"):
+            with open(rule_file, "r", encoding="utf-8") as f:
+                rules.append(f.read())
+        return "\n\n".join(rules) if rules else []
+
+    def _load_skill_meta_infos(self):
+        """
+        获取skill元信息，name和description，顺便缓存一下完整SKILL.md的内容
+        :return:
+        """
+        import yaml
+        skills = []
+        if not os.path.exists(self.skills_dir):
+            return []
+        # 先清空缓存
+        self._skills_cache.clear()
+        for item in os.listdir(self.skills_dir):
+            skill_dir = os.path.join(self.skills_dir, item)
+            if not os.path.isdir(skill_dir):
+                continue
+            skill_md_file = os.path.join(skill_dir, "SKILL.md")
+            if not os.path.exists(skill_md_file):
+                continue
+            with open(skill_md_file, "r", encoding="utf-8") as f:
+                content = f.read()
+            # 解析 YAML frontmatter
+            if content.startswith("---"):
+                frontmatter_end = content.find("---", 3)
+                if frontmatter_end != -1:
+                    frontmatter = content[3:frontmatter_end].strip()
+                    meta = yaml.safe_load(frontmatter)
+                    if meta and "name" in meta:
+                        skills.append({
+                            "name": meta.get("name"),
+                            "description": meta.get("description", ""),
+                        })
+                        # 缓存完整SKILL内容
+                        self._skills_cache[meta.get("name")] = content
+        return skills
+
+    def _load_skill_detail_by_name(self, name):
+        """
+        根据skill名称读取SKILL.md完整内容
+        :param name:
+        :return:
+        """
+        if not self._skills_cache:
+            self._load_skill_meta_infos()
+        return self._skills_cache.get(name, "")
+
+    def _run_agent_step(self, tools):
+        for i in range(self.max_iterations):
+            # 先压缩历史对话
+            self.messages = compact_messages(self.messages)
+            response_stream = self.client.chat.completions.create(
+                model=self.model,
+                messages=self.messages,
+                tools=tools,
+                temperature=self.temperature,
+                stream=True,
+            )
+            # message = response_stream.choices[0].message
+            # messages.append(message)
+            message = self._deal_stream_response(response_stream)
+            print()
+            # 按照OpenAI的格式对message进行复原然后加回历史对话
+            self.messages.append({
+                "role": "assistant",
+                "content": message.content,
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        },
+                    }
+                    for tc in (message.tool_calls or [])
+                ] if message.tool_calls else None,
+            })
+
+            # 无工具调用，结束
+            if not message.tool_calls:
+                return message.content, messages
+            print(f"[Iter {i}]: message is: {message}")
+
+            for tool_call in message.tool_calls:
+                function_payload = getattr(tool_call, "function", None)
+                if function_payload is None:
+                    continue
+                function_name = str(getattr(function_payload, "name", ""))
+                raw_arguments = str(getattr(function_payload, "arguments", ""))
+                function_args = self._parse_tool_arguments(raw_arguments)
+                function_impl = self.available_functions.get(function_name)
+
+                if function_impl is None:
+                    function_response = f"Error: Unknown tool '{function_name}'"
+                elif "_argument_error" in function_args:
+                    function_response = f"Error: {function_args['_argument_error']}"
+                elif function_name == ToolNameConstant.MAKE_PLAN:
+                    self.plan_mode = True
+                    steps = function_impl(**function_args)
+                    if not isinstance(steps, list):
+                        function_response = steps
+                    else:
+                        results = []
+                        step_cnt = 0
+                        for step in steps:
+                            print(f"[Step {step_cnt + 1}]: {step}")
+                            self.messages.append({"role": "user", "content": step})
+                            result, messages = self._run_agent_step(
+                                [t for t in tools if t["function"]["name"] != ToolNameConstant.MAKE_PLAN]
+                            )
+                            print(f"[Step {step_cnt + 1}] result:{result}, messages: {messages}")
+                            step_cnt += 1
+                            results.append(result)
+                        function_response = "\n".join(results)
+                    self.plan_mode = False
+                    self.current_plan = []
+                else:
+                    try:
+                        print(f"[Tool call] tool name: {function_name}, tool arguments: {raw_arguments}")
+                        function_response = function_impl(**function_args)
+                    except Exception as error:
+                        function_response = f"Error when calling '{function_name}': {error}"
+
+                self.messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": json.dumps(function_response, ensure_ascii=False)
+                    }
+                )
+        return "Max iterations reached", messages
+
+    def _build_system_prompt(self):
+        from prompt_builder import build_system_prompt
+        # 置空当前prompt
+        self._cached_system_prompt = None
+        memory = self._load_memory()
+        rules = self._load_rules()
+        skills = self._load_skill_meta_infos()
+        base_prompt = [
+            self._base_prompt_main_agent if self._is_main_agent else self._base_prompt_sub_agent,
+        ]
+        self._cached_system_prompt = build_system_prompt(base_prompt, rules, skills, memory)
+        return self._cached_system_prompt
+
+    def _deal_stream_response(self, stream_response):
+        """
+        为了用户体验，需要做流式响应，这里需要处理模型的流式响应，
+        所以需要 1）流式打印响应内容，2）累积工具调用的chunks,因为同一个工具调用的参数可能在两个chunk里分两次返回
+        :param stream_response:
+        :return: 转换后的一个message对象
+        """
+        # 完整reply
+        full_reply = ""
+        # 累积工具调用
+        tool_calls = {}
+        for chunk in stream_response:
+            # 防御，有时delta可能不存在
+            choice = chunk.choices[0]
+            delta = choice.delta
+            # 1) 流式打印响应内容
+            content = getattr(delta, "content", None)
+            if content:
+                print(content, end="", flush=True)
+                full_reply += content
+
+            # 2) 累积还原工具调用
+            delta_tool_calls = getattr(delta, "tool_calls", None)
+            if delta_tool_calls:
+                for tc in delta_tool_calls:
+                    idx = tc.index
+                    if idx not in tool_calls:
+                        tool_calls[idx] = {
+                            "id": getattr(tc, "id", None),
+                            "name": "",
+                            "arguments": "",
+                        }
+                    func = getattr(tc, "function", None)
+                    if func is not None:
+                        name = getattr(func, "name", None)
+                        args = getattr(func, "arguments", None)
+                        if name:
+                            tool_calls[idx]["name"] = name
+                        if args:
+                            tool_calls[idx]["arguments"] += args
+
+        # 转换兼容的结构
+        ordered_tool_calls = []
+        for idx in sorted(tool_calls.keys()):
+            item = tool_calls[idx]
+            ordered_tool_calls.append(
+                SimpleNamespace(
+                    id=item["id"],
+                    function=SimpleNamespace(
+                        name=item["name"],
+                        arguments=item["arguments"],
+                    ),
+                )
+            )
+        message = SimpleNamespace(
+            content=full_reply if full_reply else None,
+            tool_calls=ordered_tool_calls if ordered_tool_calls else None,
+        )
+        return message
+
+    def _sub_agent(self, role, task):
+        """
+        调用一个子agent，处理一个专门的子任务
+        这里sub_agent的话，怎么编排？怎么输入输出？结果怎么处理
+        :param role:
+        :param task:
+        :return:
+        """
+        if not self._is_main_agent:
+            return "Error: can't create sub-agent within a sub-agent"
+
+        sub_agent = Agent(model=self.model,
+                          temperature=self.temperature,
+                          base_url=self._base_url,
+                          api_key=self._api_key,
+                          role=role,
+                          is_main_agent=False
+                          )
+        final_result, _ = sub_agent.chat(task)
+        return final_result
+
+    def _clear_memory(self):
+        """
+        清空记忆文件
+        :return:
+        """
+        if not self._is_main_agent:
+            return
+        memory_path = os.path.join(os.path.dirname(__file__), self.memory_file)
+        try:
+            if not os.path.exists(memory_path):
+                return
+            else:
+                with open(memory_path, "w", encoding="utf-8") as f:
+                    f.write("")
+        except Exception as e:
+            print(f"Error in loading memory, exception: {e}")
+
+    def chat(self, task):
+        """
+        Agent单次任务运行入口
+        :param task: 用户任务
+        :return: 执行任务结果
+        """
+        # 如果 inbox 有新消息，先注入self.messages
+        if self.inbox:
+            mail = "\n".join(f"[from {m['from']}]: {m['content']}" for m in self.inbox)
+            self.messages.append({"role": "user", "content": f"You received message from teammate:\n{mail}"})
+            # 让 Agent 先消化这些消息
+            resp = self.client.chat.completions.create(model=self.model, messages=self.messages)
+            self.messages.append(resp.choices[0].message)
+            self.inbox.clear()
+
+        # TODO 这里跨chat保存每次会话的每个任务的短期记忆，初始时self.messages里只有一个system prompt
+        # 再拼接本次任务并执行
+        self.messages.append({"role": "user", "content": task})
+        # TODO 这里run_agent_step里的messages变量需要看看哪些要改成self.messages
+        final_result, _ = self._run_agent_step(self.all_tools)
+        # print(f"final result: {final_result}")
+        self._save_memory(task, final_result)
+
+        return final_result
+
+    def run(self):
+        """
+        Agent loop实现，对话入口
+        :return:
+        """
+        self.console.print(Panel(
+            "[bold green]JanVis[/] — At you service, sir! What can I do for you today?\n\n"
+            "  [blue]命令[/]: exit/q/quit 退出 | clear 清空当前会话历史 | clear memory",
+            border_style="green", padding=(1, 2),
+        ))
+        self.console.print(f"[dim]当前工作目录：{os.getcwd()}[/]")
+        self.console.print(f"[dim]使用模型：{self.model}[/]")
+
+        confirm_choice = ("y", "yes", "是", "确认", "对", "")
+
+        while True:
+            try:
+                user_input = self.console.input("[bold cyan]You >[/] ")
+                cmd = user_input.strip().lower()
+                if cmd in ("exit", "q", "quit"):
+                    self.console.print("\n[bold red] See you next time! [/]")
+                    break
+                elif cmd == "clear":
+                    user_input = self.console.input("[bold cyan]是否确认清除当前会话历史？(yes/y)[/] ")
+                    cmd = user_input.strip().lower()
+                    if cmd in confirm_choice:
+                        self._build_system_prompt()
+                        self.console.print("[dim]当前对话历史已清空[/]")
+                    continue
+                elif cmd == "clear memory":
+                    user_input = self.console.input("[bold cyan]是否确认清除历史记忆？(yes/y)[/] ")
+                    cmd = user_input.strip().lower()
+                    if cmd in confirm_choice:
+                        self._clear_memory()
+                        self.console.print("[dim]所有历史记忆已清空[/]")
+                    continue
+                elif not cmd:
+                    continue
+
+                # 上面分支都没中，就是用户任务了
+                self.chat(user_input)
+                self.console.print()
+            except KeyboardInterrupt:
+                self.console.print("\n[bold red] See you next time! [/]")
+                break
+
+"""
+Team 类管理多个Agent，
+"""
+
+class Team:
+    def __init__(self):
+        self.agents = {}  # name → Agent
+
+    def hire(self, name, role):
+        """招募：创建一个持久 Agent"""
+        agent = Agent(name, role)
+        self.agents[name] = agent
+        return agent
+
+    def send(self, from_name, to_name, message):
+        """Agent 之间的通信通道"""
+        if to_name not in self.agents:
+            return f"Error: {to_name} not found"
+        self.agents[to_name].receive(from_name, message)
+        print(f"  [communication] from {from_name} to {to_name}: {message[:60]}...")
+
+    def broadcast(self, from_name, message):
+        """广播：给团队所有其他人发消息"""
+        for name, agent in self.agents.items():
+            if name != from_name:
+                agent.receive(from_name, message)
+        print(f"  [broadcast] from {from_name} to all teammates: {message[:60]}...")
+
+    def disband(self):
+        """解散：所有 Agent 生命周期结束"""
+        names = list(self.agents.keys())
+        self.agents.clear()
+        print(f"  [dismiss] The team are dismissed ({', '.join(names)})")
+
+"""
+团队编排
+"""
+def plan_team(task):
+    """让 LLM 根据任务规划团队成员"""
+    print(f"\n[PM] 分析任务，组建团队...")
+    response = client.chat.completions.create(
+        model=MODEL,
+        messages=[
+            {"role": "system", "content": """You are a project manager. Given a task, plan a team of 2-4 members.
+Return JSON: {"team": [{"name": "alice", "role": "...", "task": "..."}]}
+Rules: use lowercase english names, last member should be a reviewer, keep tasks concise."""},
+            {"role": "user", "content": task}
+        ],
+        response_format={"type": "json_object"}
+    )
+    try:
+        return json.loads(response.choices[0].message.content).get("team", [])
+    except:
+        return [{"name": "dev", "role": "developer", "task": task}]
+
+def run_team(task):
+    """
+    完整的团队协作流程，展示三个核心能力:
+
+    1. 持久记忆 —— 同一个 Agent 被多次 chat()，记得之前做过什么
+    2. 身份生命周期 —— hire() 创建 → 多次交互 → disband() 解散
+    3. 通信通道 —— Agent 之间通过 send()/broadcast() 传递信息
+    """
+    team = Team()
+
+    # ---- 第 1 阶段：组建团队 ----
+    members = plan_team(task)
+    print(f"\n[团队] {len(members)} 人:")
+    for i, m in enumerate(members, 1):
+        print(f"  {i}. {m['name']} — {m['role']} → {m['task']}")
+
+    print(f"\n{'='*60}")
+    print("  第 1 阶段: 招募团队")
+    print(f"{'='*60}")
+    for m in members:
+        team.hire(m["name"], m["role"])
+
+    # ---- 第 2 阶段：逐个执行，每人干完把成果广播给全队 ----
+    print(f"\n{'='*60}")
+    print("  第 2 阶段: 协作开发")
+    print(f"{'='*60}")
+
+    results = {}
+    for i, m in enumerate(members):
+        print(f"\n{'─'*60}")
+        print(f"  [{i+1}/{len(members)}] {m['name']} 开始工作")
+        print(f"{'─'*60}")
+
+        agent = team.agents[m["name"]]
+        result = agent.chat(m["task"])
+        results[m["name"]] = result
+
+        # 干完活，把成果广播给团队其他人
+        team.broadcast(m["name"], f"我完成了任务。摘要: {result[:200]}")
+
+    # ---- 第 3 阶段（可选）：让最后一个成员做二次审查 ----
+    # 这里展示"持久记忆"的价值：reviewer 已经通过 inbox 收到了所有人的成果
+    # 再次 chat() 时，他还记得之前收到的所有广播消息
+    last = members[-1]
+    reviewer = team.agents[last["name"]]
+
+    print(f"\n{'='*60}")
+    print(f"  第 3 阶段: {last['name']} 做最终审查")
+    print(f"{'='*60}")
+
+    review = reviewer.chat("请根据你收到的所有团队成果，做一个最终的总结和审查。如有问题请指出。")
+    results["final_review"] = review
+
+    # ---- 解散 ----
+    print(f"\n{'='*60}")
+    print("  第 4 阶段: 解散团队")
+    print(f"{'='*60}")
+    team.disband()
+
+    # ---- 输出 ----
+    print(f"\n{'='*60}")
+    print("  最终成果")
+    print(f"{'='*60}\n")
+    for name, result in results.items():
+        print(f"[{name}]")
+        print(f"  {result[:300]}\n")
+
+    return results
+
+# =============  临时记忆压缩  ====================
+COMPACT_THRESHOLD = 20  # 超过 20 条就压缩
+KEEP_RECENT = 6         # 保留最近 6 条不压缩
+
+def compact_messages(messages):
+    if len(messages) <= COMPACT_THRESHOLD:
+        return messages  # 没超阈值，不压缩
+
+    system_msg = messages[0]                   # system prompt 永远保留
+    old_messages = messages[1:-KEEP_RECENT]     # 旧消息 → 要被压缩
+    recent_messages = messages[-KEEP_RECENT:]   # 最近的消息 → 保留原样
+
+    # 把旧消息拼成文本
+    old_text = ""
+    for msg in old_messages:
+        role = msg.get("role", "unknown") if isinstance(msg, dict) else getattr(msg, "role", "unknown")
+        content = msg.get("content", "") if isinstance(msg, dict) else getattr(msg, "content", "")
+        if content:
+            old_text += f"[{role}]: {content}\n"
+
+    # 调用 LLM 生成摘要
+    summary_response = client.chat.completions.create(
+        model=MODEL,
+        messages=[
+            {"role": "system", "content": "Summarize the following conversation history. Keep all important facts, file paths, command results, and decisions. Be concise but don't lose critical details."},
+            {"role": "user", "content": old_text}
+        ]
+    )
+    summary = summary_response.choices[0].message.content
+
+    # 重新组装
+    return [
+        system_msg,
+        {"role": "user", "content": f"[Previous conversation summary]: {summary}"},
+        {"role": "assistant", "content": "Understood. I have the context from our previous conversation. Let me continue."},
+        *recent_messages
+    ]
+"""
+TODO 压缩方案优化方向：
+ 压缩前先写回永久记忆，（问GPT，先实现永久记忆用RAG （用chroma 向量数据库）， 还是先实现这里的写回永久记忆
+ 触发条件：	消息条数超过固定阈值  ->	基于 token 数精确计算，考虑模型的实际窗口大小
+压缩方式：	一次性把所有旧消息压缩成一段摘要 ->	分层压缩：最近的保留原文，稍远的做摘要，更远的只保留关键事实
+保留策略：	固定保留最近 N 条   ->	智能选择：保留包含文件路径、错误信息等关键消息
+摘要质量：	通用摘要 prompt	-> 针对 coding 场景优化的摘要 prompt，确保保留文件路径、代码片段、决策原因
+ 
+"""
+
+# ====================安全防护==============
+# 危险命令正则
+DANGEROUS_PATTERNS = [
+    r'\brm\s+(-[a-zA-Z]*f[a-zA-Z]*\s+|.*--no-preserve-root)',  # rm -rf
+    r'\brm\s+(-[a-zA-Z]*r[a-zA-Z]*\s+)?/',                     # rm /
+    r'\bmkfs\b',                    # 格式化磁盘
+    r'\bdd\s+.*of\s*=\s*/dev/',     # 覆写磁盘
+    r'>\s*/dev/sd[a-z]',            # 重定向到磁盘设备
+    r'\bchmod\s+(-R\s+)?777\s+/',   # chmod 777 /
+    r':\(\)\s*\{',                  # fork bomb
+    r'\bcurl\b.*\|\s*(ba)?sh',      # curl | bash
+    r'\bwget\b.*\|\s*(ba)?sh',      # wget | bash
+    r'\bshutdown\b',                # 关机
+    r'\breboot\b',                  # 重启
+]
+
+# 第一道防线
+def is_dangerous(command):
+    for pattern in DANGEROUS_PATTERNS:
+        if re.search(pattern, command):
+            return True, pattern
+    return False, None
+
+# 第二道防线，让用户确认
+AUTO_APPROVE = True
+def ask_user_confirmation(tool_name, args):
+    if AUTO_APPROVE:
+        return True
+
+    print(f"\n┌─ 确认执行 ─────────────────────────────")
+    print(f"│ 工具: {tool_name}")
+    for key, value in args.items():
+        print(f"│ {key}: {str(value)[:200]}")
+    print(f"└────────────────────────────────────────")
+
+    while True:
+        answer = input("[Y]执行 / [N]跳过 / [Q]终止 Agent > ").strip().lower()
+        if answer in ('y', 'yes', ''):
+            return True
+        elif answer in ('n', 'no'):
+            return False
+        elif answer in ('q', 'quit'):
+            sys.exit(0)
+
+# 第三道防线 截断输出
+MAX_OUTPUT_LENGTH = 5000
+
+def truncate_output(text):
+    if len(text) <= MAX_OUTPUT_LENGTH:
+        return text
+    half = MAX_OUTPUT_LENGTH // 2
+    return (
+        text[:half]
+        + f"\n\n... [输出过长，已截断。原始 {len(text)} 字符，保留首尾各 {half} 字符] ...\n\n"
+        + text[-half:]
+    )
+
+"""
+安全优化方向：
+命令过滤	正则黑名单	更精细的分类：安全命令免确认、危险命令强制拦截、中间地带让用户选
+用户确认	文本终端 Y/N	图形化界面，支持 "Always allow" 记住选择
+执行隔离	无	Docker / 虚拟机沙箱，限制文件系统访问范围
+输出控制	字符数截断	基于 token 数精确控制，结合第六篇的压缩机制
+网络控制	无	限制可访问的域名、禁止下载执行脚本
+"""
+
+# 定义 Hook 管道
+before_hooks = [check_blacklist, ask_confirmation, log_command]
+after_hooks  = [truncate_output, log_result]
+
+# 通用的工具执行函数，hook机制
+def execute_tool(name, args):
+    # 执行前：依次过所有 before hook
+    for hook in before_hooks:
+        blocked, msg = hook(name, args)
+        if blocked:
+            return msg              # 任何一个 hook 可以拦截
+
+    # 实际执行
+    result = available_functions[name](**args)
+
+    # 执行后：依次过所有 after hook
+    for hook in after_hooks:
+        result = hook(name, result)
+
+    return result
+
+if __name__ == "__main__":
+    from agent_run import AgentRunner
+    runner = AgentRunner(
+        model="minimax-m2.7:cloud",
+        mcp_mode="subprocess",
+    )
+    runner.run()
