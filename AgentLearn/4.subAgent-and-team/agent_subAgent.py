@@ -31,27 +31,28 @@ class ToolNameConstant:
 	GET_TIME: Final = "GET_TIME",
 	WEB_SEARCH: Final = "WEB_SEARCH",
 	LIST_DIR: Final = "LIST_DIR",
+	SUB_AGENT: Final = "SUB_AGENT",
 
 
 class Agent:
 	"""支持本地工具 + MCP工具的Agent。"""
 
 	def __init__(self, model="qwen3.5:9b",
-				 temperature: float=0.1,
-				 base_url: str=None,
-				 api_key: str=None,
-	             mcp_mode: str="subprocess",
+				 temperature: float = 0.1,
+				 base_url: str = None,
+				 api_key: str = None,
+				 mcp_client=None,
 				 is_main_agent: bool = True,
-				 role: str="Main Agent"):
+				 role: str = "Main Agent"):
 		"""
 		初始化Agent对象
 		:param model: 使用模型
 		:param temperature: 模型推理时温度
 		:param base_url: 模型的url
 		:param api_key: 模型api_key
+		:param mcp_client: MCP客户端实例（由外部传入）
 		:param is_main_agent: 是否是主Agent，默认True
 		:param role: Agent角色，默认为主agent
-		:param mcp_mode: mcp运行模式，默认紫金城
 		"""
 		# base_url
 		self._base_url = os.environ.get("OPENAI_BASE_URL") if base_url is None else base_url
@@ -64,6 +65,9 @@ class Agent:
 			base_url=self._base_url,
 			api_key=self._api_key,
 		)
+
+		# 是否是主agent, False表示由Agent创建的子Agent,默认为True
+		self._is_main_agent = is_main_agent
 
 		# 记忆文件
 		self.memory_file = "agent/memory.md"
@@ -104,14 +108,21 @@ class Agent:
 			ToolNameConstant.LOAD_SKILL_DETAIL_BY_NAME: self._load_skill_detail_by_name,
 			ToolNameConstant.GET_TIME: self._get_time,
 			ToolNameConstant.WEB_SEARCH: self._web_search,
-			ToolNameConstant.LIST_DIR: self._list_dir,
+			ToolNameConstant.LIST_DIR: self._list_dir
 		}
-		# TODO 这里客户端后续要剥离出来，不在这里初始化，在一个编排类里面初始化
-		self.mcp_client = MCPClient(mode=mcp_mode)
-		self.mcp_client.start()
+		# 主agent才加subagent工具
+		if self._is_main_agent:
+			self.local_functions[ToolNameConstant.SUB_AGENT] = self._sub_agent
+		
+		# MCP客户端（由外部传入，不在Agent内部创建）
+		self.mcp_client = mcp_client
 		# 加载MCP工具
-		self.mcp_tools = self._load_mcp_tools()
-		print(f"{len(self.mcp_tools)} MCP tools loaded")
+		if self.mcp_client:
+			self.mcp_tools = self._load_mcp_tools()
+			print(f"{len(self.mcp_tools)} MCP tools loaded")
+		else:
+			self.mcp_tools = []
+			print("No MCP client provided, MCP tools not loaded")
 
 		self.available_functions: dict[str, Any] = {}
 		self.available_functions.update(self.local_functions)
@@ -131,13 +142,12 @@ class Agent:
 		# 缓存系统提示词,后续记忆压缩的时候可能会用到
 		self._cached_system_prompt = None
 
-		# 是否是主agent, False表示由Agent创建的子Agent,默认为True
-		self._is_main_agent = is_main_agent
 
 		self.console = Console()
 
 	def _make_mcp_executor(self, tool_name: str):
 		"""为MCP工具生成执行器，就是调用mcp客户端的call_tool方法"""
+
 		def _executor(**kwargs):
 			return self.mcp_client.call_tool(tool_name, kwargs)
 
@@ -319,7 +329,7 @@ You are a professional research analyst. Please provide a summary based on the f
 			prefix = "[dir]" if os.path.isdir(full) else "[file]"
 			result.append(f"{prefix} {entry}")
 		return "\n".join(result) or "Empty directory"
-		
+
 	def _save_memory(self, task, result):
 		if not self._is_main_agent:
 			# 如果不是主agent，即由主agent临时创建的子agent，就不保存记忆
@@ -605,10 +615,6 @@ You are a professional research analyst. Please provide a summary based on the f
 		)
 		return message
 
-	def _close(self):
-		# 关闭mcp客户端，TODO 后续修改为在agent loop前后进行打开和关闭，不要让外界感知
-		self.mcp_client.close()
-
 	def _sub_agent(self, role, task):
 		"""
 		调用一个子agent，处理一个专门的子任务
@@ -618,27 +624,15 @@ You are a professional research analyst. Please provide a summary based on the f
 		:return:
 		"""
 		if not self._is_main_agent:
-			# TODO 这里的返回格式可能需要再改
 			return "Error: can't create sub-agent within a sub-agent"
-		# TODO 这里如果只是新建一个Agent，还存在如下问题：
-		#  	1、memory文件共享的问题，没有做到记忆隔离,
-		#  	2、还有system prompt要区分出子agent和主agent的部分
-		#   3、本地工具列表里现在还没加主agent有的sub_agent方法，加上后新建子agent对象时怎么少给这个本地方法
-		#   4、子agent的运行结果怎么返回，主agent和子agent的提示词有哪些需要区分的，怎么用文件区分出来
-		#   5、子agent直接执行agent_run时，会有一步save_memory，会和主agent矛盾，写同一个memory文件，这个要怎么处理
-					# save_memory的时候先判断是否是主agent，否就直接返回
-		# TODO 如果把run的逻辑改为一个编排类来做，这里的逻辑可能还得改
-		# TODO 建一个记录过程中怎么设计架构的文档
-		# TODO 可能需要将现有逻辑拆解出一个编排类来解决以上关于子agent的问题
 
-		# TODO 28日最新，先改一版Agent loop的出来
 		sub_agent = Agent(model=self.model,
 						  temperature=self.temperature,
 						  base_url=self._base_url,
 						  api_key=self._api_key,
 						  role=role,
 						  is_main_agent=False
-						)
+						  )
 		final_result, _ = sub_agent.chat(task)
 		return final_result
 
@@ -661,16 +655,16 @@ You are a professional research analyst. Please provide a summary based on the f
 
 	def chat(self, task):
 		"""
-		Agent运行入口
+		Agent单次任务运行入口
 		:param task: 用户任务
 		:return: 执行任务结果
 		"""
 		system_prompt = self._build_system_prompt()
 		# 拼接完整上下文
 		messages = [
-					{"role": "system", "content": system_prompt},
-					{"role": "user", "content": task}
-				]
+			{"role": "system", "content": system_prompt},
+			{"role": "user", "content": task}
+		]
 		final_result, _ = self._run_agent_step(messages, self.all_tools)
 		# print(f"final result: {final_result}")
 		self._save_memory(task, final_result)
@@ -716,42 +710,19 @@ You are a professional research analyst. Please provide a summary based on the f
 					continue
 				elif not cmd:
 					continue
-				
+
 				# 上面分支都没中，就是用户任务了
 				self.chat(user_input)
 				self.console.print()
 			except KeyboardInterrupt:
 				self.console.print("\n[bold red] See you next time! [/]")
 				break
-		
+
 
 if __name__ == "__main__":
-	my_agent = Agent(model="minimax-m2.7:cloud")
-	task = "找到当前目录下所有文件中的TODO内容并整理到TODO.md文件中，如果TODO.md文件已存在，就先删除它"
-	my_agent.run()
-
-	# TODO 新建一个编排类，由这个编排类来控制Agent的运行，需要剥离Agent的mcp_server属性
-	# TODO 任务完成得不好，考虑设计一个评价器，调整温度重新生成
-	# TODO 实现后台定时任务，agent自主行动，类似车机上车后自动打开空调等
-	# TODO 记忆系统修改，维护两个记忆md文档，一个放未压缩的，一个放压缩的，运行时写两个文件，load记忆时优先load压缩的，再结合RAG做运行时检索旧记忆
-	# TODO sub agent的记忆怎么处理
-	# TODO agent的角色问题，比如问你是谁，系统提示词里加角色扮演以及工具或者skills等东西无法回答用户问题时回答“对不起。。。。。”
-	# TODO 模型配置，比如api_key, model, base_url等，用一个json，再提供工具给用户来修改模型等参数
-	# fc-90a9530d614f483f8a26d7f427be688d firecrawl秘钥
-
-	"""
-	TODO 子agent，两种实现方式：
-	1、隐式定义：一个类似读写文件、执行bash命令等的工具，在工具中另起一个Agent对象，通过提示词区分角色，该agent临时启用，生命周期为本次对话，任务完成就丢失
-		需要扩展Agent对象的属性，新增is_main_agent、agent_name、agent id等属性，
-	
-	2、显式定义：针对特定任务预先定义一个独立的子agent，独立的设定，可用工具列表和主agent存在部分交集，可能完全继承所有工具，也可能有主agent没有的工具，
-		记忆可以存到磁盘里做永久，下次类似的任务唤起该子agent时能load上一次的工作记忆
-	
-	二者区别：
-	对比项	 |    隐式    |      显式
-	创建方式  | agent运行时动态创建 | 预先根据特定任务定义特定agent，代码/配置文件定义
-	生命周期  | 临时创建，任务完成即销毁 | 可复用，类似于程序可永久存活在磁盘
-	有无状态  |  有状态   |	无状态
-	可控性	| 灵活，可控性弱 | 可控性强，输出可预测
-	适用场景	| 不确定性任务，由Agent自主决策 | 流程可固化的企业工作流，可配合Skill一起实现
-	"""
+	from agent_run import AgentRunner
+	runner = AgentRunner(
+		model="minimax-m2.7:cloud",
+		mcp_mode="subprocess",
+	)
+	runner.run()
