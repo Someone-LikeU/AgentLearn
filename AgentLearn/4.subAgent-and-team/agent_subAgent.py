@@ -113,7 +113,7 @@ class Agent:
 		# 主agent才加subagent工具
 		if self._is_main_agent:
 			self.local_functions[ToolNameConstant.SUB_AGENT] = self._sub_agent
-		
+
 		# MCP客户端（由外部传入，不在Agent内部创建）
 		self.mcp_client = mcp_client
 		# 加载MCP工具
@@ -669,7 +669,6 @@ You are a professional research analyst. Please provide a summary based on the f
 		# print(f"final result: {final_result}")
 		self._save_memory(task, final_result)
 
-		self._close()
 		return final_result
 
 	def run(self):
