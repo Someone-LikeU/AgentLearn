@@ -222,8 +222,8 @@
   {
     "type": "function",
     "function": {
-      "name": "subagent",
-      "description": "Delegate a task to a specialized sub-agent with its own role and independent context.",
+      "name": "SUB_AGENT",
+      "description": "Delegate a task to a specialized sub-agent with its own role and independent context. When a complex task can be broken down into multiple independent, unrelated subtasks, call this function for each subtask.",
       "parameters": {
         "type": "object",
         "properties": {
