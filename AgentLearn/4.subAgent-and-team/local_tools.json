@@ -218,5 +218,29 @@
         "required": []
       }
     }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "subagent",
+      "description": "Delegate a task to a specialized sub-agent with its own role and independent context.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "role": {
+            "type": "string",
+            "description": "The sub-agent's specialty, e.g. 'Python backend developer'"
+          },
+          "task": {
+            "type": "string",
+            "description": "The specific task to delegate"
+          }
+        },
+        "required": [
+          "role",
+          "task"
+        ]
+      }
+    }
   }
 ]
