@@ -1,0 +1,53 @@
+# Skill本地模型目录
+
+此目录用于存放自定义嵌入模型权重。
+
+## 默认模型
+
+已内置 m3e-base 模型（moka-ai/m3e-base），作为默认嵌入模型使用。
+- 路径：`models/m3e-base/`
+- 维度：768
+- 语言：中文优化
+- 无需联网即可使用
+
+## 使用方法
+
+1. 将模型权重文件放置到此目录的子目录中
+   例如：`models/my-custom-model/`
+
+2. 模型文件应包含：
+   - config.json
+   - pytorch_model.bin 或 model.safetensors
+   - tokenizer.json
+   - vocab.txt (如需要)
+   - 其他必要文件
+
+3. 使用模型管理工具扫描并切换：
+   ```bash
+   python scripts/model_manager.py --scan
+   python scripts/model_manager.py --interactive
+   ```
+
+## 模型来源
+
+推荐从 HuggingFace 下载模型：
+https://huggingface.co/models?search=sentence-transformers
+
+## 目录结构示例
+
+```
+models/
+├── my-custom-model/
+│   ├── config.json
+│   ├── model.safetensors
+│   ├── tokenizer.json
+│   └── vocab.txt
+└── another-model/
+│   ├── ...
+```
+
+## 注意事项
+
+- 模型必须与 sentence-transformers 兼容
+- 切换模型后需要重新构建索引
+- 不同模型维度可能不同
