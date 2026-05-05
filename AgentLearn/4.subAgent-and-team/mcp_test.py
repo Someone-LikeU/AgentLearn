@@ -99,7 +99,7 @@ def tcp_mode_test():
 
 
 if __name__ == "__main__":
-    print("MCP Client Test")
+    print("MCP Client Test")    
     print("Verify subprocess mode and TCP mode work correctly\n")
 
     print("[Part 1] Test Subprocess Mode")

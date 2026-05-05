@@ -65,6 +65,8 @@ class Agent:
     _BASH_AUTO_APPROVE = True
     # 目前没有默认加入 after hook，保留给后续控制超长输出时使用。
     _BASH_MAX_OUTPUT_LENGTH = 5000
+    _COMPACT_THRESHOLD = 20
+    _KEEP_RECENT = 6
 
     def __init__(self, model="qwen3.5:9b",
                  temperature: float = 0.1,
@@ -107,8 +109,9 @@ class Agent:
         # 是否是主agent, False表示由Agent创建的子Agent,默认为True
         self._is_main_agent = is_main_agent
 
-        # 记忆文件
-        self.memory_file = "agent/memory.md"
+        # 记忆文件：precise 保存任务/结果摘要，full 保存单次任务完整上下文。
+        self.precise_memory_file = "agent/precise_memory.md"
+        self.full_memory_file = "agent/full_memory.md"
 
         # 最大迭代次数
         self.max_iterations = 100
@@ -197,6 +200,8 @@ class Agent:
             # 初始化时添加系统提示词
             {"role": "system", "content": self._cached_system_prompt}
         ]
+        # 当前任务的完整上下文，用于保存长期记忆
+        self._current_task_full_context = None
 
         self.console = Console()
 
@@ -461,23 +466,47 @@ You are a professional research analyst. Please provide a summary based on the f
             result.append(f"{prefix} {entry}")
         return "\n".join(result) or "Empty directory"
 
-    def _save_memory(self, task, result):
+    def _agent_file_path(self, relative_path):
+        return os.path.join(os.path.dirname(__file__), relative_path)
+
+    def _save_precise_memory(self, task, result):
         if not self._is_main_agent:
             # 如果不是主agent，即由主agent临时创建的子agent，就不保存记忆
             return ""
         timestamp = self._get_time()
         entry = f"\n## {timestamp}\n**Task:** {task}\n**Result:** {result}\n"
         try:
-            with open(self.memory_file, "a", encoding="utf-8") as f:
+            with open(self._agent_file_path(self.precise_memory_file), "a", encoding="utf-8") as f:
                 f.write(entry)
         except Exception as e:
-            print(f"Error in saving memory: {task}, exception: {e}")
+            print(f"Error in saving precise memory: {task}, exception: {e}")
 
-    def _load_memory(self):
+    def _save_full_memory(self, task, result):
+        if not self._is_main_agent:
+            return ""
+
+        timestamp = self._get_time()
+        context = self._current_task_full_context or []
+        entry = (
+            f"\n## {timestamp}\n"
+            f"**Task:** {task}\n"
+            f"**Result:** {result}\n\n"
+            "### Full Context\n"
+            "```json\n"
+            f"{json.dumps(context, ensure_ascii=False, indent=2)}\n"
+            "```\n"
+        )
+        try:
+            with open(self._agent_file_path(self.full_memory_file), "a", encoding="utf-8") as f:
+                f.write(entry)
+        except Exception as e:
+            print(f"Error in saving full memory: {task}, exception: {e}")
+
+    def _load_precise_memory(self):
         # 如果是子agent，就不给前面的记忆
         if not self._is_main_agent:
             return ""
-        memory_path = os.path.join(os.path.dirname(__file__), self.memory_file)
+        memory_path = self._agent_file_path(self.precise_memory_file)
         try:
             if not os.path.exists(memory_path):
                 print("The agent is initializing for the first time, creating the memory file")
@@ -490,6 +519,28 @@ You are a professional research analyst. Please provide a summary based on the f
                 return "\n".join(lines[-50:]) if len(lines) > 50 else content
         except Exception as e:
             print(f"Error in loading memory, exception: {e}")
+
+    def _append_message(self, message, capture_full_context=True):
+        self.messages.append(message)
+        if capture_full_context and self._current_task_full_context is not None:
+            self._current_task_full_context.append(self._normalize_message_for_memory(message))
+
+    def _normalize_message_for_memory(self, message):
+        if isinstance(message, dict):
+            normalized = message
+        elif hasattr(message, "model_dump"):
+            normalized = message.model_dump()
+        elif hasattr(message, "to_dict"):
+            normalized = message.to_dict()
+        else:
+            normalized = {
+                "role": getattr(message, "role", None),
+                "content": getattr(message, "content", None),
+            }
+            tool_calls = getattr(message, "tool_calls", None)
+            if tool_calls is not None:
+                normalized["tool_calls"] = tool_calls
+        return json.loads(json.dumps(normalized, ensure_ascii=False, default=str))
 
     def _make_plan(self, task):
         if self.plan_mode:
@@ -539,9 +590,11 @@ You are a professional research analyst. Please provide a summary based on the f
         rules = []
         if not os.path.exists(self.rules_dir):
             return rules
+        system_time = self._get_time()
         for rule_file in Path(self.rules_dir).glob("*.md"):
             with open(rule_file, "r", encoding="utf-8") as f:
-                rules.append(f.read())
+                content = f.read().replace("<system-time>", system_time)
+                rules.append(content)
         return "\n\n".join(rules) if rules else []
 
     def _load_skill_meta_infos(self):
@@ -589,10 +642,42 @@ You are a professional research analyst. Please provide a summary based on the f
             self._load_skill_meta_infos()
         return self._skills_cache.get(name, "")
 
+    def _compact_messages(self):
+        if len(self.messages) <= self._COMPACT_THRESHOLD:
+            return
+
+        system_msg = self.messages[0]
+        old_messages = self.messages[1:-self._KEEP_RECENT]
+        recent_messages = self.messages[-self._KEEP_RECENT:]
+
+        old_text = ""
+        for msg in old_messages:
+            role = msg.get("role", "unknown") if isinstance(msg, dict) else getattr(msg, "role", "unknown")
+            content = msg.get("content", "") if isinstance(msg, dict) else getattr(msg, "content", "")
+            if content:
+                old_text += f"[{role}]: {content}\n"
+
+        # TODO 做摘要的提示词应该还需要进一步扩充，以及需要修改加载方式，以及下面重新构造self.messages的提示词内容
+        summary_response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": "Summarize the following conversation history. Keep all important facts, file paths, command results, and decisions. Be concise but don't lose critical details."},
+                {"role": "user", "content": old_text}
+            ]
+        )
+        summary = summary_response.choices[0].message.content
+
+        self.messages = [
+            system_msg,
+            {"role": "user", "content": f"[Previous conversation summary]: {summary}"},
+            {"role": "assistant", "content": "Understood. I have the context from our previous conversation. Let me continue."},
+            *recent_messages
+        ]
+
     def _run_agent_step(self, tools):
         for i in range(self.max_iterations):
             # 先压缩历史对话
-            self.messages = compact_messages(self.messages)
+            self._compact_messages()
             response_stream = self.client.chat.completions.create(
                 model=self.model,
                 messages=self.messages,
@@ -605,7 +690,7 @@ You are a professional research analyst. Please provide a summary based on the f
             message = self._deal_stream_response(response_stream)
             print()
             # 按照OpenAI的格式对message进行复原然后加回当前的短期历史记忆
-            self.messages.append({
+            self._append_message({
                 "role": "assistant",
                 "content": message.content,
                 "tool_calls": [
@@ -650,7 +735,7 @@ You are a professional research analyst. Please provide a summary based on the f
                         step_cnt = 0
                         for step in steps:
                             print(f"[Step {step_cnt + 1}]: {step}")
-                            self.messages.append({"role": "user", "content": step})
+                            self._append_message({"role": "user", "content": step})
                             result = self._run_agent_step(
                                 [t for t in tools if t["function"]["name"] != ToolNameConstant.MAKE_PLAN]
                             )
@@ -668,7 +753,7 @@ You are a professional research analyst. Please provide a summary based on the f
                     except Exception as error:
                         function_response = f"Error when calling '{function_name}': {error}"
                 # 加入本次会话的短期记忆
-                self.messages.append(
+                self._append_message(
                     {
                         "role": "tool",
                         "tool_call_id": tool_call.id,
@@ -681,7 +766,7 @@ You are a professional research analyst. Please provide a summary based on the f
         from prompt_builder import build_system_prompt
         # 置空当前prompt
         self._cached_system_prompt = None
-        memory = self._load_memory()
+        memory = self._load_precise_memory()
         rules = self._load_rules()
         skills = self._load_skill_meta_infos()
         base_prompt = [
@@ -778,15 +863,15 @@ You are a professional research analyst. Please provide a summary based on the f
         """
         if not self._is_main_agent:
             return
-        memory_path = os.path.join(os.path.dirname(__file__), self.memory_file)
-        try:
-            if not os.path.exists(memory_path):
-                return
-            else:
+        for memory_file in (self.precise_memory_file, self.full_memory_file):
+            memory_path = self._agent_file_path(memory_file)
+            try:
+                if not os.path.exists(memory_path):
+                    continue
                 with open(memory_path, "w", encoding="utf-8") as f:
                     f.write("")
-        except Exception as e:
-            print(f"Error in loading memory, exception: {e}")
+            except Exception as e:
+                print(f"Error in clearing memory {memory_file}, exception: {e}")
 
     def chat(self, task):
         """
@@ -794,22 +879,27 @@ You are a professional research analyst. Please provide a summary based on the f
         :param task: 用户任务
         :return: 执行任务结果
         """
-        # 如果 inbox 有新消息，先注入self.messages
-        if self.inbox:
-            mail = "\n".join(f"[from {m['from']}]: {m['content']}" for m in self.inbox)
-            self.messages.append({"role": "user", "content": f"You received message from teammate:\n{mail}"})
-            # 让 Agent 先消化这些消息
-            resp = self.client.chat.completions.create(model=self.model, messages=self.messages)
-            self.messages.append(resp.choices[0].message)
-            self.inbox.clear()
+        # 初始化当前任务的完整上下文记录
+        self._current_task_full_context = []
+        try:
+            # 如果 inbox 有新消息，先注入self.messages
+            if self.inbox:
+                mail = "\n".join(f"[from {m['from']}]: {m['content']}" for m in self.inbox)
+                self._append_message({"role": "user", "content": f"You received message from teammate:\n{mail}"})
+                # 让 Agent 先消化这些消息
+                resp = self.client.chat.completions.create(model=self.model, messages=self.messages)
+                self._append_message(resp.choices[0].message)
+                self.inbox.clear()
 
-        # 再拼接本次任务并执行
-        self.messages.append({"role": "user", "content": task})
-        final_result = self._run_agent_step(self.all_tools)
-        # print(f"final result: {final_result}")
-        self._save_memory(task, final_result)
-
-        return final_result
+            # 再拼接本次任务并执行
+            self._append_message({"role": "user", "content": task})
+            final_result = self._run_agent_step(self.all_tools)
+            # print(f"final result: {final_result}")
+            self._save_precise_memory(task, final_result)
+            self._save_full_memory(task, final_result)
+            return final_result
+        finally:
+            self._current_task_full_context = None
 
     def run(self):
         """
@@ -981,43 +1071,6 @@ def run_team(task):
 
     return results
 
-# =============  临时记忆压缩  ====================
-COMPACT_THRESHOLD = 20  # 超过 20 条就压缩
-KEEP_RECENT = 6         # 保留最近 6 条不压缩
-
-def compact_messages(messages):
-    if len(messages) <= COMPACT_THRESHOLD:
-        return messages  # 没超阈值，不压缩
-
-    system_msg = messages[0]                   # system prompt 永远保留
-    old_messages = messages[1:-KEEP_RECENT]     # 旧消息 → 要被压缩
-    recent_messages = messages[-KEEP_RECENT:]   # 最近的消息 → 保留原样
-
-    # 把旧消息拼成文本
-    old_text = ""
-    for msg in old_messages:
-        role = msg.get("role", "unknown") if isinstance(msg, dict) else getattr(msg, "role", "unknown")
-        content = msg.get("content", "") if isinstance(msg, dict) else getattr(msg, "content", "")
-        if content:
-            old_text += f"[{role}]: {content}\n"
-
-    # 调用 LLM 生成摘要
-    summary_response = client.chat.completions.create(
-        model=MODEL,
-        messages=[
-            {"role": "system", "content": "Summarize the following conversation history. Keep all important facts, file paths, command results, and decisions. Be concise but don't lose critical details."},
-            {"role": "user", "content": old_text}
-        ]
-    )
-    summary = summary_response.choices[0].message.content
-
-    # 重新组装
-    return [
-        system_msg,
-        {"role": "user", "content": f"[Previous conversation summary]: {summary}"},
-        {"role": "assistant", "content": "Understood. I have the context from our previous conversation. Let me continue."},
-        *recent_messages
-    ]
 """
 TODO 压缩方案优化方向：
  压缩前先写回永久记忆，（问GPT，先实现永久记忆用RAG （用chroma 向量数据库）， 还是先实现这里的写回永久记忆
@@ -1029,6 +1082,8 @@ TODO 压缩方案优化方向：
 """
 
 # TODO 优化：每次启动的会话中所有短期记忆在退出时都写到磁盘的长期记忆里
+# TODO 优化：短期记忆的加载方式以及系统提示
+# TODO 优化思考：如何保存一个任务的详细上下文且不影响当前完整工作上下文。这里有三种实现：按 self.messages 下标切片最简单，但一旦中途触发压缩会丢细节；给消息加任务边界标记会污染模型上下文；更稳的是在一次 chat(task) 期间额外维护一份“本任务上下文快照”，每次向 self.messages 追加本任务相关消息时同步记录，最后写入 full_memory.md
 
 if __name__ == "__main__":
     from agent_run import AgentRunner

@@ -35,6 +35,7 @@ def build_system_prompt(base_prompt: List, rules, skills, memory):
 
 	# 拼接记忆
 	if memory:
+		# TODO 这里改成只告诉长期记忆的位置，告诉模型需要时去哪找
 		base_prompt.append(f"\n# Previous context\n{memory}")
 
 	return "\n".join(base_prompt)
