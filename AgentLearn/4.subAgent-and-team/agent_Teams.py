@@ -36,12 +36,35 @@ class ToolNameConstant:
     SUB_AGENT: Final = "SUB_AGENT",
 
 
-# 定义 Hook 管道
-before_hooks = [check_blacklist, ask_confirmation, log_command]
-after_hooks  = [truncate_output, log_result]
-
 class Agent:
     """支持本地工具 + MCP工具的Agent。"""
+
+    # Bash 命令黑名单：只放明确高风险、不可自动执行的模式。
+    # 这里同时覆盖 Linux/macOS 常见危险命令和 Windows 批量删除命令。
+    _BASH_DANGEROUS_PATTERNS: tuple[str, ...] = (
+        r'\brm\s+(-[a-zA-Z]*f[a-zA-Z]*\s+|.*--no-preserve-root)',
+        r'\brm\s+(-[a-zA-Z]*r[a-zA-Z]*\s+)?/',
+        r'\bmkfs\b',
+        r'\bdd\s+.*of\s*=\s*/dev/',
+        r'>\s*/dev/sd[a-z]',
+        r'\bchmod\s+(-R\s+)?777\s+/',
+        r':\(\)\s*\{',
+        r'\bcurl\b.*\|\s*(ba)?sh',
+        r'\bwget\b.*\|\s*(ba)?sh',
+        r'\bshutdown\b',
+        r'\breboot\b',
+        r'\bdd\s+if\s*=',
+        r'\bdel\s+/s\b',
+        r'\brd\s+/s\b',
+        r'\brmdir\s+/s\b',
+        r'\bRemove-Item\b',
+        r'\brm\s+-rf\b',
+    )
+    # 默认不弹出交互确认，避免子 Agent 批量执行任务时阻塞。
+    # 如需人工确认，可在实例或类上改为 False。
+    _BASH_AUTO_APPROVE = True
+    # 目前没有默认加入 after hook，保留给后续控制超长输出时使用。
+    _BASH_MAX_OUTPUT_LENGTH = 5000
 
     def __init__(self, model="qwen3.5:9b",
                  temperature: float = 0.1,
@@ -109,6 +132,18 @@ class Agent:
         # 各SKILL.md缓存,key 为SKILL的name，value为SKILL.md完整内容
         self._skills_cache = {}
 
+        # Bash hook 管道只服务 _execute_bash，避免引入全局工具执行器。
+        # before hook 返回 (blocked, message)，blocked=True 时直接拦截命令。
+        self._bash_before_hooks = [
+            self._bash_check_dangerous_command,
+            self._bash_ask_user_confirmation,
+            self._bash_log_command,
+        ]
+        # after hook 接收上一个 hook 的返回值，必须返回处理后的 result。
+        self._bash_after_hooks = [
+            self._bash_log_result,
+        ]
+
         # 加载本地工具
         self.local_tools = self._load_local_tools()
         print(f"{len(self.local_tools)} local tools loaded")
@@ -157,8 +192,9 @@ class Agent:
         # 缓存系统提示词,后续记忆压缩的时候可能会用到
         self._cached_system_prompt = self._build_system_prompt()
 
-        # 单次会话中的短期记忆，可以跨多次chat
+        # 单次会话中的短期记忆，记录一次会话中的短期上下文
         self.messages = [
+            # 初始化时添加系统提示词
             {"role": "system", "content": self._cached_system_prompt}
         ]
 
@@ -213,13 +249,80 @@ class Agent:
         return tools_in_openai_format
 
     def _execute_bash(self, command):
-        # 安全检查：拦截危险命令
-        dangerous = ["rm -rf /", "mkfs", "dd if=", "> /dev/sd"]
-        if any(d in command for d in dangerous):
-            return "The command is dangerous, refused to execute it.", "The command is dangerous, refused to execute it."
+        # 保持对外签名不变，把安全检查和日志交给类内 hook 管道处理。
+        return self._execute_bash_with_hooks(command)
+
+    def _run_bash_command(self, command):
+        # 只负责实际执行和输出解码；是否允许执行由 before hook 决定。
         result = subprocess.run(command, shell=True, capture_output=True)
         stdout, stderr = self._decode_subprocess_result(result)
         return stdout + stderr
+
+    def _execute_bash_with_hooks(self, command):
+        args = {"command": command}
+        # 任意 before hook 都可以拦截命令，避免危险命令进入 subprocess。
+        for hook in self._bash_before_hooks:
+            blocked, message = hook(args)
+            if blocked:
+                return message or "Bash command was blocked."
+
+        result = self._run_bash_command(command)
+
+        for hook in self._bash_after_hooks:
+            result = hook(result)
+        return result
+
+    def _bash_command_arg(self, args: dict[str, Any]) -> str:
+        # hook 统一通过 args 传递参数，这里保证 command 最终按字符串处理。
+        command = args.get("command", "")
+        return command if isinstance(command, str) else str(command)
+
+    def _bash_check_dangerous_command(self, args: dict[str, Any]) -> tuple[bool, str | None]:
+        # 第一层防线：命中黑名单时直接拒绝执行，不再进入确认环节。
+        command = self._bash_command_arg(args)
+        for pattern in self._BASH_DANGEROUS_PATTERNS:
+            if re.search(pattern, command, flags=re.IGNORECASE):
+                return True, "The command is dangerous, refused to execute it."
+        return False, None
+
+    def _bash_ask_user_confirmation(self, args: dict[str, Any]) -> tuple[bool, str | None]:
+        # 第二层防线：需要人工确认时，把命令展示给用户再继续。
+        if self._BASH_AUTO_APPROVE:
+            return False, None
+
+        print("\nConfirm bash execution")
+        print(f"command: {self._bash_command_arg(args)[:200]}")
+        while True:
+            answer = input("[Y] execute / [N] skip / [Q] quit Agent > ").strip().lower()
+            if answer in ("y", "yes", ""):
+                return False, None
+            if answer in ("n", "no"):
+                return True, "Bash command skipped by user."
+            if answer in ("q", "quit"):
+                sys.exit(0)
+
+    def _bash_log_command(self, args: dict[str, Any]) -> tuple[bool, str | None]:
+        # 日志 hook 不改变执行结果，只记录即将运行的命令。
+        print(f"[Tool before] {ToolNameConstant.EXECUTE_BASH}: {self._bash_command_arg(args)}")
+        return False, None
+
+    def _bash_log_result(self, result: Any) -> Any:
+        # 只记录输出长度，避免把可能很长或敏感的命令输出重复打印到控制台。
+        text = result if isinstance(result, str) else str(result)
+        print(f"[Tool after] {ToolNameConstant.EXECUTE_BASH}: {len(text)} chars")
+        return result
+
+    def _bash_truncate_output(self, result: Any) -> Any:
+        # 可选 after hook：需要限制上下文长度时，可加入 self._bash_after_hooks。
+        text = result if isinstance(result, str) else str(result)
+        if len(text) <= self._BASH_MAX_OUTPUT_LENGTH:
+            return result
+        half = self._BASH_MAX_OUTPUT_LENGTH // 2
+        return (
+            text[:half]
+            + f"\n\n... [output truncated, original {len(text)} chars, kept first/last {half} chars] ...\n\n"
+            + text[-half:]
+        )
 
     def _decode_subprocess_result(self, result: CompletedProcess[bytes] | CompletedProcess[Any]):
         if isinstance(result.stdout, str):
@@ -501,7 +604,7 @@ You are a professional research analyst. Please provide a summary based on the f
             # messages.append(message)
             message = self._deal_stream_response(response_stream)
             print()
-            # 按照OpenAI的格式对message进行复原然后加回历史对话
+            # 按照OpenAI的格式对message进行复原然后加回当前的短期历史记忆
             self.messages.append({
                 "role": "assistant",
                 "content": message.content,
@@ -520,7 +623,7 @@ You are a professional research analyst. Please provide a summary based on the f
 
             # 无工具调用，结束
             if not message.tool_calls:
-                return message.content, messages
+                return message.content
             print(f"[Iter {i}]: message is: {message}")
 
             for tool_call in message.tool_calls:
@@ -537,6 +640,7 @@ You are a professional research analyst. Please provide a summary based on the f
                 elif "_argument_error" in function_args:
                     function_response = f"Error: {function_args['_argument_error']}"
                 elif function_name == ToolNameConstant.MAKE_PLAN:
+                    # 如果模型选择了先做计划，这个分支就对计划模式特殊处理
                     self.plan_mode = True
                     steps = function_impl(**function_args)
                     if not isinstance(steps, list):
@@ -547,22 +651,23 @@ You are a professional research analyst. Please provide a summary based on the f
                         for step in steps:
                             print(f"[Step {step_cnt + 1}]: {step}")
                             self.messages.append({"role": "user", "content": step})
-                            result, messages = self._run_agent_step(
+                            result = self._run_agent_step(
                                 [t for t in tools if t["function"]["name"] != ToolNameConstant.MAKE_PLAN]
                             )
-                            print(f"[Step {step_cnt + 1}] result:{result}, messages: {messages}")
+                            print(f"[Step {step_cnt + 1}] result:{result}, all messages: {self.messages}")
                             step_cnt += 1
                             results.append(result)
                         function_response = "\n".join(results)
                     self.plan_mode = False
                     self.current_plan = []
                 else:
+                    # 到这个分支就是正常调用工具
                     try:
                         print(f"[Tool call] tool name: {function_name}, tool arguments: {raw_arguments}")
                         function_response = function_impl(**function_args)
                     except Exception as error:
                         function_response = f"Error when calling '{function_name}': {error}"
-
+                # 加入本次会话的短期记忆
                 self.messages.append(
                     {
                         "role": "tool",
@@ -570,7 +675,7 @@ You are a professional research analyst. Please provide a summary based on the f
                         "content": json.dumps(function_response, ensure_ascii=False)
                     }
                 )
-        return "Max iterations reached", messages
+        return "Max iterations reached"
 
     def _build_system_prompt(self):
         from prompt_builder import build_system_prompt
@@ -649,9 +754,9 @@ You are a professional research analyst. Please provide a summary based on the f
         """
         调用一个子agent，处理一个专门的子任务
         这里sub_agent的话，怎么编排？怎么输入输出？结果怎么处理
-        :param role:
-        :param task:
-        :return:
+        :param role: 角色
+        :param task: 任务
+        :return: 任务结果
         """
         if not self._is_main_agent:
             return "Error: can't create sub-agent within a sub-agent"
@@ -698,11 +803,9 @@ You are a professional research analyst. Please provide a summary based on the f
             self.messages.append(resp.choices[0].message)
             self.inbox.clear()
 
-        # TODO 这里跨chat保存每次会话的每个任务的短期记忆，初始时self.messages里只有一个system prompt
         # 再拼接本次任务并执行
         self.messages.append({"role": "user", "content": task})
-        # TODO 这里run_agent_step里的messages变量需要看看哪些要改成self.messages
-        final_result, _ = self._run_agent_step(self.all_tools)
+        final_result = self._run_agent_step(self.all_tools)
         # print(f"final result: {final_result}")
         self._save_memory(task, final_result)
 
@@ -925,92 +1028,7 @@ TODO 压缩方案优化方向：
  
 """
 
-# ====================安全防护==============
-# 危险命令正则
-DANGEROUS_PATTERNS = [
-    r'\brm\s+(-[a-zA-Z]*f[a-zA-Z]*\s+|.*--no-preserve-root)',  # rm -rf
-    r'\brm\s+(-[a-zA-Z]*r[a-zA-Z]*\s+)?/',                     # rm /
-    r'\bmkfs\b',                    # 格式化磁盘
-    r'\bdd\s+.*of\s*=\s*/dev/',     # 覆写磁盘
-    r'>\s*/dev/sd[a-z]',            # 重定向到磁盘设备
-    r'\bchmod\s+(-R\s+)?777\s+/',   # chmod 777 /
-    r':\(\)\s*\{',                  # fork bomb
-    r'\bcurl\b.*\|\s*(ba)?sh',      # curl | bash
-    r'\bwget\b.*\|\s*(ba)?sh',      # wget | bash
-    r'\bshutdown\b',                # 关机
-    r'\breboot\b',                  # 重启
-]
-
-# 第一道防线
-def is_dangerous(command):
-    for pattern in DANGEROUS_PATTERNS:
-        if re.search(pattern, command):
-            return True, pattern
-    return False, None
-
-# 第二道防线，让用户确认
-AUTO_APPROVE = True
-def ask_user_confirmation(tool_name, args):
-    if AUTO_APPROVE:
-        return True
-
-    print(f"\n┌─ 确认执行 ─────────────────────────────")
-    print(f"│ 工具: {tool_name}")
-    for key, value in args.items():
-        print(f"│ {key}: {str(value)[:200]}")
-    print(f"└────────────────────────────────────────")
-
-    while True:
-        answer = input("[Y]执行 / [N]跳过 / [Q]终止 Agent > ").strip().lower()
-        if answer in ('y', 'yes', ''):
-            return True
-        elif answer in ('n', 'no'):
-            return False
-        elif answer in ('q', 'quit'):
-            sys.exit(0)
-
-# 第三道防线 截断输出
-MAX_OUTPUT_LENGTH = 5000
-
-def truncate_output(text):
-    if len(text) <= MAX_OUTPUT_LENGTH:
-        return text
-    half = MAX_OUTPUT_LENGTH // 2
-    return (
-        text[:half]
-        + f"\n\n... [输出过长，已截断。原始 {len(text)} 字符，保留首尾各 {half} 字符] ...\n\n"
-        + text[-half:]
-    )
-
-"""
-安全优化方向：
-命令过滤	正则黑名单	更精细的分类：安全命令免确认、危险命令强制拦截、中间地带让用户选
-用户确认	文本终端 Y/N	图形化界面，支持 "Always allow" 记住选择
-执行隔离	无	Docker / 虚拟机沙箱，限制文件系统访问范围
-输出控制	字符数截断	基于 token 数精确控制，结合第六篇的压缩机制
-网络控制	无	限制可访问的域名、禁止下载执行脚本
-"""
-
-# 定义 Hook 管道
-before_hooks = [check_blacklist, ask_confirmation, log_command]
-after_hooks  = [truncate_output, log_result]
-
-# 通用的工具执行函数，hook机制
-def execute_tool(name, args):
-    # 执行前：依次过所有 before hook
-    for hook in before_hooks:
-        blocked, msg = hook(name, args)
-        if blocked:
-            return msg              # 任何一个 hook 可以拦截
-
-    # 实际执行
-    result = available_functions[name](**args)
-
-    # 执行后：依次过所有 after hook
-    for hook in after_hooks:
-        result = hook(name, result)
-
-    return result
+# TODO 优化：每次启动的会话中所有短期记忆在退出时都写到磁盘的长期记忆里
 
 if __name__ == "__main__":
     from agent_run import AgentRunner
