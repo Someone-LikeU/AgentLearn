@@ -952,12 +952,13 @@ Team 类管理多个Agent，
 """
 
 class Team:
-    def __init__(self):
+    def __init__(self, agent_factory=None):
         self.agents = {}  # name → Agent
+        self.agent_factory = agent_factory or (lambda name, role: Agent(role=role, name=name))
 
     def hire(self, name, role):
         """招募：创建一个持久 Agent"""
-        agent = Agent(name, role)
+        agent = self.agent_factory(name, role)
         self.agents[name] = agent
         return agent
 
@@ -984,93 +985,114 @@ class Team:
 """
 团队编排
 """
-def plan_team(task):
-    """让 LLM 根据任务规划团队成员"""
-    print(f"\n[PM] 分析任务，组建团队...")
-    response = client.chat.completions.create(
-        model=MODEL,
-        messages=[
-            {"role": "system", "content": """You are a project manager. Given a task, plan a team of 2-4 members.
+class TeamOrchestrator:
+    def __init__(self, model="qwen3.5:9b", temperature: float = 0.1,
+                 base_url: str = None, api_key: str = None,
+                 client=None, mcp_client=None):
+        self.model = model
+        self.temperature = temperature
+        self._base_url = os.environ.get("OPENAI_BASE_URL") if base_url is None else base_url
+        self._api_key = os.environ.get("OPENAI_API_KEY") if api_key is None else api_key
+        self.client = client or OpenAI(base_url=self._base_url, api_key=self._api_key)
+        self.mcp_client = mcp_client
+
+    def _create_agent(self, name, role):
+        return Agent(
+            model=self.model,
+            temperature=self.temperature,
+            base_url=self._base_url,
+            api_key=self._api_key,
+            mcp_client=self.mcp_client,
+            role=role,
+            name=name,
+        )
+
+    def plan_team(self, task):
+        """让 LLM 根据任务规划团队成员"""
+        print(f"\n[PM] 分析任务，组建团队...")
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": """You are a project manager. Given a task, plan a team of 2-4 members.
 Return JSON: {"team": [{"name": "alice", "role": "...", "task": "..."}]}
 Rules: use lowercase english names, last member should be a reviewer, keep tasks concise."""},
-            {"role": "user", "content": task}
-        ],
-        response_format={"type": "json_object"}
-    )
-    try:
-        return json.loads(response.choices[0].message.content).get("team", [])
-    except:
-        return [{"name": "dev", "role": "developer", "task": task}]
+                {"role": "user", "content": task}
+            ],
+            response_format={"type": "json_object"}
+        )
+        try:
+            return json.loads(response.choices[0].message.content).get("team", [])
+        except Exception:
+            return [{"name": "dev", "role": "developer", "task": task}]
+
+    def run(self, task):
+        """
+        完整的团队协作流程，展示三个核心能力:
+
+        1. 持久记忆 —— 同一个 Agent 被多次 chat()，记得之前做过什么
+        2. 身份生命周期 —— hire() 创建 → 多次交互 → disband() 解散
+        3. 通信通道 —— Agent 之间通过 send()/broadcast() 传递信息
+        """
+        team = Team(agent_factory=self._create_agent)
+
+        members = self.plan_team(task)
+        print(f"\n[团队] {len(members)} 人")
+        for i, member in enumerate(members, 1):
+            print(f"  {i}. {member['name']} - {member['role']} -> {member['task']}")
+
+        print(f"\n{'='*60}")
+        print("  阶段 1: 招募团队")
+        print(f"{'='*60}")
+        for member in members:
+            team.hire(member["name"], member["role"])
+
+        print(f"\n{'='*60}")
+        print("  阶段 2: 协作开发")
+        print(f"{'='*60}")
+
+        results = {}
+        for i, member in enumerate(members):
+            print(f"\n{'-'*60}")
+            print(f"  [{i+1}/{len(members)}] {member['name']} 开始工作")
+            print(f"{'-'*60}")
+
+            agent = team.agents[member["name"]]
+            result = agent.chat(member["task"])
+            results[member["name"]] = result
+            team.broadcast(member["name"], f"我完成了任务。摘要: {result[:200]}")
+
+        if members:
+            last = members[-1]
+            reviewer = team.agents[last["name"]]
+
+            print(f"\n{'='*60}")
+            print(f"  阶段 3: {last['name']} 做最终审查")
+            print(f"{'='*60}")
+
+            review = reviewer.chat("请根据你收到的所有团队成果，做一个最终的总结和审查。如果有问题请指出。")
+            results["final_review"] = review
+
+        print(f"\n{'='*60}")
+        print("  阶段 4: 解散团队")
+        print(f"{'='*60}")
+        team.disband()
+
+        print(f"\n{'='*60}")
+        print("  最终成果")
+        print(f"{'='*60}\n")
+        for name, result in results.items():
+            print(f"[{name}]")
+            print(f"  {result[:300]}\n")
+
+        return results
+
+
+def plan_team(task):
+    return TeamOrchestrator().plan_team(task)
+
 
 def run_team(task):
-    """
-    完整的团队协作流程，展示三个核心能力:
-
-    1. 持久记忆 —— 同一个 Agent 被多次 chat()，记得之前做过什么
-    2. 身份生命周期 —— hire() 创建 → 多次交互 → disband() 解散
-    3. 通信通道 —— Agent 之间通过 send()/broadcast() 传递信息
-    """
-    team = Team()
-
-    # ---- 第 1 阶段：组建团队 ----
-    members = plan_team(task)
-    print(f"\n[团队] {len(members)} 人:")
-    for i, m in enumerate(members, 1):
-        print(f"  {i}. {m['name']} — {m['role']} → {m['task']}")
-
-    print(f"\n{'='*60}")
-    print("  第 1 阶段: 招募团队")
-    print(f"{'='*60}")
-    for m in members:
-        team.hire(m["name"], m["role"])
-
-    # ---- 第 2 阶段：逐个执行，每人干完把成果广播给全队 ----
-    print(f"\n{'='*60}")
-    print("  第 2 阶段: 协作开发")
-    print(f"{'='*60}")
-
-    results = {}
-    for i, m in enumerate(members):
-        print(f"\n{'─'*60}")
-        print(f"  [{i+1}/{len(members)}] {m['name']} 开始工作")
-        print(f"{'─'*60}")
-
-        agent = team.agents[m["name"]]
-        result = agent.chat(m["task"])
-        results[m["name"]] = result
-
-        # 干完活，把成果广播给团队其他人
-        team.broadcast(m["name"], f"我完成了任务。摘要: {result[:200]}")
-
-    # ---- 第 3 阶段（可选）：让最后一个成员做二次审查 ----
-    # 这里展示"持久记忆"的价值：reviewer 已经通过 inbox 收到了所有人的成果
-    # 再次 chat() 时，他还记得之前收到的所有广播消息
-    last = members[-1]
-    reviewer = team.agents[last["name"]]
-
-    print(f"\n{'='*60}")
-    print(f"  第 3 阶段: {last['name']} 做最终审查")
-    print(f"{'='*60}")
-
-    review = reviewer.chat("请根据你收到的所有团队成果，做一个最终的总结和审查。如有问题请指出。")
-    results["final_review"] = review
-
-    # ---- 解散 ----
-    print(f"\n{'='*60}")
-    print("  第 4 阶段: 解散团队")
-    print(f"{'='*60}")
-    team.disband()
-
-    # ---- 输出 ----
-    print(f"\n{'='*60}")
-    print("  最终成果")
-    print(f"{'='*60}\n")
-    for name, result in results.items():
-        print(f"[{name}]")
-        print(f"  {result[:300]}\n")
-
-    return results
-
+    return TeamOrchestrator().run(task)
 """
 TODO 压缩方案优化方向：
  压缩前先写回永久记忆，（问GPT，先实现永久记忆用RAG （用chroma 向量数据库）， 还是先实现这里的写回永久记忆
