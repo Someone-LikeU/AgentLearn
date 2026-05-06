@@ -515,8 +515,7 @@ You are a professional research analyst. Please provide a summary based on the f
                 return ""
             with open(memory_path, "r", encoding="utf-8") as f:
                 content = f.read()
-                lines = content.split("\n")
-                return "\n".join(lines[-50:]) if len(lines) > 50 else content
+                return content
         except Exception as e:
             print(f"Error in loading memory, exception: {e}")
 
@@ -582,7 +581,7 @@ You are a professional research analyst. Please provide a summary based on the f
         except json.JSONDecodeError as error:
             return {"_argument_error": f"Invalid JSON arguments: {error}"}
 
-    def _load_rules(self):
+    def _load_rules(self, precise_memory=""):
         """
         加载所有规则md文档，字符串形式返回
         :return:
@@ -591,9 +590,16 @@ You are a professional research analyst. Please provide a summary based on the f
         if not os.path.exists(self.rules_dir):
             return rules
         system_time = self._get_time()
+        full_memory_path = self._agent_file_path(self.full_memory_file)
+        precise_memory = precise_memory.strip() or "No previous tasks recorded."
         for rule_file in Path(self.rules_dir).glob("*.md"):
             with open(rule_file, "r", encoding="utf-8") as f:
-                content = f.read().replace("<system-time>", system_time)
+                content = (
+                    f.read()
+                    .replace("<system-time>", system_time)
+                    .replace("<precise-memory>", precise_memory)
+                    .replace("<full-memory-path>", full_memory_path)
+                )
                 rules.append(content)
         return "\n\n".join(rules) if rules else []
 
@@ -767,7 +773,7 @@ You are a professional research analyst. Please provide a summary based on the f
         # 置空当前prompt
         self._cached_system_prompt = None
         memory = self._load_precise_memory()
-        rules = self._load_rules()
+        rules = self._load_rules(memory)
         skills = self._load_skill_meta_infos()
         base_prompt = [
             self._base_prompt_main_agent if self._is_main_agent else self._base_prompt_sub_agent,

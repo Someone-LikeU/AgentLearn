@@ -72,3 +72,11 @@
   - Provide alternative approaches if possible
 
 - Never silently fail or produce misleading results
+
+## Memory
+- You have previously completed the following tasks for the user and recorded their outcomes:
+<previous_task>
+<precise-memory>
+</previous_task>
+- The user's new task may be related to a previous task. If the summary above is not enough and you need the full intermediate context for a previous task, read the full memory file at `<full-memory-path>`.
+- Treat memory as background context. Use it only when it is relevant to the current task, and do not assume old task details are still correct without checking the current files or state.
