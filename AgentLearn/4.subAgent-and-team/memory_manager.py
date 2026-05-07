@@ -1,5 +1,6 @@
 # encoding: utf-8
 import json
+import re
 import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor, wait
@@ -119,6 +120,35 @@ class MemoryManager:
         self.task_index_file.write_text("", encoding="utf-8")
         self.task_summaries_file.write_text("", encoding="utf-8")
         self.error_log_file.write_text("", encoding="utf-8")
+
+    def get_task_full_context(self, task_id: str) -> dict[str, Any]:
+        # 只允许读取 MemoryManager 自己生成的 task_id，避免模型传入任意路径。
+        normalized_task_id = str(task_id or "").strip()
+        if normalized_task_id.endswith(".json"):
+            normalized_task_id = normalized_task_id[:-5]
+        if not re.fullmatch(r"task_\d{8}_\d{6}_[0-9a-f]{6}", normalized_task_id):
+            return {
+                "error": "invalid_task_id",
+                "message": "task_id must look like task_YYYYMMDD_HHMMSS_xxxxxx",
+            }
+
+        full_context_path = self.full_context_dir / f"{normalized_task_id}.json"
+        if not full_context_path.exists():
+            return {
+                "error": "not_found",
+                "task_id": normalized_task_id,
+                "message": "No full context file exists for this task_id.",
+            }
+
+        try:
+            return json.loads(full_context_path.read_text(encoding="utf-8"))
+        except Exception:
+            self._log_error("load full context failed", traceback.format_exc())
+            return {
+                "error": "read_failed",
+                "task_id": normalized_task_id,
+                "message": "Failed to read or parse the full context file.",
+            }
 
     def _process_memory_update(self, task: str, result: str, context: list[dict[str, Any]]):
         try:

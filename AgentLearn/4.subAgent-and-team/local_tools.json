@@ -242,5 +242,24 @@
         ]
       }
     }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "LOAD_FULL_MEMORY_CONTEXT",
+      "description": "Load the full long-term memory context for a completed task by task_id. Use this after identifying a relevant task_id from the memory view or task index.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "task_id": {
+            "type": "string",
+            "description": "The task id, for example task_20260507_103012_a8f3c2."
+          }
+        },
+        "required": [
+          "task_id"
+        ]
+      }
+    }
   }
 ]

@@ -79,5 +79,5 @@
 <precise-memory>
 </previous_task>
 - Memory shown here is a compact index, not the full history.
-- If the user's new task appears related to an older task, first identify candidate task_ids from the memory view, then read the corresponding full context file under `<memory-root-path>/full_context/`.
+- If the user's new task appears related to an older task, first identify candidate task_ids from the memory view, then call `LOAD_FULL_MEMORY_CONTEXT` with the task_id to inspect the full context.
 - Treat memory as background context. Use it only when it is relevant to the current task, and do not assume old task details are still correct without checking the current files or state.

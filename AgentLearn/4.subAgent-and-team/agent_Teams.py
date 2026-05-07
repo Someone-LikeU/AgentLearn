@@ -31,11 +31,12 @@ class ToolNameConstant:
     GREP: Final = "GREP"
     EXECUTE_BASH: Final = "EXECUTE_BASH"
     MAKE_PLAN: Final = "MAKE_PLAN"
-    LOAD_SKILL_DETAIL_BY_NAME: Final = "LOAD_SKILL_DETAIL_BY_NAME",
-    GET_TIME: Final = "GET_TIME",
-    WEB_SEARCH: Final = "WEB_SEARCH",
-    LIST_DIR: Final = "LIST_DIR",
-    SUB_AGENT: Final = "SUB_AGENT",
+    LOAD_SKILL_DETAIL_BY_NAME: Final = "LOAD_SKILL_DETAIL_BY_NAME"
+    GET_TIME: Final = "GET_TIME"
+    WEB_SEARCH: Final = "WEB_SEARCH"
+    LIST_DIR: Final = "LIST_DIR"
+    LOAD_FULL_MEMORY_CONTEXT: Final = "LOAD_FULL_MEMORY_CONTEXT"
+    SUB_AGENT: Final = "SUB_AGENT"
 
 
 class Agent:
@@ -172,7 +173,8 @@ class Agent:
             ToolNameConstant.LOAD_SKILL_DETAIL_BY_NAME: self._load_skill_detail_by_name,
             ToolNameConstant.GET_TIME: self._get_time,
             ToolNameConstant.WEB_SEARCH: self._web_search,
-            ToolNameConstant.LIST_DIR: self._list_dir
+            ToolNameConstant.LIST_DIR: self._list_dir,
+            ToolNameConstant.LOAD_FULL_MEMORY_CONTEXT: self._load_full_memory_context,
         }
         # 主agent才加subagent工具
         if self._is_main_agent:
@@ -486,6 +488,15 @@ class Agent:
             return ""
         return self.memory_manager.load_prompt_memory_view()
 
+    def _load_full_memory_context(self, task_id):
+        # 只通过 MemoryManager 按 task_id 读取完整上下文，避免模型直接拼接文件路径。
+        if not self._is_main_agent or self.memory_manager is None:
+            return {
+                "error": "memory_unavailable",
+                "message": "Long-term memory is only available to the main agent.",
+            }
+        return self.memory_manager.get_task_full_context(task_id)
+
     def _wait_for_memory_tasks(self):
         if not self._is_main_agent or self.memory_manager is None:
             return
@@ -622,14 +633,27 @@ class Agent:
         if not self._skills_cache:
             self._load_skill_meta_infos()
         return self._skills_cache.get(name, "")
+    
+    def _message_role(self, message):
+        if isinstance(message, dict):
+            return message.get("role", "unknown")
+        return getattr(message, "role", "unknown")
+    
+    def _find_recent_start(self):
+        start = max(1, len(self.messages) - self._KEEP_RECENT)
+        # 不要从 tool 消息中间切开；tool 必须紧跟触发它的 assistant tool_call。
+        while start > 1 and self._message_role(self.messages[start]) == "tool":
+            start -= 1
+        return start
 
     def _compact_messages(self):
         if len(self.messages) <= self._COMPACT_THRESHOLD:
             return
 
         system_msg = self.messages[0]
-        old_messages = self.messages[1:-self._KEEP_RECENT]
-        recent_messages = self.messages[-self._KEEP_RECENT:]
+        recent_start = self._find_recent_start()
+        old_messages = self.messages[1: recent_start]
+        recent_messages = self.messages[recent_start:]
 
         old_text = ""
         for msg in old_messages:
