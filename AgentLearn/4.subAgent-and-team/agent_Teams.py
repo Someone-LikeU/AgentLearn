@@ -16,6 +16,8 @@ from duckduckgo_search import DDGS
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
+from memory_manager import MemoryManager
+from prompt_loader import load_prompt
 
 
 class ToolNameConstant:
@@ -109,10 +111,6 @@ class Agent:
         # 是否是主agent, False表示由Agent创建的子Agent,默认为True
         self._is_main_agent = is_main_agent
 
-        # 记忆文件：precise 保存任务/结果摘要，full 保存单次任务完整上下文。
-        self.precise_memory_file = "agent/precise_memory.md"
-        self.full_memory_file = "agent/full_memory.md"
-
         # 最大迭代次数
         self.max_iterations = 100
 
@@ -121,6 +119,18 @@ class Agent:
 
         # llm温度参数
         self.temperature = temperature
+
+        # 主Agent才保留长期记忆，由主Agent唤起的子Agent不给保留记忆，用完就扔
+        self.memory_manager = (
+            MemoryManager(
+                project_root=os.path.dirname(__file__),
+                client=self.client,
+                model=self.model,
+                temperature=self.temperature,
+            )
+            if self._is_main_agent
+            else None
+        )
 
         # 是否处在plan模式
         self.plan_mode = False
@@ -131,6 +141,7 @@ class Agent:
         # 规则和技能目录
         self.rules_dir = "agent/rules"
         self.skills_dir = "agent/skills"
+        self.prompts_dir = "agent/prompts"
 
         # 各SKILL.md缓存,key 为SKILL的name，value为SKILL.md完整内容
         self._skills_cache = {}
@@ -187,10 +198,10 @@ class Agent:
         self.all_tools = self.local_tools + self.mcp_tools
 
         # 基础提示词，用于主agent
-        self._base_prompt_main_agent = "You are an interactive agent that helps users with daily tasks or software engineering tasks. Use the instructions below and the tools available to you to assist the user."
+        self._base_prompt_main_agent = load_prompt("base_main_agent.md")
 
         # 子agent提示词
-        self._base_prompt_sub_agent = f"You are a {role} that helps users with a specific task, focus on the task. Use the instructions below and the tools available to you to assist the user."
+        self._base_prompt_sub_agent = load_prompt("base_sub_agent.md", role=role)
 
         # 缓存系统提示词,后续记忆压缩的时候可能会用到
         self._cached_system_prompt = self._build_system_prompt()
@@ -420,22 +431,12 @@ class Agent:
                 )
             search_text = "\n".join(search_text_lines)
 
-            summarization_prompt = f"""
-You are a professional research analyst. Please provide a summary based on the following user search content and web search results.
-# Requirements:
-1.Source Fidelity: Summarize based only on the provided search results; do not fabricate facts or include external information.
-2.Structure: Provide a concise conclusion first, followed by a bulleted list of key points.
-3.Conflict Resolution: If there are contradictions or conflicts between different sources, clearly point them out.
-4.Sufficiency Check: If the provided information is insufficient to answer the query, explicitly state that information is lacking.
-5.Language Consistency: If the user's query is in Chinese, respond in Chinese. If the query is in English, respond in English.
-6.Tone: The output must be polished and suitable for direct presentation to the end user.
-"""
-            user_content = f"""
-# User search content
-{query}
-# Search Results
-{search_text}
-"""
+            summarization_prompt = load_prompt("web_search_summary_system.md")
+            user_content = load_prompt(
+                "web_search_summary_user.md",
+                query=query,
+                search_text=search_text,
+            )
             # 3) 调用模型总结
             summary_response = self.client.chat.completions.create(
                 model=self.model,
@@ -469,55 +470,28 @@ You are a professional research analyst. Please provide a summary based on the f
     def _agent_file_path(self, relative_path):
         return os.path.join(os.path.dirname(__file__), relative_path)
 
-    def _save_precise_memory(self, task, result):
-        if not self._is_main_agent:
-            # 如果不是主agent，即由主agent临时创建的子agent，就不保存记忆
-            return ""
-        timestamp = self._get_time()
-        entry = f"\n## {timestamp}\n**Task:** {task}\n**Result:** {result}\n"
-        try:
-            with open(self._agent_file_path(self.precise_memory_file), "a", encoding="utf-8") as f:
-                f.write(entry)
-        except Exception as e:
-            print(f"Error in saving precise memory: {task}, exception: {e}")
-
-    def _save_full_memory(self, task, result):
-        if not self._is_main_agent:
-            return ""
-
-        timestamp = self._get_time()
-        context = self._current_task_full_context or []
-        entry = (
-            f"\n## {timestamp}\n"
-            f"**Task:** {task}\n"
-            f"**Result:** {result}\n\n"
-            "### Full Context\n"
-            "```json\n"
-            f"{json.dumps(context, ensure_ascii=False, indent=2)}\n"
-            "```\n"
+    def _schedule_memory_update(self, task, result):
+        if not self._is_main_agent or self.memory_manager is None:
+            return
+        # Memory summarization is intentionally asynchronous so task completion stays responsive.
+        self.memory_manager.enqueue(
+            task=task,
+            result=result,
+            context=self._current_task_full_context or [],
         )
-        try:
-            with open(self._agent_file_path(self.full_memory_file), "a", encoding="utf-8") as f:
-                f.write(entry)
-        except Exception as e:
-            print(f"Error in saving full memory: {task}, exception: {e}")
 
-    def _load_precise_memory(self):
-        # 如果是子agent，就不给前面的记忆
-        if not self._is_main_agent:
+    def _load_memory_view(self):
+        # Sub agents do not inherit long-term memory; they only work on the delegated task.
+        if not self._is_main_agent or self.memory_manager is None:
             return ""
-        memory_path = self._agent_file_path(self.precise_memory_file)
-        try:
-            if not os.path.exists(memory_path):
-                print("The agent is initializing for the first time, creating the memory file")
-                with open(memory_path, "w", encoding="utf-8") as f:
-                    f.write("")
-                return ""
-            with open(memory_path, "r", encoding="utf-8") as f:
-                content = f.read()
-                return content
-        except Exception as e:
-            print(f"Error in loading memory, exception: {e}")
+        return self.memory_manager.load_prompt_memory_view()
+
+    def _wait_for_memory_tasks(self):
+        if not self._is_main_agent or self.memory_manager is None:
+            return
+        if self.memory_manager.has_pending():
+            self.console.print("[dim]还有记忆整理任务未完成，正在等待完成后退出...[/]")
+        self.memory_manager.shutdown()
 
     def _append_message(self, message, capture_full_context=True):
         self.messages.append(message)
@@ -549,9 +523,9 @@ You are a professional research analyst. Please provide a summary based on the f
             messages=[
                 {
                     "role": "system",
-                    "content": "You are a task planning assistant. Break down the task into simple steps as JSON object with key 'steps'.",
+                    "content": load_prompt("task_planning_system.md"),
                 },
-                {"role": "user", "content": f"Task: {task}"},
+                {"role": "user", "content": load_prompt("task_planning_user.md", task=task)},
             ],
             response_format={"type": "json_object"},
             temperature=self.temperature,
@@ -581,7 +555,7 @@ You are a professional research analyst. Please provide a summary based on the f
         except json.JSONDecodeError as error:
             return {"_argument_error": f"Invalid JSON arguments: {error}"}
 
-    def _load_rules(self, precise_memory=""):
+    def _load_rules(self, memory_view=""):
         """
         加载所有规则md文档，字符串形式返回
         :return:
@@ -590,15 +564,16 @@ You are a professional research analyst. Please provide a summary based on the f
         if not os.path.exists(self.rules_dir):
             return rules
         system_time = self._get_time()
-        full_memory_path = self._agent_file_path(self.full_memory_file)
-        precise_memory = precise_memory.strip() or "No previous tasks recorded."
+        memory_root_path = self.memory_manager.memory_dir if self.memory_manager else self._agent_file_path("agent/memory")
+        memory_view = memory_view.strip() or "No previous tasks recorded."
         for rule_file in Path(self.rules_dir).glob("*.md"):
             with open(rule_file, "r", encoding="utf-8") as f:
                 content = (
                     f.read()
                     .replace("<system-time>", system_time)
-                    .replace("<precise-memory>", precise_memory)
-                    .replace("<full-memory-path>", full_memory_path)
+                    .replace("<precise-memory>", memory_view)
+                    .replace("<full-memory-path>", str(memory_root_path))
+                    .replace("<memory-root-path>", str(memory_root_path))
                 )
                 rules.append(content)
         return "\n\n".join(rules) if rules else []
@@ -663,20 +638,19 @@ You are a professional research analyst. Please provide a summary based on the f
             if content:
                 old_text += f"[{role}]: {content}\n"
 
-        # TODO 做摘要的提示词应该还需要进一步扩充，以及需要修改加载方式，以及下面重新构造self.messages的提示词内容
         summary_response = self.client.chat.completions.create(
             model=self.model,
             messages=[
-                {"role": "system", "content": "Summarize the following conversation history. Keep all important facts, file paths, command results, and decisions. Be concise but don't lose critical details."},
-                {"role": "user", "content": old_text}
+                {"role": "system", "content": load_prompt("conversation_compaction_system.md")},
+                {"role": "user", "content": load_prompt("conversation_compaction_user.md", old_text=old_text)}
             ]
         )
         summary = summary_response.choices[0].message.content
 
         self.messages = [
             system_msg,
-            {"role": "user", "content": f"[Previous conversation summary]: {summary}"},
-            {"role": "assistant", "content": "Understood. I have the context from our previous conversation. Let me continue."},
+            {"role": "user", "content": load_prompt("conversation_compaction_summary_message.md", summary=summary)},
+            {"role": "assistant", "content": load_prompt("conversation_compaction_ack.md")},
             *recent_messages
         ]
 
@@ -772,7 +746,7 @@ You are a professional research analyst. Please provide a summary based on the f
         from prompt_builder import build_system_prompt
         # 置空当前prompt
         self._cached_system_prompt = None
-        memory = self._load_precise_memory()
+        memory = self._load_memory_view()
         rules = self._load_rules(memory)
         skills = self._load_skill_meta_infos()
         base_prompt = [
@@ -867,17 +841,9 @@ You are a professional research analyst. Please provide a summary based on the f
         清空记忆文件
         :return:
         """
-        if not self._is_main_agent:
+        if not self._is_main_agent or self.memory_manager is None:
             return
-        for memory_file in (self.precise_memory_file, self.full_memory_file):
-            memory_path = self._agent_file_path(memory_file)
-            try:
-                if not os.path.exists(memory_path):
-                    continue
-                with open(memory_path, "w", encoding="utf-8") as f:
-                    f.write("")
-            except Exception as e:
-                print(f"Error in clearing memory {memory_file}, exception: {e}")
+        self.memory_manager.clear()
 
     def chat(self, task):
         """
@@ -891,7 +857,7 @@ You are a professional research analyst. Please provide a summary based on the f
             # 如果 inbox 有新消息，先注入self.messages
             if self.inbox:
                 mail = "\n".join(f"[from {m['from']}]: {m['content']}" for m in self.inbox)
-                self._append_message({"role": "user", "content": f"You received message from teammate:\n{mail}"})
+                self._append_message({"role": "user", "content": load_prompt("inbox_digest_user.md", mail=mail)})
                 # 让 Agent 先消化这些消息
                 resp = self.client.chat.completions.create(model=self.model, messages=self.messages)
                 self._append_message(resp.choices[0].message)
@@ -901,8 +867,7 @@ You are a professional research analyst. Please provide a summary based on the f
             self._append_message({"role": "user", "content": task})
             final_result = self._run_agent_step(self.all_tools)
             # print(f"final result: {final_result}")
-            self._save_precise_memory(task, final_result)
-            self._save_full_memory(task, final_result)
+            self._schedule_memory_update(task, final_result)
             return final_result
         finally:
             self._current_task_full_context = None
@@ -927,6 +892,7 @@ You are a professional research analyst. Please provide a summary based on the f
                 user_input = self.console.input("[bold cyan]You >[/] ")
                 cmd = user_input.strip().lower()
                 if cmd in ("exit", "q", "quit"):
+                    self._wait_for_memory_tasks()
                     self.console.print("\n[bold red] See you next time! [/]")
                     break
                 elif cmd == "clear":
@@ -941,7 +907,7 @@ You are a professional research analyst. Please provide a summary based on the f
                     cmd = user_input.strip().lower()
                     if cmd in confirm_choice:
                         self._clear_memory()
-                        self.console.print("[dim]所有历史记忆已清空[/]")
+                        self.console.print("[dim]记忆索引和汇总已清空；full_context 文件未批量删除[/]")
                     continue
                 elif not cmd:
                     continue
@@ -950,6 +916,7 @@ You are a professional research analyst. Please provide a summary based on the f
                 self.chat(user_input)
                 self.console.print()
             except KeyboardInterrupt:
+                self._wait_for_memory_tasks()
                 self.console.print("\n[bold red] See you next time! [/]")
                 break
 
@@ -1019,10 +986,8 @@ class TeamOrchestrator:
         response = self.client.chat.completions.create(
             model=self.model,
             messages=[
-                {"role": "system", "content": """You are a project manager. Given a task, plan a team of 2-4 members.
-Return JSON: {"team": [{"name": "alice", "role": "...", "task": "..."}]}
-Rules: use lowercase english names, last member should be a reviewer, keep tasks concise."""},
-                {"role": "user", "content": task}
+                {"role": "system", "content": load_prompt("team_planning_system.md")},
+                {"role": "user", "content": load_prompt("team_planning_user.md", task=task)}
             ],
             response_format={"type": "json_object"}
         )
@@ -1111,7 +1076,7 @@ TODO 压缩方案优化方向：
 
 # TODO 优化：每次启动的会话中所有短期记忆在退出时都写到磁盘的长期记忆里
 # TODO 优化：短期记忆的加载方式以及系统提示
-# TODO 优化思考：如何保存一个任务的详细上下文且不影响当前完整工作上下文。这里有三种实现：按 self.messages 下标切片最简单，但一旦中途触发压缩会丢细节；给消息加任务边界标记会污染模型上下文；更稳的是在一次 chat(task) 期间额外维护一份“本任务上下文快照”，每次向 self.messages 追加本任务相关消息时同步记录，最后写入 full_memory.md
+# TODO 优化思考：当前通过 MemoryManager 在一次 chat(task) 期间保存“本任务上下文快照”，并异步写入 agent/memory/full_context。
 
 if __name__ == "__main__":
     from agent_run import AgentRunner

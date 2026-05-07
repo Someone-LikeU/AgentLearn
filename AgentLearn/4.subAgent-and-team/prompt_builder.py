@@ -2,6 +2,7 @@
 # @Time    : 2026/04/24
 import json
 from typing import List
+from prompt_loader import load_prompt
 
 
 def build_system_prompt(base_prompt: List, rules, skills, memory=None):
@@ -19,8 +20,7 @@ def build_system_prompt(base_prompt: List, rules, skills, memory=None):
 	# 拼接技能
 	skill_prompt = None
 	try:
-		with open("./agent/SKILL_PROMPT_PART.md", 'r', encoding='utf-8') as f:
-			skill_prompt = f.read()
+		skill_prompt = load_prompt("skill_prompt_part.md")
 		available_skills = {
 			"available_skills": [
 				{"name": skill["name"], "description": skill.get("description", "")}
