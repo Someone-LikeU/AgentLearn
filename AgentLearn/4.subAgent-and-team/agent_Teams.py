@@ -68,8 +68,10 @@ class Agent:
     _BASH_AUTO_APPROVE = True
     # 目前没有默认加入 after hook，保留给后续控制超长输出时使用。
     _BASH_MAX_OUTPUT_LENGTH = 5000
-    _COMPACT_THRESHOLD = 20
-    _KEEP_RECENT = 6
+    _DEFAULT_CONTEXT_WINDOW = 32768
+    _COMPACT_TRIGGER_RATIO = 0.8
+    _MIDDLE_COMPACT_RATIO = 0.3
+    _KEEP_RECENT = 10
 
     def __init__(self, model="qwen3.5:9b",
                  temperature: float = 0.1,
@@ -117,6 +119,7 @@ class Agent:
 
         # 使用模型
         self.model = model
+        self._max_context_tokens = self._load_model_context_window()
 
         # llm温度参数
         self.temperature = temperature
@@ -215,6 +218,7 @@ class Agent:
         ]
         # 当前任务的完整上下文，用于保存长期记忆
         self._current_task_full_context = None
+        self._current_task_start_index = None
 
         self.console = Console()
 
@@ -472,6 +476,14 @@ class Agent:
     def _agent_file_path(self, relative_path):
         return os.path.join(os.path.dirname(__file__), relative_path)
 
+    def _load_model_context_window(self):
+        config_path = Path(self._agent_file_path("agent/config/model_context_windows.json"))
+        try:
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+        except Exception:
+            return self._DEFAULT_CONTEXT_WINDOW
+        return int(config.get(self.model) or config.get("default") or self._DEFAULT_CONTEXT_WINDOW)
+
     def _schedule_memory_update(self, task, result):
         if not self._is_main_agent or self.memory_manager is None:
             return
@@ -638,6 +650,39 @@ class Agent:
         if isinstance(message, dict):
             return message.get("role", "unknown")
         return getattr(message, "role", "unknown")
+
+    def _message_text(self, message):
+        if isinstance(message, dict):
+            parts = [str(message.get("role", "")), str(message.get("content", ""))]
+            if message.get("tool_calls"):
+                parts.append(json.dumps(message.get("tool_calls"), ensure_ascii=False, default=str))
+            if message.get("tool_call_id"):
+                parts.append(str(message.get("tool_call_id")))
+            return "\n".join(part for part in parts if part)
+
+        parts = [str(getattr(message, "role", "")), str(getattr(message, "content", ""))]
+        tool_calls = getattr(message, "tool_calls", None)
+        if tool_calls:
+            parts.append(json.dumps(tool_calls, ensure_ascii=False, default=str))
+        return "\n".join(part for part in parts if part)
+
+    def _estimate_text_tokens(self, text):
+        text = text or ""
+        ascii_count = sum(1 for char in text if ord(char) < 128)
+        non_ascii_count = len(text) - ascii_count
+        return max(1, ascii_count // 4 + non_ascii_count * 2)
+
+    def _estimate_messages_tokens(self, messages, tools=None):
+        total = 0
+        for message in messages:
+            total += 4 + self._estimate_text_tokens(self._message_text(message))
+        if tools:
+            total += self._estimate_text_tokens(json.dumps(tools, ensure_ascii=False, default=str))
+        return total
+
+    def _should_compact_messages(self, tools=None):
+        used_tokens = self._estimate_messages_tokens(self.messages, tools)
+        return used_tokens >= int(self._max_context_tokens * self._COMPACT_TRIGGER_RATIO)
     
     def _find_recent_start(self):
         start = max(1, len(self.messages) - self._KEEP_RECENT)
@@ -646,21 +691,49 @@ class Agent:
             start -= 1
         return start
 
-    def _compact_messages(self):
-        if len(self.messages) <= self._COMPACT_THRESHOLD:
+    def _format_messages_for_compaction(self, messages):
+        text = ""
+        for message in messages:
+            role = self._message_role(message)
+            content = self._message_text(message)
+            if content:
+                text += f"[{role}]: {content}\n"
+        return text
+
+    def _load_archived_task_reference_for_compaction(self):
+        if self._is_main_agent and self.memory_manager is not None:
+            return self.memory_manager.load_prompt_memory_view()
+        return "No archived task references are available in this agent."
+
+    def _select_messages_for_compaction_summary(self, old_messages, recent_start):
+        if self._current_task_start_index is not None:
+            live_start = max(1, self._current_task_start_index)
+            live_messages = self.messages[live_start: recent_start]
+            if live_messages:
+                return live_messages
+
+        middle_size = max(1, int(len(old_messages) * self._MIDDLE_COMPACT_RATIO))
+        return old_messages[-middle_size:]
+
+    def _compact_messages(self, tools=None):
+        if not self._should_compact_messages(tools):
             return
 
         system_msg = self.messages[0]
         recent_start = self._find_recent_start()
         old_messages = self.messages[1: recent_start]
         recent_messages = self.messages[recent_start:]
+        if not old_messages:
+            return
 
-        old_text = ""
-        for msg in old_messages:
-            role = msg.get("role", "unknown") if isinstance(msg, dict) else getattr(msg, "role", "unknown")
-            content = msg.get("content", "") if isinstance(msg, dict) else getattr(msg, "content", "")
-            if content:
-                old_text += f"[{role}]: {content}\n"
+        archived_task_reference = self._load_archived_task_reference_for_compaction()
+        summary_messages = self._select_messages_for_compaction_summary(old_messages, recent_start)
+        old_text = (
+            "Archived task references for older completed tasks:\n"
+            f"{archived_task_reference}\n\n"
+            "Conversation messages to summarize:\n"
+            f"{self._format_messages_for_compaction(summary_messages)}"
+        )
 
         summary_response = self.client.chat.completions.create(
             model=self.model,
@@ -673,6 +746,18 @@ class Agent:
 
         self.messages = [
             system_msg,
+            {
+                "role": "user",
+                "content": (
+                    "[Archived completed-task references]\n"
+                    f"{archived_task_reference}\n\n"
+                    "For details from an archived task, call LOAD_FULL_MEMORY_CONTEXT with the task_id."
+                ),
+            },
+            {
+                "role": "assistant",
+                "content": "Understood. I will load archived task context by task_id when needed.",
+            },
             {"role": "user", "content": load_prompt("conversation_compaction_summary_message.md", summary=summary)},
             {"role": "assistant", "content": load_prompt("conversation_compaction_ack.md")},
             *recent_messages
@@ -681,7 +766,7 @@ class Agent:
     def _run_agent_step(self, tools):
         for i in range(self.max_iterations):
             # 先压缩历史对话
-            self._compact_messages()
+            self._compact_messages(tools)
             response_stream = self.client.chat.completions.create(
                 model=self.model,
                 messages=self.messages,
