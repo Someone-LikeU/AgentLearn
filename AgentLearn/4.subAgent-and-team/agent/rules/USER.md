@@ -1,7 +1,5 @@
 # USER.md
-
 The following outlines the user's personal preferences and habits. These should be considered when solving user tasks:
-
 - Prefers sunny weather; dislikes rainy weather and excessively hot conditions
 - Prefers outdoor activities over indoor ones
 - For long-distance travel:
