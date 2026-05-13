@@ -1,0 +1,19 @@
+from typing import Final
+
+
+class ToolNameConstant:
+    """工具名称常量类"""
+
+    READ_FILE: Final = "READ_FILE"
+    WRITE_FILE: Final = "WRITE_FILE"
+    EDIT: Final = "EDIT"
+    GLOB: Final = "GLOB"
+    GREP: Final = "GREP"
+    EXECUTE_BASH: Final = "EXECUTE_BASH"
+    MAKE_PLAN: Final = "MAKE_PLAN"
+    LOAD_SKILL_DETAIL_BY_NAME: Final = "LOAD_SKILL_DETAIL_BY_NAME"
+    GET_TIME: Final = "GET_TIME"
+    WEB_SEARCH: Final = "WEB_SEARCH"
+    LIST_DIR: Final = "LIST_DIR"
+    LOAD_FULL_MEMORY_CONTEXT: Final = "LOAD_FULL_MEMORY_CONTEXT"
+    SUB_AGENT: Final = "SUB_AGENT"
