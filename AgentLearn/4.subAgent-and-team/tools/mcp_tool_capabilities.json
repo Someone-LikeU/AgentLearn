@@ -1,0 +1,14 @@
+{
+  "QUERY_WEATHER": {
+    "is_concurrency_safe": true,
+    "is_read_only": true,
+    "is_destructive": false,
+    "side_effect_scope": "network"
+  },
+  "QUERY_FLIGHT_TICKETS": {
+    "is_concurrency_safe": true,
+    "is_read_only": true,
+    "is_destructive": false,
+    "side_effect_scope": "network"
+  }
+}

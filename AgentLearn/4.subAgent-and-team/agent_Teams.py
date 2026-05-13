@@ -1,42 +1,20 @@
 # encoding : utf-8
 # @Time    : 2026/4/19
-import glob as glob_module
 import json
 import os
-import re
-import subprocess
-import sys
 from pathlib import Path
-from subprocess import CompletedProcess
 from types import SimpleNamespace
-from typing import Any, Final
+from typing import Any
 from openai import OpenAI
 from mcp_client import MCPClient
-from duckduckgo_search import DDGS
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
 from memory_manager import MemoryManager
 from prompt_loader import load_prompt
-
-
-class ToolNameConstant:
-    """
-    工具名称常量类
-    """
-    READ_FILE: Final = "READ_FILE"
-    WRITE_FILE: Final = "WRITE_FILE"
-    EDIT: Final = "EDIT"
-    GLOB: Final = "GLOB"
-    GREP: Final = "GREP"
-    EXECUTE_BASH: Final = "EXECUTE_BASH"
-    MAKE_PLAN: Final = "MAKE_PLAN"
-    LOAD_SKILL_DETAIL_BY_NAME: Final = "LOAD_SKILL_DETAIL_BY_NAME"
-    GET_TIME: Final = "GET_TIME"
-    WEB_SEARCH: Final = "WEB_SEARCH"
-    LIST_DIR: Final = "LIST_DIR"
-    LOAD_FULL_MEMORY_CONTEXT: Final = "LOAD_FULL_MEMORY_CONTEXT"
-    SUB_AGENT: Final = "SUB_AGENT"
+from tools.tool_manager import ToolManager, ToolManagerConfig, AgentToolHandlers
+from tools.tool_names import ToolNameConstant
+from tools.tool_scheduler import ToolScheduler, ToolCallTask
 
 
 class Agent:
@@ -150,57 +128,34 @@ class Agent:
         # 各SKILL.md缓存,key 为SKILL的name，value为SKILL.md完整内容
         self._skills_cache = {}
 
-        # Bash hook 管道只服务 _execute_bash，避免引入全局工具执行器。
-        # before hook 返回 (blocked, message)，blocked=True 时直接拦截命令。
-        self._bash_before_hooks = [
-            self._bash_check_dangerous_command,
-            self._bash_ask_user_confirmation,
-            self._bash_log_command,
-        ]
-        # after hook 接收上一个 hook 的返回值，必须返回处理后的 result。
-        self._bash_after_hooks = [
-            self._bash_log_result,
-        ]
-
-        # 加载本地工具
-        self.local_tools = self._load_local_tools()
-        print(f"{len(self.local_tools)} local tools loaded")
-        self.local_functions = {
-            ToolNameConstant.EXECUTE_BASH: self._execute_bash,
-            ToolNameConstant.READ_FILE: self._read_file,
-            ToolNameConstant.WRITE_FILE: self._write_file,
-            ToolNameConstant.EDIT: self._edit,
-            ToolNameConstant.GLOB: self._glob,
-            ToolNameConstant.GREP: self._grep,
-            ToolNameConstant.MAKE_PLAN: self._make_plan,
-            ToolNameConstant.LOAD_SKILL_DETAIL_BY_NAME: self._load_skill_detail_by_name,
-            ToolNameConstant.GET_TIME: self._get_time,
-            ToolNameConstant.WEB_SEARCH: self._web_search,
-            ToolNameConstant.LIST_DIR: self._list_dir,
-            ToolNameConstant.LOAD_FULL_MEMORY_CONTEXT: self._load_full_memory_context,
-        }
-        # 主agent才加subagent工具
-        if self._is_main_agent:
-            self.local_functions[ToolNameConstant.SUB_AGENT] = self._sub_agent
-
         # MCP客户端（由外部传入，不在Agent内部创建）
         self.mcp_client = mcp_client
-        # 加载MCP工具
+        self._tool_manager = ToolManager(
+            config=ToolManagerConfig(
+                project_root=os.path.dirname(__file__),
+                client=self.client,
+                model=self.model,
+                temperature=self.temperature,
+                is_main_agent=self._is_main_agent,
+            ),
+            handlers=AgentToolHandlers(
+                make_plan_handler=self._make_plan,
+                load_skill_detail_handler=self._load_skill_detail_by_name,
+                load_full_memory_context_handler=self._load_full_memory_context,
+                sub_agent_handler=self._sub_agent if self._is_main_agent else None,
+            ),
+            mcp_client=self.mcp_client,
+        )
+        self._local_tools = self._tool_manager.local_tools
+        self._local_functions = self._tool_manager.local_functions
+        self._mcp_tools = self._tool_manager.mcp_tools
+        self._available_functions = self._tool_manager.available_functions
+        self._all_tools = self._tool_manager.all_tools
+        print(f"{len(self._local_tools)} local tools loaded")
         if self.mcp_client:
-            self.mcp_tools = self._load_mcp_tools()
-            print(f"{len(self.mcp_tools)} MCP tools loaded")
+            print(f"{len(self._mcp_tools)} MCP tools loaded")
         else:
-            self.mcp_tools = []
             print("No MCP client provided, MCP tools not loaded")
-
-        self.available_functions: dict[str, Any] = {}
-        self.available_functions.update(self.local_functions)
-        # 动态更新可用的工具列表
-        for tool in self.mcp_tools:
-            tool_name = tool["function"]["name"]
-            self.available_functions[tool_name] = self._make_mcp_executor(tool_name)
-
-        self.all_tools = self.local_tools + self.mcp_tools
 
         # 基础提示词，用于主agent
         self._base_prompt_main_agent = load_prompt("base_main_agent.md")
@@ -230,248 +185,6 @@ class Agent:
         :return: 无
         """
         self.inbox.append({"from": sender, "content": message})
-
-    def _make_mcp_executor(self, tool_name: str):
-        """为MCP工具生成执行器，就是调用mcp客户端的call_tool方法"""
-
-        def _executor(**kwargs):
-            return self.mcp_client.call_tool(tool_name, kwargs)
-
-        return _executor
-
-    def _load_local_tools(self) -> list[dict[str, Any]]:
-        """
-        加载本地工具列表
-        :return:
-        """
-        print("loading local tools...")
-        tools_path = os.path.join(os.path.dirname(__file__), "local_tools.json")
-        with open(tools_path, "r", encoding="utf-8") as f:
-            return json.load(f)
-
-    def _load_mcp_tools(self) -> list[dict[str, Any]]:
-        """
-        加载远端可用mcp工具列表
-        :return:
-        """
-        mcp_tools = self.mcp_client.list_tools()
-        tools_in_openai_format = []
-        # 按OpenAI的工具格式添加
-        for tool in mcp_tools:
-            tools_in_openai_format.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": tool["name"],
-                        "description": tool.get("description", ""),
-                        "parameters": tool.get("parameters", {"type": "object", "properties": {}}),
-                    },
-                }
-            )
-        return tools_in_openai_format
-
-    def _execute_bash(self, command):
-        # 保持对外签名不变，把安全检查和日志交给类内 hook 管道处理。
-        return self._execute_bash_with_hooks(command)
-
-    def _run_bash_command(self, command):
-        # 只负责实际执行和输出解码；是否允许执行由 before hook 决定。
-        result = subprocess.run(command, shell=True, capture_output=True)
-        stdout, stderr = self._decode_subprocess_result(result)
-        return stdout + stderr
-
-    def _execute_bash_with_hooks(self, command):
-        args = {"command": command}
-        # 任意 before hook 都可以拦截命令，避免危险命令进入 subprocess。
-        for hook in self._bash_before_hooks:
-            blocked, message = hook(args)
-            if blocked:
-                return message or "Bash command was blocked."
-
-        result = self._run_bash_command(command)
-
-        for hook in self._bash_after_hooks:
-            result = hook(result)
-        return result
-
-    def _bash_command_arg(self, args: dict[str, Any]) -> str:
-        # hook 统一通过 args 传递参数，这里保证 command 最终按字符串处理。
-        command = args.get("command", "")
-        return command if isinstance(command, str) else str(command)
-
-    def _bash_check_dangerous_command(self, args: dict[str, Any]) -> tuple[bool, str | None]:
-        # 第一层防线：命中黑名单时直接拒绝执行，不再进入确认环节。
-        command = self._bash_command_arg(args)
-        for pattern in self._BASH_DANGEROUS_PATTERNS:
-            if re.search(pattern, command, flags=re.IGNORECASE):
-                return True, "The command is dangerous, refused to execute it."
-        return False, None
-
-    def _bash_ask_user_confirmation(self, args: dict[str, Any]) -> tuple[bool, str | None]:
-        # 第二层防线：需要人工确认时，把命令展示给用户再继续。
-        if self._BASH_AUTO_APPROVE:
-            return False, None
-
-        print("\nConfirm bash execution")
-        print(f"command: {self._bash_command_arg(args)[:200]}")
-        while True:
-            answer = input("[Y] execute / [N] skip / [Q] quit Agent > ").strip().lower()
-            if answer in ("y", "yes", ""):
-                return False, None
-            if answer in ("n", "no"):
-                return True, "Bash command skipped by user."
-            if answer in ("q", "quit"):
-                sys.exit(0)
-
-    def _bash_log_command(self, args: dict[str, Any]) -> tuple[bool, str | None]:
-        # 日志 hook 不改变执行结果，只记录即将运行的命令。
-        print(f"[Tool before] {ToolNameConstant.EXECUTE_BASH}: {self._bash_command_arg(args)}")
-        return False, None
-
-    def _bash_log_result(self, result: Any) -> Any:
-        # 只记录输出长度，避免把可能很长或敏感的命令输出重复打印到控制台。
-        text = result if isinstance(result, str) else str(result)
-        print(f"[Tool after] {ToolNameConstant.EXECUTE_BASH}: {len(text)} chars")
-        return result
-
-    def _bash_truncate_output(self, result: Any) -> Any:
-        # 可选 after hook：需要限制上下文长度时，可加入 self._bash_after_hooks。
-        text = result if isinstance(result, str) else str(result)
-        if len(text) <= self._BASH_MAX_OUTPUT_LENGTH:
-            return result
-        half = self._BASH_MAX_OUTPUT_LENGTH // 2
-        return (
-            text[:half]
-            + f"\n\n... [output truncated, original {len(text)} chars, kept first/last {half} chars] ...\n\n"
-            + text[-half:]
-        )
-
-    def _decode_subprocess_result(self, result: CompletedProcess[bytes] | CompletedProcess[Any]):
-        if isinstance(result.stdout, str):
-            stdout = result.stdout
-        else:
-            stdout = b"" if result.stdout is None else result.stdout
-        if isinstance(result.stderr, str):
-            stderr = result.stderr
-        else:
-            stderr = b"" if result.stderr is None else result.stderr
-
-        if isinstance(stdout, str) and isinstance(stderr, str):
-            return stdout, stderr
-
-        for enc in ("utf-8", "gbk", "gb18030"):
-            try:
-                decoded_out = stdout.decode(enc)
-                decoded_err = stderr.decode(enc)
-                return decoded_out, decoded_err
-            except UnicodeDecodeError:
-                continue
-        return stdout.decode("utf-8", errors="replace"), stderr.decode("utf-8", errors="replace")
-
-    def _read_file(self, path, offset=None, limit=None):
-        with open(path, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-        start = offset if offset else 0
-        end = start + limit if limit else len(lines)
-        numbered = [f"{i + 1:4d} {line}" for i, line in enumerate(lines[start:end], start)]
-        return "".join(numbered)
-
-    def _write_file(self, path, content):
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(content)
-        return f"Successfully wrote to {path}"
-
-    def _edit(self, path, old_string, new_string):
-        with open(path, "r", encoding="utf-8") as f:
-            content = f.read()
-        if content.count(old_string) != 1:
-            return "Error: old_string must appear exactly once"
-        new_content = content.replace(old_string, new_string)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(new_content)
-        return f"Successfully edited {path}"
-
-    def _glob(self, pattern):
-        files = glob_module.glob(pattern, recursive=True)
-        files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
-        return "\n".join(files) if files else "No files found"
-
-    def _grep(self, pattern, path="."):
-        result = subprocess.run(f"grep -r '{pattern}' {path}", shell=True, capture_output=True)
-        stdout, _ = self._decode_subprocess_result(result)
-        return stdout if stdout else "No matches found"
-
-    def _get_time(self):
-        from datetime import datetime
-        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    def _web_search(self, query: str, max_results: int = 10) -> str:
-        """
-        使用duckduckgo_search 搜索网络结果，然后再叫模型进行总结
-        :param query: 搜索内容
-        :param max_results: 最多搜索条数，默认10
-        :return: 经过模型总结后的结果
-        """
-        max_results = int(max_results) if max_results else 10
-        max_results = max(1, min(max_results, 10))
-
-        try:
-            # 1) 搜索网络
-            with DDGS() as ddgs:
-                results = list(ddgs.text(query, max_results=max_results))
-
-            if not results:
-                return f"未搜索到与“{query}”相关的结果。"
-
-            # 2) 整理搜索结果，给模型做总结
-            search_text_lines = []
-            for i, item in enumerate(results, 1):
-                title = item.get("title", "").strip()
-                body = item.get("body", "").strip()
-                href = item.get("href", "").strip()
-
-                search_text_lines.append(
-                    f"{i}. 标题: {title}\n"
-                    f"   摘要: {body}\n"
-                    f"   链接: {href}\n"
-                )
-            search_text = "\n".join(search_text_lines)
-
-            summarization_prompt = load_prompt("web_search_summary_system.md")
-            user_content = load_prompt(
-                "web_search_summary_user.md",
-                query=query,
-                search_text=search_text,
-            )
-            # 3) 调用模型总结
-            summary_response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": summarization_prompt},
-                    {"role": "user", "content": user_content},
-                ],
-                temperature=0,
-            )
-
-            summary = summary_response.choices[0].message.content
-            return summary if summary else "未能生成总结。"
-
-        except Exception as e:
-            return f"WEB_SEARCH 执行失败: {e}"
-
-    def _list_dir(self, path):
-        """
-        列出目录path下的所有内容，忽略.git等
-        :param path: 路径
-        :return: 该路径下的所有内容
-        """
-        entries = sorted(os.listdir(path))
-        result = []
-        for entry in entries:
-            full = os.path.join(path, entry)
-            prefix = "[dir]" if os.path.isdir(full) else "[file]"
-            result.append(f"{prefix} {entry}")
-        return "\n".join(result) or "Empty directory"
 
     def _agent_file_path(self, relative_path):
         return os.path.join(os.path.dirname(__file__), relative_path)
@@ -586,7 +299,7 @@ class Agent:
         rules = []
         if not os.path.exists(self.rules_dir):
             return rules
-        system_time = self._get_time()
+        system_time = self._tool_manager.get_time()
         memory_root_path = self.memory_manager.memory_dir if self.memory_manager else self._agent_file_path("agent/memory")
         memory_view = memory_view.strip() or "No previous tasks recorded."
         for rule_file in Path(self.rules_dir).glob("*.md"):
@@ -799,6 +512,9 @@ class Agent:
             if not message.tool_calls:
                 return message.content
             print(f"[Iter {i}]: message is: {message}")
+            # V2 调度策略：依据工具画像（只读/并发安全/作用域）做分段并发。
+            scheduler = ToolScheduler(get_profile=self._tool_manager.get_tool_runtime_profile)
+            pending_tasks: list[ToolCallTask] = []
 
             for tool_call in message.tool_calls:
                 function_payload = getattr(tool_call, "function", None)
@@ -807,49 +523,79 @@ class Agent:
                 function_name = str(getattr(function_payload, "name", ""))
                 raw_arguments = str(getattr(function_payload, "arguments", ""))
                 function_args = self._parse_tool_arguments(raw_arguments)
-                function_impl = self.available_functions.get(function_name)
 
-                if function_impl is None:
-                    function_response = f"Error: Unknown tool '{function_name}'"
-                elif "_argument_error" in function_args:
-                    function_response = f"Error: {function_args['_argument_error']}"
-                elif function_name == ToolNameConstant.MAKE_PLAN:
-                    # 如果模型选择了先做计划，这个分支就对计划模式特殊处理
-                    self.plan_mode = True
-                    steps = function_impl(**function_args)
-                    if not isinstance(steps, list):
-                        function_response = steps
+                # MAKE_PLAN 需要维持原有特殊流程，先刷新 pending 队列再串行处理。
+                if function_name == ToolNameConstant.MAKE_PLAN:
+                    for task, function_response in scheduler.execute_batches(
+                        scheduler.plan_batches(pending_tasks), self._invoke_tool_task
+                    ):
+                        self._append_message(
+                            {"role": "tool", "tool_call_id": task.tool_call_id,
+                             "content": json.dumps(function_response, ensure_ascii=False)}
+                        )
+                    pending_tasks = []
+
+                    function_impl = self._available_functions.get(function_name)
+                    if function_impl is None:
+                        function_response = f"Error: Unknown tool '{function_name}'"
+                    elif "_argument_error" in function_args:
+                        function_response = f"Error: {function_args['_argument_error']}"
                     else:
-                        results = []
-                        step_cnt = 0
-                        for step in steps:
-                            print(f"[Step {step_cnt + 1}]: {step}")
-                            self._append_message({"role": "user", "content": step})
-                            result = self._run_agent_step(
-                                [t for t in tools if t["function"]["name"] != ToolNameConstant.MAKE_PLAN]
-                            )
-                            print(f"[Step {step_cnt + 1}] result:{result}, all messages: {self.messages}")
-                            step_cnt += 1
-                            results.append(result)
-                        function_response = "\n".join(results)
-                    self.plan_mode = False
-                    self.current_plan = []
-                else:
-                    # 到这个分支就是正常调用工具
-                    try:
-                        print(f"[Tool call] tool name: {function_name}, tool arguments: {raw_arguments}")
-                        function_response = function_impl(**function_args)
-                    except Exception as error:
-                        function_response = f"Error when calling '{function_name}': {error}"
-                # 加入本次会话的短期记忆
+                        # 如果模型选择了先做计划，这个分支就对计划模式特殊处理
+                        self.plan_mode = True
+                        steps = function_impl(**function_args)
+                        if not isinstance(steps, list):
+                            function_response = steps
+                        else:
+                            results = []
+                            step_cnt = 0
+                            for step in steps:
+                                print(f"[Step {step_cnt + 1}]: {step}")
+                                self._append_message({"role": "user", "content": step})
+                                result = self._run_agent_step(
+                                    [t for t in tools if t["function"]["name"] != ToolNameConstant.MAKE_PLAN]
+                                )
+                                print(f"[Step {step_cnt + 1}] result:{result}, all messages: {self.messages}")
+                                step_cnt += 1
+                                results.append(result)
+                            function_response = "\n".join(results)
+                        self.plan_mode = False
+                        self.current_plan = []
+                    self._append_message(
+                        {"role": "tool", "tool_call_id": tool_call.id, "content": json.dumps(function_response, ensure_ascii=False)}
+                    )
+                    continue
+
+                pending_tasks.append(
+                    ToolCallTask(
+                        tool_call_id=tool_call.id,
+                        function_name=function_name,
+                        raw_arguments=raw_arguments,
+                        function_args=function_args,
+                    )
+                )
+
+            # 收尾执行剩余任务（可能包含并发批次）。
+            for task, function_response in scheduler.execute_batches(
+                scheduler.plan_batches(pending_tasks), self._invoke_tool_task
+            ):
                 self._append_message(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "content": json.dumps(function_response, ensure_ascii=False)
-                    }
+                    {"role": "tool", "tool_call_id": task.tool_call_id, "content": json.dumps(function_response, ensure_ascii=False)}
                 )
         return "Max iterations reached"
+
+    def _invoke_tool_task(self, task: ToolCallTask):
+        """调度器执行入口：单工具调用的统一异常处理。"""
+        function_impl = self._available_functions.get(task.function_name)
+        if function_impl is None:
+            return f"Error: Unknown tool '{task.function_name}'"
+        if "_argument_error" in task.function_args:
+            return f"Error: {task.function_args['_argument_error']}"
+        try:
+            print(f"[Tool call] tool name: {task.function_name}, tool arguments: {task.raw_arguments}")
+            return function_impl(**task.function_args)
+        except Exception as error:
+            return f"Error when calling '{task.function_name}': {error}"
 
     def _build_system_prompt(self):
         from prompt_builder import build_system_prompt
@@ -974,7 +720,7 @@ class Agent:
 
             # 再拼接本次任务并执行
             self._append_message({"role": "user", "content": task})
-            final_result = self._run_agent_step(self.all_tools)
+            final_result = self._run_agent_step(self._all_tools)
             # print(f"final result: {final_result}")
             self._schedule_memory_update(task, final_result)
             return final_result

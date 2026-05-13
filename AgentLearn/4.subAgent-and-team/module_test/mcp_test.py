@@ -3,6 +3,11 @@
 import subprocess
 import sys
 import time
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from mcp_client import MCPClient
 
@@ -52,7 +57,7 @@ def tcp_mode_test():
     try:
         print("\n[0] Start TCP server...")
         server_process = subprocess.Popen(
-            [sys.executable, "mcp_server.py", "--mode", "tcp"],
+            [sys.executable, str(PROJECT_ROOT / "mcp_server.py"), "--mode", "tcp"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
