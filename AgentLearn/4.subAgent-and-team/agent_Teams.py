@@ -98,6 +98,9 @@ class Agent:
         # 使用模型
         self.model = model
         self._max_context_tokens = self._load_model_context_window()
+        # 新增：记录最近一次模型调用的已使用 token 和总 token（来自 OpenAI 标准 usage 字段）。
+        self._used_token = 0
+        self._total_token = 0
 
         # llm温度参数
         self.temperature = temperature
@@ -229,6 +232,25 @@ class Agent:
             self.console.print("[dim]还有记忆整理任务未完成，正在等待完成后退出...[/]")
         self.memory_manager.shutdown()
 
+    def set_bash_auto_approve(self, enabled: bool):
+        """
+        设置当前 Agent 的 Bash 命令是否自动确认执行。
+        :param enabled: True 表示自动确认，False 表示需要手动确认
+        :return:
+        """
+        # 新增：支持运行时切换 Bash 自动确认配置，便于用户动态控制安全策略。
+        self._BASH_AUTO_APPROVE = bool(enabled)
+
+    def _bash_approve_status_text(self) -> str:
+        """
+        返回当前 Bash 执行确认策略的文本描述。
+        :return:
+        """
+        # 新增：统一管理状态文案，避免 run() 中重复拼接字符串。
+        if self._BASH_AUTO_APPROVE:
+            return "自动确认（无需手动确认）"
+        return "手动确认（每次需确认）"
+
     def _append_message(self, message, capture_full_context=True):
         self.messages.append(message)
         if capture_full_context and self._current_task_full_context is not None:
@@ -266,6 +288,8 @@ class Agent:
             response_format={"type": "json_object"},
             temperature=self.temperature,
         )
+        # 新增：每次模型调用后更新 token 使用统计。
+        self._update_usage_from_response(response)
         try:
             plan_data = json.loads(response.choices[0].message.content)
             print("make plan response is: ", response)
@@ -455,6 +479,8 @@ class Agent:
                 {"role": "user", "content": load_prompt("conversation_compaction_user.md", old_text=old_text)}
             ]
         )
+        # 新增：每次模型调用后更新 token 使用统计。
+        self._update_usage_from_response(summary_response)
         summary = summary_response.choices[0].message.content
 
         self.messages = [
@@ -622,6 +648,8 @@ class Agent:
         # 累积工具调用
         tool_calls = {}
         for chunk in stream_response:
+            # 新增：流式响应中若包含 usage 字段，则实时更新 token 统计。
+            self._update_usage_from_response(chunk)
             # 防御，有时delta可能不存在
             choice = chunk.choices[0]
             delta = choice.delta
@@ -670,6 +698,33 @@ class Agent:
         )
         return message
 
+    def _update_usage_from_response(self, response):
+        """
+        从 OpenAI 响应对象中提取 usage 并更新 token 统计。
+        :param response: 非流式 response 或流式 chunk
+        :return:
+        """
+        # 新增：统一处理标准 OpenAI usage 字段，避免各处重复解析逻辑。
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return
+        prompt_tokens = getattr(usage, "prompt_tokens", None)
+        completion_tokens = getattr(usage, "completion_tokens", None)
+        total_tokens = getattr(usage, "total_tokens", None)
+
+        # 新增：优先使用 total_tokens；若为空则回退为 prompt+completion。
+        if isinstance(total_tokens, int):
+            self._used_token = total_tokens
+            self._total_token = total_tokens
+            return
+
+        prompt = prompt_tokens if isinstance(prompt_tokens, int) else 0
+        completion = completion_tokens if isinstance(completion_tokens, int) else 0
+        estimated_total = prompt + completion
+        if estimated_total > 0:
+            self._used_token = estimated_total
+            self._total_token = estimated_total
+
     def _sub_agent(self, role, task):
         """
         调用一个子agent，处理一个专门的子任务
@@ -715,6 +770,8 @@ class Agent:
                 self._append_message({"role": "user", "content": load_prompt("inbox_digest_user.md", mail=mail)})
                 # 让 Agent 先消化这些消息
                 resp = self.client.chat.completions.create(model=self.model, messages=self.messages)
+                # 新增：每次模型调用后更新 token 使用统计。
+                self._update_usage_from_response(resp)
                 self._append_message(resp.choices[0].message)
                 self.inbox.clear()
 
@@ -732,39 +789,23 @@ class Agent:
         Agent loop实现，对话入口
         :return:
         """
-        self.console.print(Panel(
-            "[bold green]JanVis[/] — At you service, sir! What can I do for you today?\n\n"
-            "  [blue]命令[/]: exit/q/quit 退出 | clear 清空当前会话历史 | clear memory",
-            border_style="green", padding=(1, 2),
-        ))
-        self.console.print(f"[dim]当前工作目录：{os.getcwd()}[/]")
-        self.console.print(f"[dim]使用模型：{self.model}[/]")
+        # 新增：统一通过 help 文案展示可用命令，避免 run() 内硬编码过长提示。
+        self._print_help(show_welcome=True)
+        # 新增：集中展示运行时状态，后续配置变更后可复用该方法刷新显示。
+        self._print_runtime_status()
 
         confirm_choice = ("y", "yes", "是", "确认", "对", "")
 
         while True:
             try:
                 user_input = self.console.input("[bold cyan]You >[/] ")
-                cmd = user_input.strip().lower()
-                if cmd in ("exit", "q", "quit"):
-                    self._wait_for_memory_tasks()
-                    self.console.print("\n[bold red] See you next time! [/]")
+                # 新增：将命令分支提取到独立方法中，降低 run() 循环复杂度。
+                handled, should_exit = self._handle_user_command(user_input, confirm_choice)
+                if should_exit:
                     break
-                elif cmd == "clear":
-                    user_input = self.console.input("[bold cyan]是否确认清除当前会话历史？(yes/y)[/] ")
-                    cmd = user_input.strip().lower()
-                    if cmd in confirm_choice:
-                        self._build_system_prompt()
-                        self.console.print("[dim]当前对话历史已清空[/]")
+                if handled:
                     continue
-                elif cmd == "clear memory":
-                    user_input = self.console.input("[bold cyan]是否确认清除历史记忆？(yes/y)[/] ")
-                    cmd = user_input.strip().lower()
-                    if cmd in confirm_choice:
-                        self._clear_memory()
-                        self.console.print("[dim]记忆索引和汇总已清空；full_context 文件未批量删除[/]")
-                    continue
-                elif not cmd:
+                if not user_input.strip():
                     continue
 
                 # 上面分支都没中，就是用户任务了
@@ -774,6 +815,222 @@ class Agent:
                 self._wait_for_memory_tasks()
                 self.console.print("\n[bold red] See you next time! [/]")
                 break
+
+    def _print_help(self, show_welcome: bool = False):
+        """
+        打印交互帮助信息。
+        :param show_welcome: 是否展示欢迎语
+        :return:
+        """
+        # 新增：将帮助提示抽取为独立方法，便于复用和后续维护。
+        if show_welcome:
+            self.console.print(Panel(
+                "[bold green]JanVis[/] — At you service, sir! What can I do for you today?\n\n"
+                "You can ask me to do some task or type help/h",
+                border_style="green", padding=(1, 2),
+            ))
+        self.console.print(
+            "[dim]可用命令：help/h | exit/q/quit | clear session | clear history | bash approve on/off | "
+            "model_list | model | model <name> | campact/compact | status[/]"
+        )
+
+    def _print_runtime_status(self):
+        """
+        打印当前运行时状态信息。
+        :return:
+        """
+        # 新增：抽取状态打印逻辑，便于启动时和配置变更后统一刷新展示。
+        self.console.print(f"[dim]当前工作目录：{os.getcwd()}[/]")
+        self.console.print(f"[dim]使用模型：{self.model}[/]")
+        self.console.print(f"[dim]Bash 命令确认策略：{self._bash_approve_status_text()}[/]")
+
+    def _normalize_command(self, user_input: str) -> str:
+        """
+        规范化用户命令输入，支持 `/` 前缀命令。
+        :param user_input: 原始用户输入
+        :return:
+        """
+        # 新增：统一处理前后空白和可选的 "/" 前缀（如 /clear session）。
+        cmd = (user_input or "").strip().lower()
+        if cmd.startswith("/"):
+            cmd = cmd[1:].strip()
+        return cmd
+
+    def _handle_user_command(self, user_input: str, confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
+        """
+        处理命令型输入。
+        :param user_input: 用户输入
+        :param confirm_choice: 确认命令可接受输入
+        :return: (是否已处理, 是否需要退出循环)
+        """
+        # 新增：集中处理所有命令分支，主循环仅保留调度逻辑。
+        cmd = self._normalize_command(user_input)
+        # 新增：使用命令映射表分发处理函数，便于后续扩展命令而不是堆叠 if/else。
+        command_handlers = self._command_handler_map()
+        handler = command_handlers.get(cmd)
+        if handler:
+            return handler(confirm_choice)
+        # 新增：支持带参数命令，例如 model gpt-4o-mini。
+        if cmd.startswith("model "):
+            return self._handle_cmd_model_switch(confirm_choice, cmd)
+        return False, False
+
+    def _command_handler_map(self):
+        """
+        命令到处理函数的映射表。
+        :return:
+        """
+        # 新增：集中管理命令和处理方法的映射关系，提升可维护性。
+        return {
+            "exit": self._handle_cmd_exit,
+            "q": self._handle_cmd_exit,
+            "quit": self._handle_cmd_exit,
+            "help": self._handle_cmd_help,
+            "h": self._handle_cmd_help,
+            "clear session": self._handle_cmd_clear_session,
+            "clear history": self._handle_cmd_clear_history,
+            "clear memory": self._handle_cmd_clear_memory,
+            "bash approve on": self._handle_cmd_bash_approve_on,
+            "bash approve off": self._handle_cmd_bash_approve_off,
+            "model_list": self._handle_cmd_model_list,
+            "model": self._handle_cmd_model_show_current,
+            "campact": self._handle_cmd_compact_history,
+            "compact": self._handle_cmd_compact_history,
+            "status": self._handle_cmd_status,
+        }
+
+    def _handle_cmd_exit(self, _confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
+        # 新增：退出命令处理。
+        self._wait_for_memory_tasks()
+        self.console.print("\n[bold red] See you next time! [/]")
+        return True, True
+
+    def _handle_cmd_help(self, _confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
+        # 新增：帮助命令处理。
+        self._print_help(show_welcome=False)
+        return True, False
+
+    def _handle_cmd_clear_session(self, confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
+        # 新增：仅清空当前会话历史，不影响长期记忆。
+        confirm_input = self.console.input("[bold cyan]是否确认清除当前会话历史？(yes/y)[/] ")
+        if self._normalize_command(confirm_input) in confirm_choice:
+            self._build_system_prompt()
+            self.console.print("[dim]当前对话历史已清空[/]")
+        return True, False
+
+    def _handle_cmd_clear_history(self, confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
+        # 新增：清空当前会话历史并清空历史记忆。
+        confirm_input = self.console.input("[bold cyan]是否确认清除当前会话历史和全部历史记忆？(yes/y)[/] ")
+        if self._normalize_command(confirm_input) in confirm_choice:
+            self._build_system_prompt()
+            self._clear_memory()
+            self.console.print("[dim]当前对话历史与历史记忆已清空；full_context 文件未批量删除[/]")
+        return True, False
+
+    def _handle_cmd_clear_memory(self, confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
+        # 新增：兼容旧命令 clear memory，行为与 clear history 一致。
+        confirm_input = self.console.input("[bold cyan]是否确认清除历史记忆？(yes/y)[/] ")
+        if self._normalize_command(confirm_input) in confirm_choice:
+            self._clear_memory()
+            self.console.print("[dim]记忆索引和汇总已清空；full_context 文件未批量删除[/]")
+        return True, False
+
+    def _handle_cmd_bash_approve_on(self, _confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
+        # 新增：开启 Bash 自动确认。
+        self._update_bash_approve_status(True)
+        return True, False
+
+    def _handle_cmd_bash_approve_off(self, _confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
+        # 新增：关闭 Bash 自动确认。
+        self._update_bash_approve_status(False)
+        return True, False
+
+    def _update_bash_approve_status(self, enabled: bool):
+        """
+        更新 Bash 自动确认配置并刷新状态展示。
+        :param enabled: 是否开启自动确认
+        :return:
+        """
+        # 新增：复用 on/off 两个命令的公共逻辑，避免重复代码。
+        old_status = self._bash_approve_status_text()
+        self.set_bash_auto_approve(enabled)
+        new_status = self._bash_approve_status_text()
+        if old_status != new_status:
+            # 新增：当确认策略发生变化后，自动刷新状态展示，用户可立即看到最新配置。
+            self.console.print(f"[dim]已更新 Bash 命令确认策略：{new_status}[/]")
+            self._print_runtime_status()
+        else:
+            # 新增：若用户重复设置同一状态，明确告知并保持当前展示一致。
+            self.console.print(f"[dim]Bash 命令确认策略未变化，当前为：{new_status}[/]")
+
+    def _load_available_models(self) -> list[str]:
+        """
+        读取当前已配置的可用模型列表。
+        :return:
+        """
+        # 新增：从模型上下文窗口配置读取模型列表，作为可切换模型来源。
+        config_path = Path(self._agent_file_path("agent/config/model_context_windows.json"))
+        try:
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+        if not isinstance(config, dict):
+            return []
+        return [key for key in config.keys() if key != "default"]
+
+    def _handle_cmd_model_list(self, _confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
+        # 新增：列出当前已配置模型；若暂无配置则先保留为空实现提示。
+        available_models = self._load_available_models()
+        if not available_models:
+            self.console.print("[yellow]当前暂无可用模型配置，model_list 暂无可展示内容。[/]")
+            return True, False
+        self.console.print("[dim]已配置模型列表：[/]")
+        for index, model_name in enumerate(available_models, start=1):
+            marker = "（当前）" if model_name == self.model else ""
+            self.console.print(f"[dim]{index}. {model_name} {marker}[/]")
+        return True, False
+
+    def _handle_cmd_model_show_current(self, _confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
+        # 新增：展示当前模型并提示如何切换。
+        self.console.print(f"[dim]当前使用模型：{self.model}[/]")
+        self.console.print("[dim]切换方式：model <模型名>，例如 model gpt-4o-mini[/]")
+        return True, False
+
+    def _handle_cmd_model_switch(self, _confirm_choice: tuple[str, ...], cmd: str) -> tuple[bool, bool]:
+        # 新增：处理 model <model_name> 命令，校验配置后执行切换。
+        target_model = cmd.split(" ", 1)[1].strip()
+        self.console.print(f"[dim]当前使用模型：{self.model}[/]")
+        if not target_model:
+            self.console.print("[yellow]请输入目标模型，例如：model gpt-4o-mini[/]")
+            return True, False
+        available_models = self._load_available_models()
+        if not available_models:
+            self.console.print("[yellow]当前没有模型配置，暂无法切换，请先配置可用模型。[/]")
+            return True, False
+        if target_model not in available_models:
+            self.console.print(f"[yellow]模型 {target_model} 未配置，无法切换。可用模型：{', '.join(available_models)}[/]")
+            return True, False
+        self.model = target_model
+        self._max_context_tokens = self._load_model_context_window()
+        self.console.print(f"[green]模型已切换为：{self.model}（上下文窗口：{self._max_context_tokens}）[/]")
+        self._print_runtime_status()
+        return True, False
+
+    def _handle_cmd_compact_history(self, _confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
+        # 新增：主动触发当前会话历史压缩。
+        self._compact_messages(self._all_tools)
+        self.console.print("[dim]已执行会话压缩检查（达到阈值时会执行压缩）。[/]")
+        return True, False
+
+    def _handle_cmd_status(self, _confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
+        # 新增：展示当前模型状态（模型名、已用 token、token 总量）。
+        used_tokens = self._used_token or self._estimate_messages_tokens(self.messages, self._all_tools)
+        total_tokens = self._total_token or self._max_context_tokens
+        self.console.print(f"[dim]模型名：{self.model}[/]")
+        self.console.print(f"[dim]已使用 Token：{used_tokens}[/]")
+        self.console.print(f"[dim]Token 总量：{total_tokens}[/]")
+        self.console.print(f"[dim]上下文窗口：{self._max_context_tokens}[/]")
+        return True, False
 
 """
 Team 类管理多个Agent，
