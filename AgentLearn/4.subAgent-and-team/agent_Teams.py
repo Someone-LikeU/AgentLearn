@@ -15,6 +15,7 @@ from prompt_loader import load_prompt
 from tools.tool_manager import ToolManager, ToolManagerConfig, AgentToolHandlers
 from tools.tool_names import ToolNameConstant
 from tools.tool_scheduler import ToolScheduler, ToolCallTask
+from spinner import Spinner
 
 
 class Agent:
@@ -349,18 +350,22 @@ class Agent:
     def _make_plan(self, task):
         if self.plan_mode:
             return "Error: can't make plan within a plan"
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {
-                    "role": "system",
-                    "content": load_prompt("task_planning_system.md"),
-                },
-                {"role": "user", "content": load_prompt("task_planning_user.md", task=task)},
-            ],
-            response_format={"type": "json_object"},
-            temperature=self.temperature,
-        )
+        spinner = self._start_spinner()
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": load_prompt("task_planning_system.md"),
+                    },
+                    {"role": "user", "content": load_prompt("task_planning_user.md", task=task)},
+                ],
+                response_format={"type": "json_object"},
+                temperature=self.temperature,
+            )
+        finally:
+            spinner.stop()
         # 新增：每次模型调用后更新 token 使用统计。
         self._update_usage_from_response(response)
         try:
@@ -545,13 +550,17 @@ class Agent:
             f"{self._format_messages_for_compaction(summary_messages)}"
         )
 
-        summary_response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": load_prompt("conversation_compaction_system.md")},
-                {"role": "user", "content": load_prompt("conversation_compaction_user.md", old_text=old_text)}
-            ]
-        )
+        spinner = self._start_spinner()
+        try:
+            summary_response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": load_prompt("conversation_compaction_system.md")},
+                    {"role": "user", "content": load_prompt("conversation_compaction_user.md", old_text=old_text)}
+                ]
+            )
+        finally:
+            spinner.stop()
         # 新增：每次模型调用后更新 token 使用统计。
         self._update_usage_from_response(summary_response)
         summary = summary_response.choices[0].message.content
@@ -579,16 +588,21 @@ class Agent:
         for i in range(self.max_iterations):
             # 先压缩历史对话
             self._compact_messages(tools)
-            response_stream = self.client.chat.completions.create(
-                model=self.model,
-                messages=self.messages,
-                tools=tools,
-                temperature=self.temperature,
-                stream=True,
-            )
-            # message = response_stream.choices[0].message
-            # messages.append(message)
-            message = self._deal_stream_response(response_stream)
+            # 模型调用前启动等待动画，首个流式 chunk 到来后关闭。
+            spinner = self._start_spinner()
+            try:
+                response_stream = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=self.messages,
+                    tools=tools,
+                    temperature=self.temperature,
+                    stream=True,
+                )
+                # message = response_stream.choices[0].message
+                # messages.append(message)
+                message = self._deal_stream_response(response_stream, spinner=spinner)
+            finally:
+                spinner.stop()
             print()
             # 按照OpenAI的格式对message进行复原然后加回当前的短期历史记忆
             self._append_message({
@@ -709,7 +723,7 @@ class Agent:
         self._cached_system_prompt = build_system_prompt(base_prompt, rules, skills, memory)
         return self._cached_system_prompt
 
-    def _deal_stream_response(self, stream_response):
+    def _deal_stream_response(self, stream_response, spinner: Spinner | None = None):
         """
         为了用户体验，需要做流式响应，这里需要处理模型的流式响应，
         所以需要 1）流式打印响应内容，2）累积工具调用的chunks,因为同一个工具调用的参数可能在两个chunk里分两次返回
@@ -720,7 +734,12 @@ class Agent:
         full_reply = ""
         # 累积工具调用
         tool_calls = {}
+        first_chunk_arrived = False
         for chunk in stream_response:
+            if not first_chunk_arrived and spinner is not None:
+                # 首个响应到达后关闭等待动画，切换到真实流式输出。
+                spinner.stop()
+                first_chunk_arrived = True
             # 新增：流式响应中若包含 usage 字段，则实时更新 token 统计。
             self._update_usage_from_response(chunk)
             # 防御，有时delta可能不存在
@@ -743,12 +762,16 @@ class Agent:
                             "name": "",
                             "arguments": "",
                         }
+                    # 新增：若后续 chunk 才补齐 tool_call_id，这里做增量回填，避免首包无 id 导致丢失。
+                    if getattr(tc, "id", None):
+                        tool_calls[idx]["id"] = tc.id
                     func = getattr(tc, "function", None)
                     if func is not None:
                         name = getattr(func, "name", None)
                         args = getattr(func, "arguments", None)
                         if name:
-                            tool_calls[idx]["name"] = name
+                            # 新增：使用追加方式拼接，兼容极端情况下 name 被分片返回。
+                            tool_calls[idx]["name"] += name
                         if args:
                             tool_calls[idx]["arguments"] += args
 
@@ -770,6 +793,16 @@ class Agent:
             tool_calls=ordered_tool_calls if ordered_tool_calls else None,
         )
         return message
+
+    def _start_spinner(self) -> Spinner:
+        """
+        创建并启动等待动画。
+        :return:
+        """
+        # 统一由该方法管理 spinner 的创建，尽量减少对业务逻辑的侵入。
+        spinner = Spinner(self.console)
+        spinner.start()
+        return spinner
 
     def _update_usage_from_response(self, response):
         """
@@ -842,7 +875,11 @@ class Agent:
                 mail = "\n".join(f"[from {m['from']}]: {m['content']}" for m in self.inbox)
                 self._append_message({"role": "user", "content": load_prompt("inbox_digest_user.md", mail=mail)})
                 # 让 Agent 先消化这些消息
-                resp = self.client.chat.completions.create(model=self.model, messages=self.messages)
+                spinner = self._start_spinner()
+                try:
+                    resp = self.client.chat.completions.create(model=self.model, messages=self.messages)
+                finally:
+                    spinner.stop()
                 # 新增：每次模型调用后更新 token 使用统计。
                 self._update_usage_from_response(resp)
                 self._append_message(resp.choices[0].message)
