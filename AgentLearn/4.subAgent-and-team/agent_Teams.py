@@ -798,6 +798,8 @@ class Agent:
 
         while True:
             try:
+                # 新增：在输入框上方展示当前模型，便于用户随时确认当前会话模型。
+                self._print_input_header()
                 user_input = self.console.input("[bold cyan]You >[/] ")
                 # 新增：将命令分支提取到独立方法中，降低 run() 循环复杂度。
                 handled, should_exit = self._handle_user_command(user_input, confirm_choice)
@@ -843,6 +845,14 @@ class Agent:
         self.console.print(f"[dim]当前工作目录：{os.getcwd()}[/]")
         self.console.print(f"[dim]使用模型：{self.model}[/]")
         self.console.print(f"[dim]Bash 命令确认策略：{self._bash_approve_status_text()}[/]")
+
+    def _print_input_header(self):
+        """
+        在输入提示前展示当前模型信息。
+        :return:
+        """
+        # 新增：每轮输入前展示当前模型，模型切换后可自动反映最新状态。
+        self.console.print(f"[dim]当前模型：{self.model}[/]")
 
     def _normalize_command(self, user_input: str) -> str:
         """
