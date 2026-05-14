@@ -1123,11 +1123,49 @@ class Agent:
         # 新增：展示当前模型状态（模型名、已用 token、token 总量）。
         used_tokens = self._used_token or self._estimate_messages_tokens(self.messages, self._all_tools)
         total_tokens = self._total_token or self._max_context_tokens
+        # 新增：status 命令展示 token 使用柱状图，直观反馈使用率。
+        usage_ratio = self._calculate_token_usage_ratio(used_tokens, self._max_context_tokens)
+        token_bar = self._render_token_usage_bar(usage_ratio)
         self.console.print(f"[dim]模型名：{self.model}[/]")
         self.console.print(f"[dim]已使用 Token：{used_tokens}[/]")
         self.console.print(f"[dim]Token 总量：{total_tokens}[/]")
         self.console.print(f"[dim]上下文窗口：{self._max_context_tokens}[/]")
+        self.console.print(f"[dim]上下文使用率：{usage_ratio * 100:.2f}%[/]")
+        # 新增：按评审意见直接打印柱状图，不额外增加提示前缀。
+        self.console.print(token_bar)
         return True, False
+
+    def _calculate_token_usage_ratio(self, used_tokens: int, context_window: int) -> float:
+        """
+        计算 token 使用率。
+        :param used_tokens: 已使用 token
+        :param context_window: 上下文窗口 token 上限
+        :return:
+        """
+        # 新增：统一处理边界情况，避免除零并将结果限制在 0~1。
+        if context_window <= 0:
+            return 0.0
+        ratio = max(0.0, used_tokens / context_window)
+        return min(ratio, 1.0)
+
+    def _render_token_usage_bar(self, usage_ratio: float, width: int = 30) -> str:
+        """
+        渲染横向 token 使用柱状图。
+        :param usage_ratio: 使用率（0~1）
+        :param width: 柱状图宽度
+        :return:
+        """
+        # 新增：使用 Unicode 方块字符绘制柱状图，并根据阈值设置颜色。
+        ratio = min(max(usage_ratio, 0.0), 1.0)
+        filled = int(width * ratio)
+        bar = "█" * filled + "░" * (width - filled)
+        if ratio >= 0.9:
+            color = "red"
+        elif ratio >= 0.7:
+            color = "yellow"
+        else:
+            color = "green"
+        return f"[{color}]{bar}[/{color}] {ratio * 100:.2f}%"
 
 """
 Team 类管理多个Agent，
