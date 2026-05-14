@@ -3,7 +3,7 @@
     {
       "name": "qwen3.5:9b",
       "base_url": "http://localhost:5173/",
-      "api_key": "api_key",
+      "api_key": "",
       "max_model_context_token": 258000
     }
   ]

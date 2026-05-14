@@ -4,6 +4,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from subprocess import CompletedProcess
 from typing import Any, Callable
@@ -321,9 +322,42 @@ class ToolManager:
 
     def _run_bash_command(self, command):
         # 只负责执行与解码；是否可执行由 before hook 决定。
-        result = subprocess.run(command, shell=True, capture_output=True)
-        stdout, stderr = self._decode_subprocess_result(result)
-        return stdout + stderr
+        # 这里改为流式读取子进程输出，避免长命令执行期间控制台长时间无反馈。
+        process = subprocess.Popen(
+            command,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+        output_chunks: list[str] = []
+        stream_lock = threading.Lock()
+
+        def _consume_stream(stream, is_error: bool = False):
+            # 按行读取子进程输出并实时打印，同时把内容收集到结果中返回给模型。
+            if stream is None:
+                return
+            for line in iter(stream.readline, ""):
+                with stream_lock:
+                    if is_error:
+                        print(line, end="", file=sys.stderr, flush=True)
+                    else:
+                        print(line, end="", flush=True)
+                    output_chunks.append(line)
+            stream.close()
+
+        # stdout/stderr 并发消费，避免其中一侧缓冲区写满导致命令阻塞。
+        stdout_thread = threading.Thread(target=_consume_stream, args=(process.stdout, False), daemon=True)
+        stderr_thread = threading.Thread(target=_consume_stream, args=(process.stderr, True), daemon=True)
+        stdout_thread.start()
+        stderr_thread.start()
+        stdout_thread.join()
+        stderr_thread.join()
+        process.wait()
+        return "".join(output_chunks)
 
     def _execute_bash_with_hooks(self, command):
         args = {"command": command}
