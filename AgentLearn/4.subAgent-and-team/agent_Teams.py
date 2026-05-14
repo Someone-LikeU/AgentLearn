@@ -97,6 +97,8 @@ class Agent:
 
         # 使用模型
         self.model = model
+        # 新增：根据传入模型从 model_config.json 读取模型配置（base_url/api_key/上下文窗口等）。
+        self._apply_model_config_by_name(self.model)
         self._max_context_tokens = self._load_model_context_window()
         # 新增：记录最近一次模型调用的已使用 token 和总 token（来自 OpenAI 标准 usage 字段）。
         self._used_token = 0
@@ -180,6 +182,72 @@ class Agent:
 
         self.console = Console()
 
+    def _model_config_file_path(self) -> Path:
+        """
+        获取模型配置文件路径。
+        :return:
+        """
+        # 新增：统一模型配置路径，后续读取与写入共用。
+        return Path(self._agent_file_path("agent/config/model_config.json"))
+
+    def _read_model_config(self) -> dict:
+        """
+        读取模型配置文件。
+        :return:
+        """
+        # 新增：若文件不存在或内容异常，返回空配置结构，避免启动报错。
+        config_path = self._model_config_file_path()
+        try:
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+        except Exception:
+            return {"models": []}
+        if not isinstance(config, dict):
+            return {"models": []}
+        if not isinstance(config.get("models"), list):
+            config["models"] = []
+        return config
+
+    def _write_model_config(self, config: dict):
+        """
+        写入模型配置文件。
+        :param config: 配置内容
+        :return:
+        """
+        # 新增：确保目录存在并按 UTF-8 美化输出 JSON。
+        config_path = self._model_config_file_path()
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _get_model_config_by_name(self, model_name: str) -> dict | None:
+        """
+        根据模型名获取模型配置项。
+        :param model_name: 模型名
+        :return:
+        """
+        # 新增：从模型配置列表里查找目标模型。
+        models = self._read_model_config().get("models", [])
+        for model_info in models:
+            if isinstance(model_info, dict) and model_info.get("name") == model_name:
+                return model_info
+        return None
+
+    def _apply_model_config_by_name(self, model_name: str):
+        """
+        根据模型名应用模型配置（base_url/api_key）。
+        :param model_name: 模型名
+        :return:
+        """
+        # 新增：在不改变初始化接口的前提下，按模型配置自动补全连接信息。
+        model_info = self._get_model_config_by_name(model_name)
+        if not model_info:
+            return
+        self._base_url = model_info.get("base_url") or self._base_url
+        self._api_key = model_info.get("api_key") or self._api_key
+        self.client = OpenAI(
+            base_url=self._base_url,
+            api_key=self._api_key,
+        )
+
     def receive(self, sender, message):
         """
         通信，接收来自其他agent的信息
@@ -193,12 +261,17 @@ class Agent:
         return os.path.join(os.path.dirname(__file__), relative_path)
 
     def _load_model_context_window(self):
-        config_path = Path(self._agent_file_path("agent/config/model_context_windows.json"))
+        config_path = Path(self._agent_file_path("agent/config/model_config.json"))
         try:
             config = json.loads(config_path.read_text(encoding="utf-8"))
         except Exception:
             return self._DEFAULT_CONTEXT_WINDOW
-        return int(config.get(self.model) or config.get("default") or self._DEFAULT_CONTEXT_WINDOW)
+        # 新增：从模型配置中按模型名读取上下文窗口配置。
+        models = config.get("models", []) if isinstance(config, dict) else []
+        for model_info in models:
+            if isinstance(model_info, dict) and model_info.get("name") == self.model:
+                return int(model_info.get("max_model_context_token") or self._DEFAULT_CONTEXT_WINDOW)
+        return self._DEFAULT_CONTEXT_WINDOW
 
     def _schedule_memory_update(self, task, result):
         if not self._is_main_agent or self.memory_manager is None:
@@ -978,15 +1051,9 @@ class Agent:
         读取当前已配置的可用模型列表。
         :return:
         """
-        # 新增：从模型上下文窗口配置读取模型列表，作为可切换模型来源。
-        config_path = Path(self._agent_file_path("agent/config/model_context_windows.json"))
-        try:
-            config = json.loads(config_path.read_text(encoding="utf-8"))
-        except Exception:
-            return []
-        if not isinstance(config, dict):
-            return []
-        return [key for key in config.keys() if key != "default"]
+        # 新增：从 model_config.json 读取模型列表，作为可切换模型来源。
+        models = self._read_model_config().get("models", [])
+        return [model_info.get("name") for model_info in models if isinstance(model_info, dict) and model_info.get("name")]
 
     def _handle_cmd_model_list(self, _confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
         # 新增：列出当前已配置模型；若暂无配置则先保留为空实现提示。
@@ -1014,13 +1081,33 @@ class Agent:
             self.console.print("[yellow]请输入目标模型，例如：model gpt-4o-mini[/]")
             return True, False
         available_models = self._load_available_models()
-        if not available_models:
-            self.console.print("[yellow]当前没有模型配置，暂无法切换，请先配置可用模型。[/]")
-            return True, False
         if target_model not in available_models:
-            self.console.print(f"[yellow]模型 {target_model} 未配置，无法切换。可用模型：{', '.join(available_models)}[/]")
-            return True, False
+            # 新增：目标模型不在配置列表时，引导用户录入4个配置字段并写入 model_config.json。
+            self.console.print(f"[yellow]模型 {target_model} 未配置，开始新增模型配置。[/]")
+            base_url = self.console.input("[bold cyan]请输入 base_url：[/] ").strip()
+            api_key = self.console.input("[bold cyan]请输入 api_key：[/] ").strip()
+            context_token_input = self.console.input("[bold cyan]请输入 max_model_context_token：[/] ").strip()
+            try:
+                max_model_context_token = int(context_token_input)
+            except ValueError:
+                self.console.print("[red]max_model_context_token 必须是整数，已取消新增。[/]")
+                return True, False
+
+            config = self._read_model_config()
+            config.setdefault("models", [])
+            config["models"].append(
+                {
+                    "name": target_model,
+                    "base_url": base_url,
+                    "api_key": api_key,
+                    "max_model_context_token": max_model_context_token,
+                }
+            )
+            self._write_model_config(config)
+            self.console.print(f"[green]模型 {target_model} 配置已写入 model_config.json[/]")
+
         self.model = target_model
+        self._apply_model_config_by_name(self.model)
         self._max_context_tokens = self._load_model_context_window()
         self.console.print(f"[green]模型已切换为：{self.model}（上下文窗口：{self._max_context_tokens}）[/]")
         self._print_runtime_status()
