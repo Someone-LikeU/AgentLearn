@@ -68,7 +68,7 @@ class MCPServer:
 			sys.stdout.write(json.dumps(response, ensure_ascii=False) + "\n")
 			sys.stdout.flush()
 
-	def serve_tcp(self, host: str = "127.0.0.1", port: int = 8765):
+	def serve_tcp(self, host: str = "127.0.0.1", port: int = 7777):
 		"""
 		通过 TCP Socket 方式提供服务
 		:param host: 监听地址

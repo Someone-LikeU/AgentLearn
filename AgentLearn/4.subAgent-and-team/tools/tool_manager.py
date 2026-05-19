@@ -10,7 +10,10 @@ from subprocess import CompletedProcess
 from typing import Any, Callable
 from dataclasses import dataclass
 
-from duckduckgo_search import DDGS
+try:
+    from duckduckgo_search import DDGS
+except ModuleNotFoundError:
+    DDGS = None
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -464,10 +467,30 @@ class ToolManager:
         return "\n".join(files) if files else "No files found"
 
     def grep(self, pattern, path="."):
-        # 统一走系统 grep，返回匹配文本，空结果给标准提示。
-        result = subprocess.run(f"grep -r '{pattern}' {path}", shell=True, capture_output=True)
-        stdout, _ = self._decode_subprocess_result(result)
-        return stdout if stdout else "No matches found"
+        # 使用 Python 实现递归搜索，避免 Windows 环境缺少 grep 命令导致工具失效。
+        try:
+            regex = re.compile(pattern)
+        except re.error as e:
+            return f"Invalid regex pattern: {e}"
+
+        target = Path(path)
+        if target.is_file():
+            files = [target]
+        elif target.is_dir():
+            files = [p for p in target.rglob("*") if p.is_file()]
+        else:
+            return "No matches found"
+
+        matches: list[str] = []
+        for file_path in files:
+            try:
+                with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+                    for line_no, line in enumerate(f, 1):
+                        if regex.search(line):
+                            matches.append(f"{file_path}:{line_no}: {line.rstrip()}")
+            except OSError:
+                continue
+        return "\n".join(matches) if matches else "No matches found"
 
     def get_time(self):
         # 统一系统时间格式，供规则注入和提示词拼接使用。
@@ -479,6 +502,8 @@ class ToolManager:
         max_results = int(max_results) if max_results else 10
         max_results = max(1, min(max_results, 10))
         try:
+            if DDGS is None:
+                return "WEB_SEARCH 执行失败: missing dependency duckduckgo_search"
             with DDGS() as ddgs:
                 results = list(ddgs.text(query, max_results=max_results))
             if not results:

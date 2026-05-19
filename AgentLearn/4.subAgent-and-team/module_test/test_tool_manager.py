@@ -1,6 +1,12 @@
 # encoding: utf-8
 import sys
 import types
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+# 测试可能从 module_test 或仓库根目录启动，这里确保阶段目录可被导入。
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 if "duckduckgo_search" not in sys.modules:
     mock_module = types.ModuleType("duckduckgo_search")
@@ -20,7 +26,6 @@ if "duckduckgo_search" not in sys.modules:
 
 import tempfile
 import unittest
-from pathlib import Path
 from unittest.mock import patch
 
 from tools.tool_manager import ToolManager, ToolManagerConfig, AgentToolHandlers

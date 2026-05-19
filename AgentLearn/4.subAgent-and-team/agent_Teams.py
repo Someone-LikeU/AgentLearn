@@ -6,9 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from openai import OpenAI
-from mcp_client import MCPClient
 from rich.console import Console
-from rich.markdown import Markdown
 from rich.panel import Panel
 from memory_manager import MemoryManager
 from prompt_loader import load_prompt
@@ -136,6 +134,7 @@ class Agent:
 
         # MCP客户端（由外部传入，不在Agent内部创建）
         self.mcp_client = mcp_client
+        self._prepare_mcp_client()
         self._tool_manager = ToolManager(
             config=ToolManagerConfig(
                 project_root=os.path.dirname(__file__),
@@ -182,6 +181,52 @@ class Agent:
         self._current_task_start_index = None
 
         self.console = Console()
+
+    def _mcp_client_ping_ok(self) -> bool:
+        """
+        检查 MCP 客户端是否可以 ping 通。
+        :return:
+        """
+        ping = getattr(self.mcp_client, "ping", None)
+        if not callable(ping):
+            return False
+        try:
+            # 用 ping 做真实连通性检查，避免仅检查 socket/process 字段但连接已失效。
+            ping()
+            return True
+        except Exception:
+            return False
+
+    def _prepare_mcp_client(self, max_attempts: int = 3):
+        """
+        初始化 ToolManager 前检查 MCP 客户端是否可用，不可用则退回本地工具。
+        :param max_attempts: 最大启动尝试次数
+        :return:
+        """
+        if not self.mcp_client:
+            return
+
+        if self._mcp_client_ping_ok():
+            return
+
+        start = getattr(self.mcp_client, "start", None)
+        if not callable(start):
+            # 传入对象无法启动且当前不可用，禁用 MCP，避免 ToolManager 初始化时报错。
+            print("传入的 MCP 客户端不可用：ping 不通且没有 start 方法，将只使用本地工具")
+            self.mcp_client = None
+            return
+
+        last_error = None
+        for _ in range(max_attempts):
+            try:
+                start()
+            except Exception as e:
+                last_error = e
+            if self._mcp_client_ping_ok():
+                return
+
+        print(f"传入的 MCP 客户端不可用：尝试启动 {max_attempts} 次后仍 ping 不通，将只使用本地工具。最后错误：{last_error}")
+        self.mcp_client = None
 
     def _model_config_file_path(self) -> Path:
         """

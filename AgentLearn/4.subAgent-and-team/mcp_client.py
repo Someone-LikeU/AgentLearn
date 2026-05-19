@@ -4,7 +4,9 @@ import json
 import socket
 import subprocess
 import sys
+import time
 import uuid
+from pathlib import Path
 from typing import Any
 
 
@@ -14,8 +16,8 @@ class MCPClient:
 	1. 子进程模式：服务器作为客户端的子进程运行（通过 STDIO 通信）
 	2. TCP 模式：服务器独立运行，客户端通过 TCP 连接通信
 	"""
-	def __init__(self, server_script: str | None = None, 
-				 mode: str = "subprocess", host: str = "127.0.0.1", port: int = 8765):
+	def __init__(self, server_script: str | None = None,
+				 mode: str = "subprocess", host: str = "127.0.0.1", port: int = 7777):
 		"""
 		初始化 MCP 客户端
 		:param server_script: 服务器脚本路径（仅子进程模式需要）
@@ -119,7 +121,7 @@ class MCPClient:
 	def _request_tcp(self, payload_str: str) -> Any:
 		"""通过 TCP Socket 发送请求"""
 		if self.socket is None:
-			raise RuntimeError("MCP server is not connected")
+			raise RuntimeError("MCP server is not connected. Call MCPClient.start() before using TCP mode")
 		
 		self.socket.sendall(payload_str.encode("utf-8"))
 		response_data = b""
@@ -160,6 +162,53 @@ class MCPClient:
 			self.close()
 		except Exception:
 			pass
+
+
+def create_tcp_mcp_client(
+	host: str = "127.0.0.1",
+	port: int = 7777,
+	server_script: str | None = None,
+	startup_wait: float = 1.0,
+) -> tuple[MCPClient, subprocess.Popen[str] | None]:
+	"""
+	创建可用的 TCP MCP 客户端；如果服务端未启动，则先拉起本地服务端。
+	:param host: TCP 服务地址
+	:param port: TCP 服务端口
+	:param server_script: MCP 服务端脚本路径
+	:param startup_wait: 启动服务端后的等待秒数
+	:return: MCP 客户端，以及本函数自动启动的服务端进程；如果复用已有服务端，则进程为 None
+	"""
+	client = MCPClient(server_script=server_script, mode="tcp", host=host, port=port)
+	try:
+		# 先尝试复用已经启动的 TCP 服务端，避免重复拉起服务进程。
+		client.start()
+		return client, None
+	except (OSError, RuntimeError):
+		client.close()
+
+	server_path = Path(client.server_script).resolve()
+	server_process = subprocess.Popen(
+		[sys.executable, "-u", str(server_path), "--mode", "tcp", "--host", host, "--port", str(port)],
+		cwd=str(server_path.parent),
+		stdout=subprocess.PIPE,
+		stderr=subprocess.PIPE,
+		text=True,
+		encoding="utf-8",
+	)
+	time.sleep(startup_wait)
+
+	client = MCPClient(server_script=str(server_path), mode="tcp", host=host, port=port)
+	try:
+		# 服务端由本函数启动后，再创建新的客户端连接并校验 ping。
+		client.start()
+	except Exception:
+		client.close()
+		if server_process.poll() is None:
+			# 连接失败时只清理本函数启动的服务端进程。
+			server_process.terminate()
+			server_process.wait(timeout=3)
+		raise
+	return client, server_process
 
 
 if __name__ == '__main__':
