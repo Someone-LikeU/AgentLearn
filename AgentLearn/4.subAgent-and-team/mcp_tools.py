@@ -101,12 +101,12 @@ class MCPToolsRegistry:
 		# 查询某城市天气
 		self._tools["QUERY_WEATHER"] = MCPTool(
 			name="QUERY_WEATHER",
-			description="该工具接口查询某城市的天气数据，当用户任务可能涉及到需要查询天气时，调用该工具，例如'帮我规划未来3天假期去北京的旅游行程'、'明天需不需要穿羽绒服'等。该工具查询某个城市的未来天气，days参数默认15天，最大16天。",
+			description="Get weather forecast for a city. Use for weather, clothing, or travel planning questions. `days` defaults to 15 and is capped at 16.",
 			parameters={
 				"type": "object",
 				"properties": {
-					"city": {"type": "string", "description": "城市名称，如北京、上海"},
-					"days": {"type": "integer", "description": "未来天数，默认15，最大16"},
+					"city": {"type": "string", "description": "City name, preferably in Chinese, e.g. 北京 or 上海."},
+					"days": {"type": "integer", "description": "Forecast days. Default 15, max 16."},
 				},
 				"required": ["city"],
 			},
@@ -115,13 +115,13 @@ class MCPToolsRegistry:
 		# 机票查询工具
 		self._tools["QUERY_FLIGHT_TICKETS"] = MCPTool(
 			name="QUERY_FLIGHT_TICKETS",
-			description="该工具调用携程公开接口查询机票价格趋势（最低价接口）。当用户任务可能涉及到查询机票信息时，调用该工具，例如'帮我规划未来5天假期去北京的旅游行程'、'未来10天有没有去北京的低于800的机票？'等。",
+			description="Query Ctrip lowest flight price trend. Use for airfare checks, trip planning, or finding cheap flights between cities.",
 			parameters={
 				"type": "object",
 				"properties": {
-					"from_city": {"type": "string", "description": "出发城市，如北京"},
-					"to_city": {"type": "string", "description": "到达城市，如上海"},
-					"direct": {"type": "boolean", "description": "是否直飞，默认false"},
+					"from_city": {"type": "string", "description": "Departure city, preferably in Chinese, e.g. 北京."},
+					"to_city": {"type": "string", "description": "Arrival city, preferably in Chinese, e.g. 上海."},
+					"direct": {"type": "boolean", "description": "Direct flights only. Default false."},
 				},
 				"required": ["from_city", "to_city"],
 			},

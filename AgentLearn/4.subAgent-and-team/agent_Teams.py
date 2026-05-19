@@ -8,6 +8,7 @@ from typing import Any
 from openai import OpenAI
 from rich.console import Console
 from rich.panel import Panel
+from rich.table import Table
 from memory_manager import MemoryManager
 from prompt_loader import load_prompt
 from tools.tool_manager import ToolManager, ToolManagerConfig, AgentToolHandlers
@@ -986,10 +987,62 @@ class Agent:
                 "You can ask me to do some task or type help/h",
                 border_style="green", padding=(1, 2),
             ))
-        self.console.print(
-            "[dim]可用命令：help/h | exit/q/quit | clear session | clear history | bash approve on/off | "
-            "model_list | model | model <name> | campact/compact | status[/]"
-        )
+        commands = [
+            ("clear", "清空当前终端窗口显示内容"),
+            ("help / h", "显示帮助信息"),
+            ("exit / q / quit", "退出当前 Agent 会话"),
+            ("clear session", "清空当前短期会话上下文"),
+            ("clear history", "清空当前会话上下文和长期记忆"),
+            ("clear memory", "只清空长期记忆"),
+            ("bash approve on", "开启 Bash 命令人工确认"),
+            ("bash approve off", "关闭 Bash 命令人工确认"),
+            ("model_list", "查看可用模型配置"),
+            ("model", "查看当前模型"),
+            ("model <name>", "切换到指定模型"),
+            ("tools", "列出当前可用工具"),
+            ("compact", "压缩当前会话上下文"),
+            ("status", "查看当前运行状态"),
+        ]
+        command_table = Table.grid(padding=(0, 2))
+        command_table.add_column(justify="left", no_wrap=True)
+        command_table.add_column(justify="left")
+        # 命令名加粗突出，说明文字使用浅色，便于快速扫描。
+        for command, description in commands:
+            command_table.add_row(f"[bold cyan]{command}[/]", f"[dim]{description}[/]")
+
+        self.console.print("[bold]可用命令[/]")
+        self.console.print(command_table)
+
+    def _print_available_tools(self):
+        """
+        打印当前 Agent 可用工具列表。
+        :return:
+        """
+        tool_groups = [
+            ("本地工具", self._local_tools),
+            ("MCP 工具", self._mcp_tools),
+        ]
+        has_tools = False
+        for group_name, tools in tool_groups:
+            if not tools:
+                continue
+            has_tools = True
+            tool_table = Table.grid(padding=(0, 2))
+            tool_table.add_column(justify="left", no_wrap=True)
+            tool_table.add_column(justify="left")
+            # 工具 schema 统一按 OpenAI tool 格式读取，兼容少量直接含 name/description 的旧格式。
+            for tool in tools:
+                tool_schema = tool if isinstance(tool, dict) else {}
+                function_schema = tool_schema.get("function", {})
+                name = function_schema.get("name") or tool_schema.get("name") or "UNKNOWN_TOOL"
+                description = function_schema.get("description") or tool_schema.get("description") or "暂无描述"
+                tool_table.add_row(f"[bold cyan]{name}[/]", f"[dim]{description}[/]")
+
+            self.console.print(f"[bold]{group_name}[/]")
+            self.console.print(tool_table)
+
+        if not has_tools:
+            self.console.print("[yellow]当前没有可用工具。[/]")
 
     def _print_runtime_status(self):
         """
@@ -1059,6 +1112,8 @@ class Agent:
             "bash approve off": self._handle_cmd_bash_approve_off,
             "model_list": self._handle_cmd_model_list,
             "model": self._handle_cmd_model_show_current,
+            "tools": self._handle_cmd_tools,
+            "clear": self._handle_cmd_clear_screen,
             "campact": self._handle_cmd_compact_history,
             "compact": self._handle_cmd_compact_history,
             "status": self._handle_cmd_status,
@@ -1073,6 +1128,16 @@ class Agent:
     def _handle_cmd_help(self, _confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
         # 新增：帮助命令处理。
         self._print_help(show_welcome=False)
+        return True, False
+
+    def _handle_cmd_tools(self, _confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
+        # 新增：展示当前已加载的本地工具和 MCP 工具。
+        self._print_available_tools()
+        return True, False
+
+    def _handle_cmd_clear_screen(self, _confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
+        # 清空终端窗口显示内容，不影响 Agent 的会话上下文和长期记忆。
+        self.console.clear()
         return True, False
 
     def _handle_cmd_clear_session(self, confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
