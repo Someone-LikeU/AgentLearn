@@ -1,8 +1,10 @@
 # encoding : utf-8
 # @Time    : 2026/4/19
+import atexit
 import json
 import os
 from pathlib import Path
+from threading import Thread, current_thread
 from types import SimpleNamespace
 from typing import Any
 from openai import OpenAI
@@ -11,10 +13,12 @@ from rich.panel import Panel
 from rich.table import Table
 from memory_manager import MemoryManager
 from prompt_loader import load_prompt
+from session_manager import SessionManager
 from tools.tool_manager import ToolManager, ToolManagerConfig, AgentToolHandlers
 from tools.tool_names import ToolNameConstant
 from tools.tool_scheduler import ToolScheduler, ToolCallTask
 from spinner import Spinner
+from task_history_viewer import open_task_history_viewer
 
 
 class Agent:
@@ -50,6 +54,7 @@ class Agent:
     _COMPACT_TRIGGER_RATIO = 0.8
     _MIDDLE_COMPACT_RATIO = 0.3
     _KEEP_RECENT = 10
+    _MAX_CONSECUTIVE_TOOL_FAILURES = 2
 
     def __init__(self, model="qwen3.5:9b",
                  temperature: float = 0.1,
@@ -83,13 +88,13 @@ class Agent:
         # api_key
         self._api_key = os.environ.get("OPENAI_API_KEY") if api_key is None else api_key
 
-        # openAI 请求客户端
+        # OpenAI 请求客户端
         self.client = OpenAI(
             base_url=self._base_url,
             api_key=self._api_key,
         )
 
-        # 是否是主agent, False表示由Agent创建的子Agent,默认为True
+        # 是否是主 Agent，False 表示由 Agent 创建的子 Agent，默认为 True。
         self._is_main_agent = is_main_agent
 
         # 最大迭代次数
@@ -97,17 +102,17 @@ class Agent:
 
         # 使用模型
         self.model = model
-        # 新增：根据传入模型从 model_config.json 读取模型配置（base_url/api_key/上下文窗口等）。
+        # 根据传入模型从 model_config.json 读取模型配置（base_url/api_key/上下文窗口等）。
         self._apply_model_config_by_name(self.model)
         self._max_context_tokens = self._load_model_context_window()
-        # 新增：记录最近一次模型调用的已使用 token 和总 token（来自 OpenAI 标准 usage 字段）。
+        # 记录最近一次模型调用的已使用 token 和总 token（来自 OpenAI 标准 usage 字段）。
         self._used_token = 0
         self._total_token = 0
 
-        # llm温度参数
+        # LLM 温度参数
         self.temperature = temperature
 
-        # 主Agent才保留长期记忆，由主Agent唤起的子Agent不给保留记忆，用完就扔
+        # 主 Agent 才保留长期记忆，由主 Agent 唤起的子 Agent 不保留记忆，用完即丢。
         self.memory_manager = (
             MemoryManager(
                 project_root=os.path.dirname(__file__),
@@ -119,10 +124,10 @@ class Agent:
             else None
         )
 
-        # 是否处在plan模式
+        # 是否处在计划模式
         self.plan_mode = False
 
-        # 当前plan列表
+        # 当前计划列表
         self.current_plan: list[str] = []
 
         # 规则和技能目录
@@ -130,12 +135,13 @@ class Agent:
         self.skills_dir = "agent/skills"
         self.prompts_dir = "agent/prompts"
 
-        # 各SKILL.md缓存,key 为SKILL的name，value为SKILL.md完整内容
+        # 各 SKILL.md 缓存，key 为技能名称，value 为 SKILL.md 完整内容。
         self._skills_cache = {}
 
-        # MCP客户端（由外部传入，不在Agent内部创建）
+        # MCP 客户端（由外部传入，不在 Agent 内部创建）。
         self.mcp_client = mcp_client
         self._prepare_mcp_client()
+        self.console = Console()
         self._tool_manager = ToolManager(
             config=ToolManagerConfig(
                 project_root=os.path.dirname(__file__),
@@ -143,6 +149,11 @@ class Agent:
                 model=self.model,
                 temperature=self.temperature,
                 is_main_agent=self._is_main_agent,
+                spinner_factory=(
+                    lambda preset=Spinner.DEFAULT, **context: self._start_spinner(preset=preset, **context)
+                    if self._should_show_tool_spinner()
+                    else None
+                ),
             ),
             handlers=AgentToolHandlers(
                 make_plan_handler=self._make_plan,
@@ -163,14 +174,32 @@ class Agent:
         else:
             print("No MCP client provided, MCP tools not loaded")
 
-        # 基础提示词，用于主agent
+        # 基础提示词，用于主 Agent。
         self._base_prompt_main_agent = load_prompt("base_main_agent.md")
 
-        # 子agent提示词
+        # 子 Agent 提示词。
         self._base_prompt_sub_agent = load_prompt("base_sub_agent.md", role=role)
 
         # 缓存系统提示词,后续记忆压缩的时候可能会用到
         self._cached_system_prompt = self._build_system_prompt()
+
+        self._session_interrupted_recorded = False
+        self._session_exit_hook_registered = False
+
+        # 主 Agent 才记录完整会话；子 Agent 的过程保留在主任务 turn 中，避免产生零散会话文件。
+        self.session_manager = (
+            SessionManager(project_root=os.path.dirname(__file__))
+            if self._is_main_agent
+            else None
+        )
+        if self.session_manager is not None:
+            # 会话文件懒创建，避免用户启动后直接退出时留下空 session。
+            self._register_session_exit_hook()
+
+        self._current_turn_id = None
+        self._session_title_auto_started = False
+        self._pending_session_title = None
+        self._pending_session_title_source = None
 
         # 单次会话中的短期记忆，记录一次会话中的短期上下文
         self.messages = [
@@ -180,8 +209,6 @@ class Agent:
         # 当前任务的完整上下文，用于保存长期记忆
         self._current_task_full_context = None
         self._current_task_start_index = None
-
-        self.console = Console()
 
     def _mcp_client_ping_ok(self) -> bool:
         """
@@ -234,7 +261,7 @@ class Agent:
         获取模型配置文件路径。
         :return:
         """
-        # 新增：统一模型配置路径，后续读取与写入共用。
+        # 统一模型配置路径，后续读取与写入共用。
         return Path(self._agent_file_path("agent/config/model_config.json"))
 
     def _read_model_config(self) -> dict:
@@ -242,7 +269,7 @@ class Agent:
         读取模型配置文件。
         :return:
         """
-        # 新增：若文件不存在或内容异常，返回空配置结构，避免启动报错。
+        # 若文件不存在或内容异常，返回空配置结构，避免启动报错。
         config_path = self._model_config_file_path()
         try:
             config = json.loads(config_path.read_text(encoding="utf-8"))
@@ -260,7 +287,7 @@ class Agent:
         :param config: 配置内容
         :return:
         """
-        # 新增：确保目录存在并按 UTF-8 美化输出 JSON。
+        # 确保目录存在并按 UTF-8 美化输出 JSON。
         config_path = self._model_config_file_path()
         config_path.parent.mkdir(parents=True, exist_ok=True)
         config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -271,7 +298,7 @@ class Agent:
         :param model_name: 模型名
         :return:
         """
-        # 新增：从模型配置列表里查找目标模型。
+        # 从模型配置列表里查找目标模型。
         models = self._read_model_config().get("models", [])
         for model_info in models:
             if isinstance(model_info, dict) and model_info.get("name") == model_name:
@@ -284,7 +311,7 @@ class Agent:
         :param model_name: 模型名
         :return:
         """
-        # 新增：在不改变初始化接口的前提下，按模型配置自动补全连接信息。
+        # 在不改变初始化接口的前提下，按模型配置自动补全连接信息。
         model_info = self._get_model_config_by_name(model_name)
         if not model_info:
             return
@@ -313,7 +340,7 @@ class Agent:
             config = json.loads(config_path.read_text(encoding="utf-8"))
         except Exception:
             return self._DEFAULT_CONTEXT_WINDOW
-        # 新增：从模型配置中按模型名读取上下文窗口配置。
+        # 从模型配置中按模型名读取上下文窗口配置。
         models = config.get("models", []) if isinstance(config, dict) else []
         for model_info in models:
             if isinstance(model_info, dict) and model_info.get("name") == self.model:
@@ -323,15 +350,185 @@ class Agent:
     def _schedule_memory_update(self, task, result):
         if not self._is_main_agent or self.memory_manager is None:
             return
-        # Memory summarization is intentionally asynchronous so task completion stays responsive.
-        self.memory_manager.enqueue(
+        # 长期记忆摘要异步执行，避免拖慢当前任务完成。
+        future = self.memory_manager.enqueue(
             task=task,
             result=result,
             context=self._current_task_full_context or [],
+            session_id=self.session_manager.current_session_id if self.session_manager is not None else None,
+            turn_id=self._current_turn_id,
         )
+        if future is None or self.session_manager is None or not self._current_turn_id:
+            return
+
+        turn_id = self._current_turn_id
+
+        def _record_memory_saved(done_future):
+            try:
+                index_record = done_future.result()
+                if not index_record:
+                    return
+                # 只有长期记忆真正落盘后，才把 task_id 关联到当前 turn。
+                self.session_manager.record_memory_saved(
+                    turn_id=turn_id,
+                    task_id=index_record.get("task_id"),
+                    full_context_path=index_record.get("full_context_path"),
+                )
+            except Exception as error:
+                try:
+                    self.session_manager.append_event(
+                        {
+                            "event": "memory_save_error",
+                            "turn_id": turn_id,
+                            "error": str(error),
+                        }
+                    )
+                except Exception:
+                    pass
+
+        future.add_done_callback(_record_memory_saved)
+
+    def _maybe_auto_title_session(self, task: str):
+        """
+        根据当前会话的第一个用户任务自动生成标题。
+        :param task: 用户任务
+        :return:
+        """
+        if not self._is_main_agent or self.session_manager is None:
+            return
+        if self._session_title_auto_started:
+            return
+        session_info = self.session_manager.get_current_session_info()
+        if session_info.get("title_source") == "user":
+            return
+
+        normalized_task = " ".join(str(task or "").strip().split())
+        if not normalized_task:
+            return
+        self._session_title_auto_started = True
+
+        if len(normalized_task) <= 8:
+            # 8 个字以内的任务本身已经足够短，直接作为会话标题。
+            self._set_session_title(normalized_task, source="auto", silent=True)
+            return
+
+        # 长任务标题异步生成，不阻塞当前用户任务的执行。
+        Thread(
+            target=self._generate_session_title_async,
+            args=(normalized_task,),
+            daemon=True,
+            name="session-title-generator",
+        ).start()
+
+    def _generate_session_title_async(self, task: str):
+        """
+        后台调用当前模型生成中文会话标题。
+        :param task: 用户任务
+        :return:
+        """
+        try:
+            # 使用临时 messages 执行独立标题任务，避免污染主会话上下文窗口。
+            title_messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "You generate concise Chinese conversation titles. "
+                        "Return only the title, no punctuation, no explanation."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "Summarize the following user task into a Chinese title.\n"
+                        "Requirements:\n"
+                        "- 6 to 18 Chinese characters when possible\n"
+                        "- No punctuation\n"
+                        "- No explanation\n\n"
+                        f"User task:\n{task}"
+                    ),
+                },
+            ]
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=title_messages,
+                temperature=0,
+            )
+            raw_title = response.choices[0].message.content
+            title = self._normalize_generated_session_title(raw_title, task)
+        except Exception:
+            title = self._fallback_session_title(task)
+        self._set_session_title(title, source="auto", silent=True)
+
+    def _normalize_generated_session_title(self, raw_title: str, task: str) -> str:
+        """
+        清理模型生成的标题。
+        :param raw_title: 模型原始输出
+        :param task: 用户任务，用于兜底
+        :return: 清理后的标题
+        """
+        title = str(raw_title or "").strip().splitlines()[0].strip()
+        for prefix in ("标题：", "标题:", "Title:", "title:"):
+            if title.startswith(prefix):
+                title = title[len(prefix):].strip()
+        title = title.strip("`\"'“”‘’《》<>。，、：:；;！!？?")
+        if not title:
+            return self._fallback_session_title(task)
+        if len(title) > 18:
+            title = title[:18]
+        return title
+
+    def _fallback_session_title(self, task: str) -> str:
+        """
+        本地生成兜底会话标题。
+        :param task: 用户任务
+        :return: 兜底标题
+        """
+        normalized_task = " ".join(str(task or "").strip().split())
+        return normalized_task[:18] if normalized_task else "未命名会话"
+
+    def _set_session_title(self, title: str, source: str = "user", silent: bool = False) -> bool:
+        """
+        设置当前会话标题。
+        :param title: 标题
+        :param source: 标题来源
+        :param silent: 是否静默设置
+        :return: 是否设置成功
+        """
+        if self.session_manager is None:
+            if not silent:
+                self.console.print("[yellow]当前没有可管理的主会话。[/]")
+            return False
+        if self.session_manager.current_session_id is None:
+            normalized_title = " ".join(str(title or "").strip().split())
+            if not normalized_title:
+                if not silent:
+                    self.console.print("[yellow]会话标题不能为空。[/]")
+                return False
+            # 会话尚未落盘时只暂存标题，等第一条真实任务创建 session 时一起写入。
+            self._pending_session_title = normalized_title
+            self._pending_session_title_source = source if source in {"user", "auto", "default"} else "user"
+            if not silent:
+                self.console.print(f"[dim]已设置待创建会话标题：{normalized_title}[/]")
+            return True
+        try:
+            event = self.session_manager.update_title(title, source=source)
+        except ValueError:
+            if not silent:
+                self.console.print("[yellow]会话标题不能为空。[/]")
+            return False
+        except Exception as error:
+            if not silent:
+                self.console.print(f"[yellow]会话标题更新失败：{error}[/]")
+            return False
+
+        if event.get("event") == "session_title_update_skipped":
+            return False
+        if not silent:
+            self.console.print(f"[dim]当前会话标题已更新为：{event.get('title')}[/]")
+        return True
 
     def _load_memory_view(self):
-        # Sub agents do not inherit long-term memory; they only work on the delegated task.
+        # 子 Agent 不继承长期记忆，只处理被委派的当前任务。
         if not self._is_main_agent or self.memory_manager is None:
             return ""
         return self.memory_manager.load_prompt_memory_view()
@@ -352,13 +549,113 @@ class Agent:
             self.console.print("[dim]还有记忆整理任务未完成，正在等待完成后退出...[/]")
         self.memory_manager.shutdown()
 
+    def _wait_for_pending_memory_updates(self):
+        """
+        等待当前仍在运行的记忆整理任务，但不关闭 MemoryManager。
+        :return:
+        """
+        if not self._is_main_agent or self.memory_manager is None:
+            return
+        if self.memory_manager.has_pending():
+            self.console.print("[dim]还有记忆整理任务未完成，正在等待完成后切换会话...[/]")
+        # 切换会话前只等待后台任务归档完成，后续新任务仍需要继续写长期记忆。
+        self.memory_manager.wait_for_pending()
+
+    def _register_session_exit_hook(self):
+        """
+        注册进程退出兜底清理逻辑。
+        :return:
+        """
+        if self._session_exit_hook_registered:
+            return
+        # 即使调用方没有走 Agent.run()，解释器正常退出时也尽量补写 session_end。
+        atexit.register(self._cleanup_session_on_process_exit)
+        self._session_exit_hook_registered = True
+
+    def _cleanup_session_on_process_exit(self):
+        """
+        进程退出时兜底结束当前 session。
+        :return:
+        """
+        if self.session_manager is None:
+            return
+        try:
+            self._end_session()
+        except Exception:
+            pass
+
+    def _record_session_interrupted(self, reason: str):
+        """
+        记录当前会话被中断。
+        :param reason: 中断原因
+        :return:
+        """
+        if (
+            self.session_manager is None
+            or self.session_manager.current_session_id is None
+            or self._session_interrupted_recorded
+        ):
+            return
+        try:
+            # 中断事件单独落盘，便于区分正常退出和 Ctrl+C 退出。
+            self.session_manager.record_session_interrupted(reason=reason, turn_id=self._current_turn_id)
+            self._session_interrupted_recorded = True
+        except Exception as error:
+            self.console.print(f"[yellow]会话中断事件写入失败：{error}[/]")
+
+    def _end_session(self):
+        """
+        结束当前 session。
+        :return:
+        """
+        if self.session_manager is None:
+            return
+        try:
+            self.session_manager.end_session()
+        except Exception as error:
+            self.console.print(f"[yellow]会话结束事件写入失败：{error}[/]")
+
+    def _session_metadata(self) -> dict[str, Any]:
+        # 会话元信息集中生成，避免 session new 和懒启动时字段不一致。
+        return {
+            "role": self.role,
+            "name": self.name,
+            "is_main_agent": self._is_main_agent,
+        }
+
+    def _ensure_session_started(self) -> str | None:
+        """
+        确保当前已有可写入的 session。
+        :return: 当前 session_id
+        """
+        if self.session_manager is None:
+            return None
+        if self.session_manager.current_session_id:
+            return self.session_manager.current_session_id
+
+        title = self._pending_session_title or "未命名会话"
+        title_source = self._pending_session_title_source or "default"
+        session_id = self.session_manager.start_session(
+            model=self.model,
+            title=title,
+            title_source=title_source,
+            metadata=self._session_metadata(),
+        )
+        self._session_interrupted_recorded = False
+        self._pending_session_title = None
+        self._pending_session_title_source = None
+        # session_start 后立刻写入 system message，保证历史会话可完整恢复。
+        if self.messages:
+            self._record_session_message(self.messages[0], turn_id=None)
+        return session_id
+
     def set_bash_auto_approve(self, enabled: bool):
         """
         设置当前 Agent 的 Bash 命令是否自动确认执行。
         :param enabled: True 表示自动确认，False 表示需要手动确认
         :return:
         """
-        # 新增：支持运行时切换 Bash 自动确认配置，便于用户动态控制安全策略。
+        # 支持运行时切换 Bash 自动确认配置，便于用户动态控制安全策略。
         self._BASH_AUTO_APPROVE = bool(enabled)
 
     def _bash_approve_status_text(self) -> str:
@@ -366,15 +663,32 @@ class Agent:
         返回当前 Bash 执行确认策略的文本描述。
         :return:
         """
-        # 新增：统一管理状态文案，避免 run() 中重复拼接字符串。
+        # 统一管理状态文案，避免 run() 中重复拼接字符串。
         if self._BASH_AUTO_APPROVE:
             return "自动确认（无需手动确认）"
         return "手动确认（每次需确认）"
 
-    def _append_message(self, message, capture_full_context=True):
+    def _record_session_message(self, message, turn_id=None, metadata=None):
+        """
+        把短期上下文消息同步写入当前 session。
+        :param message: OpenAI message
+        :param turn_id: 当前用户任务 id
+        :param metadata: 只写入 session 的辅助元信息
+        :return:
+        """
+        if self.session_manager is None or self.session_manager.current_session_id is None:
+            return
+        try:
+            # 会话记录失败不应该打断 Agent 正常回答。
+            self.session_manager.append_message(message, turn_id=turn_id, metadata=metadata)
+        except Exception as error:
+            self.console.print(f"[yellow]会话记录写入失败：{error}[/]")
+
+    def _append_message(self, message, capture_full_context=True, session_metadata=None):
         self.messages.append(message)
         if capture_full_context and self._current_task_full_context is not None:
             self._current_task_full_context.append(self._normalize_message_for_memory(message))
+        self._record_session_message(message, turn_id=self._current_turn_id, metadata=session_metadata)
 
     def _normalize_message_for_memory(self, message):
         if isinstance(message, dict):
@@ -412,7 +726,7 @@ class Agent:
             )
         finally:
             spinner.stop()
-        # 新增：每次模型调用后更新 token 使用统计。
+        # 每次模型调用后更新 token 使用统计。
         self._update_usage_from_response(response)
         try:
             plan_data = json.loads(response.choices[0].message.content)
@@ -482,7 +796,7 @@ class Agent:
                 continue
             with open(skill_md_file, "r", encoding="utf-8") as f:
                 content = f.read()
-            # 解析 YAML frontmatter
+            # 解析 YAML 前置元数据。
             if content.startswith("---"):
                 frontmatter_end = content.find("---", 3)
                 if frontmatter_end != -1:
@@ -493,7 +807,7 @@ class Agent:
                             "name": meta.get("name"),
                             "description": meta.get("description", ""),
                         })
-                        # 缓存完整SKILL内容
+                        # 缓存完整 SKILL 内容。
                         self._skills_cache[meta.get("name")] = content
         return skills
 
@@ -547,7 +861,7 @@ class Agent:
     
     def _find_recent_start(self):
         start = max(1, len(self.messages) - self._KEEP_RECENT)
-        # 不要从 tool 消息中间切开；tool 必须紧跟触发它的 assistant tool_call。
+        # 不要从工具消息中间切开；工具消息必须紧跟触发它的 assistant tool_call。
         while start > 1 and self._message_role(self.messages[start]) == "tool":
             start -= 1
         return start
@@ -607,7 +921,7 @@ class Agent:
             )
         finally:
             spinner.stop()
-        # 新增：每次模型调用后更新 token 使用统计。
+        # 每次模型调用后更新 token 使用统计。
         self._update_usage_from_response(summary_response)
         summary = summary_response.choices[0].message.content
 
@@ -630,22 +944,115 @@ class Agent:
             *recent_messages
         ]
 
+    def _tool_call_failure_key(self, task: ToolCallTask) -> tuple[str, str]:
+        """生成工具失败去重 key，用于识别同一工具和同一参数的连续失败。"""
+        try:
+            normalized_args = json.dumps(task.function_args, ensure_ascii=False, sort_keys=True, default=str)
+        except TypeError:
+            normalized_args = task.raw_arguments
+        return task.function_name, normalized_args
+
+    def _is_tool_call_failure(self, function_response) -> bool:
+        """判断工具结果是否表示失败。"""
+        if isinstance(function_response, dict):
+            if function_response.get("ok") is False:
+                return True
+            return bool(function_response.get("error") or function_response.get("error_type"))
+        text = str(function_response or "").strip()
+        lowered = text.lower()
+        return (
+            lowered.startswith("error")
+            or "执行失败" in text
+            or "failed" in lowered
+            or "exception" in lowered
+        )
+
+    def _filter_available_tools(self, tools: list[dict[str, Any]], failed_tool_name: str) -> list[dict[str, Any]]:
+        """从本轮可用工具列表中移除连续失败的工具。"""
+        return [
+            tool
+            for tool in tools
+            if tool.get("function", {}).get("name") != failed_tool_name
+        ]
+
+    def _format_tool_failure_response(self, task: ToolCallTask, error_type: str, message: str, retryable: bool = False) -> dict[str, Any]:
+        """生成结构化工具错误，帮助模型区分工具系统失败和正常业务结果。"""
+        return {
+            "ok": False,
+            "tool": task.function_name,
+            "arguments": task.function_args,
+            "error_type": error_type,
+            "retryable": retryable,
+            "message": message,
+        }
+
     def _run_agent_step(self, tools):
+        active_tools = list(tools)
+        last_failure_key = None
+        consecutive_failure_count = 0
+        disabled_tools: set[str] = set()
+
+        def _append_tool_result_and_guard(task: ToolCallTask, function_response):
+            nonlocal active_tools, last_failure_key, consecutive_failure_count
+
+            self._append_message(
+                {"role": "tool", "tool_call_id": task.tool_call_id, "content": json.dumps(function_response, ensure_ascii=False)}
+            )
+            if not self._is_tool_call_failure(function_response):
+                last_failure_key = None
+                consecutive_failure_count = 0
+                return None
+
+            failure_key = self._tool_call_failure_key(task)
+            if failure_key == last_failure_key:
+                consecutive_failure_count += 1
+            else:
+                last_failure_key = failure_key
+                consecutive_failure_count = 1
+
+            if consecutive_failure_count < self._MAX_CONSECUTIVE_TOOL_FAILURES:
+                return None
+
+            active_tools = self._filter_available_tools(active_tools, task.function_name)
+            disabled_tools.add(task.function_name)
+            user_reason = (
+                f"工具 {task.function_name} 使用相同参数连续失败 {consecutive_failure_count} 次。"
+                f"最后一次结果：{function_response}"
+            )
+            model_reason = (
+                f"Tool {task.function_name} failed {consecutive_failure_count} consecutive times "
+                f"with the same arguments. Last result: {function_response}"
+            )
+            if not active_tools:
+                return f"{user_reason}\n没有其他可用工具，已结束当前任务。"
+
+            # 提醒模型换用其他相关工具；如果没有合适工具，应直接给用户说明失败原因。
+            self._append_message(
+                {
+                    "role": "user",
+                    "content": (
+                        f"{model_reason}\n"
+                        f"Do not call {task.function_name} again. Use another relevant tool if available. "
+                        "If no suitable tool is available, stop tool use and explain why the task cannot be completed."
+                    ),
+                },
+                session_metadata={"is_task_entry": False, "tool_failure_guard": True},
+            )
+            return None
+
         for i in range(self.max_iterations):
             # 先压缩历史对话
-            self._compact_messages(tools)
-            # 模型调用前启动等待动画，首个流式 chunk 到来后关闭。
+            self._compact_messages(active_tools)
+            # 模型调用前启动等待动画，首个流式数据片段到来后关闭。
             spinner = self._start_spinner()
             try:
                 response_stream = self.client.chat.completions.create(
                     model=self.model,
                     messages=self.messages,
-                    tools=tools,
+                    tools=active_tools,
                     temperature=self.temperature,
                     stream=True,
                 )
-                # message = response_stream.choices[0].message
-                # messages.append(message)
                 message = self._deal_stream_response(response_stream, spinner=spinner)
             finally:
                 spinner.stop()
@@ -671,7 +1078,7 @@ class Agent:
             if not message.tool_calls:
                 return message.content
             print(f"[Iter {i}]: message is: {message}")
-            # V2 调度策略：依据工具画像（只读/并发安全/作用域）做分段并发。
+            # 第二版调度策略：依据工具画像（只读/并发安全/作用域）做分段并发。
             scheduler = ToolScheduler(get_profile=self._tool_manager.get_tool_runtime_profile)
             pending_tasks: list[ToolCallTask] = []
 
@@ -682,23 +1089,54 @@ class Agent:
                 function_name = str(getattr(function_payload, "name", ""))
                 raw_arguments = str(getattr(function_payload, "arguments", ""))
                 function_args = self._parse_tool_arguments(raw_arguments)
+                current_task = ToolCallTask(
+                    tool_call_id=tool_call.id,
+                    function_name=function_name,
+                    raw_arguments=raw_arguments,
+                    function_args=function_args,
+                )
 
-                # MAKE_PLAN 需要维持原有特殊流程，先刷新 pending 队列再串行处理。
+                if function_name in disabled_tools:
+                    function_response = self._format_tool_failure_response(
+                        current_task,
+                        "disabled_repeated_failure",
+                        f"Tool {function_name} is disabled for this turn after repeated failures.",
+                        retryable=False,
+                    )
+                    self._append_message(
+                        {
+                            "role": "tool",
+                            "tool_call_id": current_task.tool_call_id,
+                            "content": json.dumps(function_response, ensure_ascii=False),
+                        }
+                    )
+                    return f"工具 {function_name} 已因连续失败被禁用，但模型再次请求该工具，已结束当前任务。"
+
+                # MAKE_PLAN 需要维持原有特殊流程，先刷新待执行队列再串行处理。
                 if function_name == ToolNameConstant.MAKE_PLAN:
                     for task, function_response in scheduler.execute_batches(
                         scheduler.plan_batches(pending_tasks), self._invoke_tool_task
                     ):
-                        self._append_message(
-                            {"role": "tool", "tool_call_id": task.tool_call_id,
-                             "content": json.dumps(function_response, ensure_ascii=False)}
-                        )
+                        stop_reason = _append_tool_result_and_guard(task, function_response)
+                        if stop_reason:
+                            return stop_reason
                     pending_tasks = []
 
                     function_impl = self._available_functions.get(function_name)
                     if function_impl is None:
-                        function_response = f"Error: Unknown tool '{function_name}'"
+                        function_response = self._format_tool_failure_response(
+                            current_task,
+                            "unknown_tool",
+                            f"Unknown tool '{function_name}'",
+                            retryable=False,
+                        )
                     elif "_argument_error" in function_args:
-                        function_response = f"Error: {function_args['_argument_error']}"
+                        function_response = self._format_tool_failure_response(
+                            current_task,
+                            "argument_error",
+                            function_args["_argument_error"],
+                            retryable=False,
+                        )
                     else:
                         # 如果模型选择了先做计划，这个分支就对计划模式特殊处理
                         self.plan_mode = True
@@ -710,9 +1148,12 @@ class Agent:
                             step_cnt = 0
                             for step in steps:
                                 print(f"[Step {step_cnt + 1}]: {step}")
-                                self._append_message({"role": "user", "content": step})
+                                self._append_message(
+                                    {"role": "user", "content": step},
+                                    session_metadata={"is_task_entry": False},
+                                )
                                 result = self._run_agent_step(
-                                    [t for t in tools if t["function"]["name"] != ToolNameConstant.MAKE_PLAN]
+                                    [t for t in active_tools if t["function"]["name"] != ToolNameConstant.MAKE_PLAN]
                                 )
                                 print(f"[Step {step_cnt + 1}] result:{result}, all messages: {self.messages}")
                                 step_cnt += 1
@@ -720,45 +1161,73 @@ class Agent:
                             function_response = "\n".join(results)
                         self.plan_mode = False
                         self.current_plan = []
-                    self._append_message(
-                        {"role": "tool", "tool_call_id": tool_call.id, "content": json.dumps(function_response, ensure_ascii=False)}
-                    )
+                    stop_reason = _append_tool_result_and_guard(current_task, function_response)
+                    if stop_reason:
+                        return stop_reason
                     continue
 
-                pending_tasks.append(
-                    ToolCallTask(
-                        tool_call_id=tool_call.id,
-                        function_name=function_name,
-                        raw_arguments=raw_arguments,
-                        function_args=function_args,
-                    )
-                )
+                pending_tasks.append(current_task)
 
             # 收尾执行剩余任务（可能包含并发批次）。
             for task, function_response in scheduler.execute_batches(
                 scheduler.plan_batches(pending_tasks), self._invoke_tool_task
             ):
-                self._append_message(
-                    {"role": "tool", "tool_call_id": task.tool_call_id, "content": json.dumps(function_response, ensure_ascii=False)}
-                )
+                stop_reason = _append_tool_result_and_guard(task, function_response)
+                if stop_reason:
+                    return stop_reason
         return "Max iterations reached"
+
+    def _should_show_tool_spinner(self) -> bool:
+        # 并发工具在工作线程中执行，避免多个 Live 动画同时刷新控制台。
+        return current_thread().name == "MainThread"
+
+    def _print_network_search_results(self):
+        search_results = getattr(self._tool_manager, "last_web_search_results", None)
+        if not search_results:
+            return
+        self.console.print("[bold cyan]网络搜索结果：[/]")
+        self.console.print(json.dumps(search_results, ensure_ascii=False, indent=2))
 
     def _invoke_tool_task(self, task: ToolCallTask):
         """调度器执行入口：单工具调用的统一异常处理。"""
         function_impl = self._available_functions.get(task.function_name)
         if function_impl is None:
-            return f"Error: Unknown tool '{task.function_name}'"
+            return self._format_tool_failure_response(
+                task,
+                "unknown_tool",
+                f"Unknown tool '{task.function_name}'",
+                retryable=False,
+            )
         if "_argument_error" in task.function_args:
-            return f"Error: {task.function_args['_argument_error']}"
+            return self._format_tool_failure_response(
+                task,
+                "argument_error",
+                task.function_args["_argument_error"],
+                retryable=False,
+            )
         try:
             print(f"[Tool call] tool name: {task.function_name}, tool arguments: {task.raw_arguments}")
-            return function_impl(**task.function_args)
+            spinner = self._start_spinner(preset=Spinner.TOOL, tool_name=task.function_name) \
+                if self._should_show_tool_spinner() and task.function_name != ToolNameConstant.WEB_SEARCH else None
+            try:
+                result = function_impl(**task.function_args)
+            finally:
+                if spinner is not None:
+                    spinner.stop()
+            # if task.function_name == ToolNameConstant.WEB_SEARCH:
+            #     self._print_network_search_results()
+            return result
         except Exception as error:
-            return f"Error when calling '{task.function_name}': {error}"
+            return self._format_tool_failure_response(
+                task,
+                "tool_exception",
+                f"Error when calling '{task.function_name}': {error}",
+                retryable=False,
+            )
 
     def _build_system_prompt(self):
         from prompt_builder import build_system_prompt
-        # 置空当前prompt
+        # 置空当前提示词。
         self._cached_system_prompt = None
         memory = self._load_memory_view()
         rules = self._load_rules(memory)
@@ -776,50 +1245,63 @@ class Agent:
         :param stream_response:
         :return: 转换后的一个message对象
         """
-        # 完整reply
+        # 完整回复。
         full_reply = ""
         # 累积工具调用
         tool_calls = {}
         first_chunk_arrived = False
-        for chunk in stream_response:
-            if not first_chunk_arrived and spinner is not None:
-                # 首个响应到达后关闭等待动画，切换到真实流式输出。
-                spinner.stop()
-                first_chunk_arrived = True
-            # 新增：流式响应中若包含 usage 字段，则实时更新 token 统计。
-            self._update_usage_from_response(chunk)
-            # 防御，有时delta可能不存在
-            choice = chunk.choices[0]
-            delta = choice.delta
-            # 1) 流式打印响应内容
-            content = getattr(delta, "content", None)
-            if content:
-                print(content, end="", flush=True)
-                full_reply += content
+        try:
+            for chunk in stream_response:
+                if not first_chunk_arrived and spinner is not None:
+                    # 首个响应到达后关闭等待动画，切换到真实流式输出。
+                    spinner.stop()
+                    first_chunk_arrived = True
+                # 流式响应中若包含 usage 字段，则实时更新 token 统计。
+                self._update_usage_from_response(chunk)
+                # 防御性处理，有时 delta 可能不存在。
+                choice = chunk.choices[0]
+                delta = choice.delta
+                # 1) 流式打印响应内容
+                content = getattr(delta, "content", None)
+                if content:
+                    print(content, end="", flush=True)
+                    full_reply += content
 
-            # 2) 累积还原工具调用
-            delta_tool_calls = getattr(delta, "tool_calls", None)
-            if delta_tool_calls:
-                for tc in delta_tool_calls:
-                    idx = tc.index
-                    if idx not in tool_calls:
-                        tool_calls[idx] = {
-                            "id": getattr(tc, "id", None),
-                            "name": "",
-                            "arguments": "",
-                        }
-                    # 新增：若后续 chunk 才补齐 tool_call_id，这里做增量回填，避免首包无 id 导致丢失。
-                    if getattr(tc, "id", None):
-                        tool_calls[idx]["id"] = tc.id
-                    func = getattr(tc, "function", None)
-                    if func is not None:
-                        name = getattr(func, "name", None)
-                        args = getattr(func, "arguments", None)
-                        if name:
-                            # 新增：使用追加方式拼接，兼容极端情况下 name 被分片返回。
-                            tool_calls[idx]["name"] += name
-                        if args:
-                            tool_calls[idx]["arguments"] += args
+                # 2) 累积还原工具调用
+                delta_tool_calls = getattr(delta, "tool_calls", None)
+                if delta_tool_calls:
+                    for tc in delta_tool_calls:
+                        idx = tc.index
+                        if idx not in tool_calls:
+                            tool_calls[idx] = {
+                                "id": getattr(tc, "id", None),
+                                "name": "",
+                                "arguments": "",
+                            }
+                        # 若后续数据片段才补齐 tool_call_id，这里做增量回填，避免首包无 id 导致丢失。
+                        if getattr(tc, "id", None):
+                            tool_calls[idx]["id"] = tc.id
+                        func = getattr(tc, "function", None)
+                        if func is not None:
+                            name = getattr(func, "name", None)
+                            args = getattr(func, "arguments", None)
+                            if name:
+                                # 使用追加方式拼接，兼容极端情况下 name 被分片返回。
+                                tool_calls[idx]["name"] += name
+                            if args:
+                                tool_calls[idx]["arguments"] += args
+        except Exception as error:
+            if self.session_manager is not None and self._current_turn_id:
+                try:
+                    # 正常流式片段不落盘，只有异常时保存已收到内容辅助排查。
+                    self.session_manager.record_model_stream_error(
+                        turn_id=self._current_turn_id,
+                        partial_content=full_reply,
+                        error=str(error),
+                    )
+                except Exception:
+                    pass
+            raise
 
         # 转换兼容的结构
         ordered_tool_calls = []
@@ -840,13 +1322,19 @@ class Agent:
         )
         return message
 
-    def _start_spinner(self) -> Spinner:
+    def _start_spinner(
+            self,
+            messages: list[str] | None = None,
+            *,
+            preset: str = Spinner.DEFAULT,
+            **context: Any,
+    ) -> Spinner:
         """
         创建并启动等待动画。
         :return:
         """
-        # 统一由该方法管理 spinner 的创建，尽量减少对业务逻辑的侵入。
-        spinner = Spinner(self.console)
+        # 统一由该方法管理等待动画的创建，尽量减少对业务逻辑的侵入。
+        spinner = Spinner(self.console, messages=messages, preset=preset, **context)
         spinner.start()
         return spinner
 
@@ -856,7 +1344,7 @@ class Agent:
         :param response: 非流式 response 或流式 chunk
         :return:
         """
-        # 新增：统一处理标准 OpenAI usage 字段，避免各处重复解析逻辑。
+        # 统一处理标准 OpenAI usage 字段，避免各处重复解析逻辑。
         usage = getattr(response, "usage", None)
         if usage is None:
             return
@@ -864,7 +1352,7 @@ class Agent:
         completion_tokens = getattr(usage, "completion_tokens", None)
         total_tokens = getattr(usage, "total_tokens", None)
 
-        # 新增：优先使用 total_tokens；若为空则回退为 prompt+completion。
+        # 优先使用 total_tokens；若为空则回退为 prompt+completion。
         if isinstance(total_tokens, int):
             self._used_token = total_tokens
             self._total_token = total_tokens
@@ -913,51 +1401,71 @@ class Agent:
         :param task: 用户任务
         :return: 执行任务结果
         """
+        self._ensure_session_started()
         # 初始化当前任务的完整上下文记录
+        self._current_turn_id = (
+            self.session_manager.create_turn_id()
+            if self.session_manager is not None
+            else None
+        )
         self._current_task_full_context = []
         try:
-            # 如果 inbox 有新消息，先注入self.messages
+            # 如果收件箱有新消息，先注入 self.messages。
             if self.inbox:
                 mail = "\n".join(f"[from {m['from']}]: {m['content']}" for m in self.inbox)
-                self._append_message({"role": "user", "content": load_prompt("inbox_digest_user.md", mail=mail)})
+                self._append_message(
+                    {"role": "user", "content": load_prompt("inbox_digest_user.md", mail=mail)},
+                    session_metadata={"is_task_entry": False},
+                )
                 # 让 Agent 先消化这些消息
                 spinner = self._start_spinner()
                 try:
                     resp = self.client.chat.completions.create(model=self.model, messages=self.messages)
                 finally:
                     spinner.stop()
-                # 新增：每次模型调用后更新 token 使用统计。
+                # 每次模型调用后更新 token 使用统计。
                 self._update_usage_from_response(resp)
                 self._append_message(resp.choices[0].message)
                 self.inbox.clear()
 
             # 再拼接本次任务并执行
-            self._append_message({"role": "user", "content": task})
+            self._maybe_auto_title_session(task)
+            self._append_message(
+                {"role": "user", "content": task},
+                session_metadata={"is_task_entry": True},
+            )
             final_result = self._run_agent_step(self._all_tools)
             # print(f"final result: {final_result}")
             self._schedule_memory_update(task, final_result)
+            if self.session_manager is not None:
+                # 每个用户任务结束后只更新一次索引活跃时间，避免消息级索引膨胀。
+                self.session_manager.touch_session(reason="task_completed")
             return final_result
+        except KeyboardInterrupt:
+            self._record_session_interrupted("keyboard_interrupt")
+            raise
         finally:
             self._current_task_full_context = None
+            self._current_turn_id = None
 
     def run(self):
         """
         Agent loop实现，对话入口
         :return:
         """
-        # 新增：统一通过 help 文案展示可用命令，避免 run() 内硬编码过长提示。
+        # 统一通过 help 文案展示可用命令，避免 run() 内硬编码过长提示。
         self._print_help(show_welcome=True)
-        # 新增：集中展示运行时状态，后续配置变更后可复用该方法刷新显示。
+        # 集中展示运行时状态，后续配置变更后可复用该方法刷新显示。
         self._print_runtime_status()
 
         confirm_choice = ("y", "yes", "是", "确认", "对", "")
 
         while True:
             try:
-                # 新增：在输入框上方展示当前模型，便于用户随时确认当前会话模型。
+                # 在输入框上方展示当前模型，便于用户随时确认当前会话模型。
                 self._print_input_header()
                 user_input = self.console.input("[bold cyan]You >[/] ")
-                # 新增：将命令分支提取到独立方法中，降低 run() 循环复杂度。
+                # 将命令分支提取到独立方法中，降低 run() 循环复杂度。
                 handled, should_exit = self._handle_user_command(user_input, confirm_choice)
                 if should_exit:
                     break
@@ -970,7 +1478,12 @@ class Agent:
                 self.chat(user_input)
                 self.console.print()
             except KeyboardInterrupt:
-                self._wait_for_memory_tasks()
+                self._record_session_interrupted("keyboard_interrupt")
+                self._end_session()
+                try:
+                    self._wait_for_memory_tasks()
+                except KeyboardInterrupt:
+                    self.console.print("\n[yellow]已保存当前 session，记忆整理等待被再次中断。[/]")
                 self.console.print("\n[bold red] See you next time! [/]")
                 break
 
@@ -980,7 +1493,7 @@ class Agent:
         :param show_welcome: 是否展示欢迎语
         :return:
         """
-        # 新增：将帮助提示抽取为独立方法，便于复用和后续维护。
+        # 将帮助提示抽取为独立方法，便于复用和后续维护。
         if show_welcome:
             self.console.print(Panel(
                 "[bold green]JanVis[/] — At you service, sir! What can I do for you today?\n\n"
@@ -1002,6 +1515,14 @@ class Agent:
             ("tools", "列出当前可用工具"),
             ("compact", "压缩当前会话上下文"),
             ("status", "查看当前运行状态"),
+            ("history", "查看当前会话用户任务历史"),
+            ("sessions", "列出最近会话"),
+            ("continue", "继续上一次会话"),
+            ("session current", "查看当前会话信息"),
+            ("session new", "创建一个新会话"),
+            ("session load <序号|session_id>", "加载并继续一个历史会话"),
+            ("session title", "查看当前会话标题"),
+            ("session title <标题>", "自定义当前会话标题"),
         ]
         command_table = Table.grid(padding=(0, 2))
         command_table.add_column(justify="left", no_wrap=True)
@@ -1030,7 +1551,7 @@ class Agent:
             tool_table = Table.grid(padding=(0, 2))
             tool_table.add_column(justify="left", no_wrap=True)
             tool_table.add_column(justify="left")
-            # 工具 schema 统一按 OpenAI tool 格式读取，兼容少量直接含 name/description 的旧格式。
+            # 工具结构统一按 OpenAI tool 格式读取，兼容少量直接含 name/description 的旧格式。
             for tool in tools:
                 tool_schema = tool if isinstance(tool, dict) else {}
                 function_schema = tool_schema.get("function", {})
@@ -1049,7 +1570,7 @@ class Agent:
         打印当前运行时状态信息。
         :return:
         """
-        # 新增：抽取状态打印逻辑，便于启动时和配置变更后统一刷新展示。
+        # 抽取状态打印逻辑，便于启动时和配置变更后统一刷新展示。
         self.console.print(f"[dim]当前工作目录：{os.getcwd()}[/]")
         self.console.print(f"[dim]使用模型：{self.model}[/]")
         self.console.print(f"[dim]Bash 命令确认策略：{self._bash_approve_status_text()}[/]")
@@ -1059,7 +1580,7 @@ class Agent:
         在输入提示前展示当前模型信息。
         :return:
         """
-        # 新增：每轮输入前展示当前模型，模型切换后可自动反映最新状态。
+        # 每轮输入前展示当前模型，模型切换后可自动反映最新状态。
         self.console.print(f"[dim]当前模型：{self.model}[/]")
 
     def _normalize_command(self, user_input: str) -> str:
@@ -1068,11 +1589,52 @@ class Agent:
         :param user_input: 原始用户输入
         :return:
         """
-        # 新增：统一处理前后空白和可选的 "/" 前缀（如 /clear session）。
+        # 统一处理前后空白和可选的 "/" 前缀（如 /clear session）。
         cmd = (user_input or "").strip().lower()
         if cmd.startswith("/"):
             cmd = cmd[1:].strip()
         return cmd
+
+    def _normalize_session_command_alias(self, raw_cmd: str) -> str:
+        """
+        纠正常见 session 命令误输入。
+        :param raw_cmd: 已去掉可选 / 前缀的原始命令
+        :return: 纠正后的命令
+        """
+        # 只处理明确的 session 命令别名，不做全局模糊匹配，避免普通问题被误判为命令。
+        stripped = (raw_cmd or "").strip()
+        if not stripped:
+            return stripped
+        parts = stripped.split(maxsplit=2)
+        lowered = [part.lower() for part in parts]
+
+        session_aliases = {"session", "sesssion", "sesstion"}
+        sessions_aliases = {"sessions", "sesssions", "sesstions"}
+        current_aliases = {"current", "currrent", "curent"}
+        title_aliases = {"title", "tittle"}
+        load_aliases = {"load", "lod", "laod"}
+        new_aliases = {"new", "neu"}
+
+        if len(parts) == 1 and lowered[0] in sessions_aliases:
+            return "sessions"
+        if lowered[0] not in session_aliases:
+            return stripped
+        if len(parts) == 1:
+            return stripped
+
+        sub_command = lowered[1]
+        rest = parts[2] if len(parts) >= 3 else ""
+        if sub_command == "s":
+            return "sessions"
+        if sub_command in current_aliases:
+            return "session current"
+        if sub_command in new_aliases:
+            return "session new"
+        if sub_command in load_aliases:
+            return f"session load {rest}".strip()
+        if sub_command in title_aliases:
+            return f"session title {rest}".strip()
+        return stripped
 
     def _handle_user_command(self, user_input: str, confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
         """
@@ -1081,14 +1643,24 @@ class Agent:
         :param confirm_choice: 确认命令可接受输入
         :return: (是否已处理, 是否需要退出循环)
         """
-        # 新增：集中处理所有命令分支，主循环仅保留调度逻辑。
+        # 集中处理所有命令分支，主循环仅保留调度逻辑。
         cmd = self._normalize_command(user_input)
-        # 新增：使用命令映射表分发处理函数，便于后续扩展命令而不是堆叠 if/else。
+        raw_cmd = (user_input or "").strip()
+        if raw_cmd.startswith("/"):
+            raw_cmd = raw_cmd[1:].strip()
+        raw_cmd = self._normalize_session_command_alias(raw_cmd)
+        cmd = self._normalize_command(raw_cmd)
+        # 使用命令映射表分发处理函数，便于后续扩展命令而不是堆叠 if/else。
         command_handlers = self._command_handler_map()
         handler = command_handlers.get(cmd)
         if handler:
             return handler(confirm_choice)
-        # 新增：支持带参数命令，例如 model gpt-4o-mini。
+        raw_parts = raw_cmd.split(maxsplit=2)
+        if len(raw_parts) >= 3 and raw_parts[0].lower() == "session" and raw_parts[1].lower() == "title":
+            return self._handle_cmd_session_title_set(confirm_choice, raw_parts[2].strip())
+        if len(raw_parts) >= 3 and raw_parts[0].lower() == "session" and raw_parts[1].lower() == "load":
+            return self._handle_cmd_session_load(confirm_choice, raw_parts[2].strip())
+        # 支持带参数命令，例如 model gpt-4o-mini。
         if cmd.startswith("model "):
             return self._handle_cmd_model_switch(confirm_choice, cmd)
         return False, False
@@ -1098,7 +1670,7 @@ class Agent:
         命令到处理函数的映射表。
         :return:
         """
-        # 新增：集中管理命令和处理方法的映射关系，提升可维护性。
+        # 集中管理命令和处理方法的映射关系，提升可维护性。
         return {
             "exit": self._handle_cmd_exit,
             "q": self._handle_cmd_exit,
@@ -1117,21 +1689,29 @@ class Agent:
             "campact": self._handle_cmd_compact_history,
             "compact": self._handle_cmd_compact_history,
             "status": self._handle_cmd_status,
+            "history": self._handle_cmd_history,
+            "sessions": self._handle_cmd_sessions,
+            "continue": self._handle_cmd_continue_session,
+            "session current": self._handle_cmd_session_current,
+            "session new": self._handle_cmd_session_new,
+            "session load": self._handle_cmd_session_load_prompt,
+            "session title": self._handle_cmd_session_title_show,
         }
 
     def _handle_cmd_exit(self, _confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
-        # 新增：退出命令处理。
+        # 退出命令处理。
         self._wait_for_memory_tasks()
+        self._end_session()
         self.console.print("\n[bold red] See you next time! [/]")
         return True, True
 
     def _handle_cmd_help(self, _confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
-        # 新增：帮助命令处理。
+        # 帮助命令处理。
         self._print_help(show_welcome=False)
         return True, False
 
     def _handle_cmd_tools(self, _confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
-        # 新增：展示当前已加载的本地工具和 MCP 工具。
+        # 展示当前已加载的本地工具和 MCP 工具。
         self._print_available_tools()
         return True, False
 
@@ -1141,7 +1721,7 @@ class Agent:
         return True, False
 
     def _handle_cmd_clear_session(self, confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
-        # 新增：仅清空当前会话历史，不影响长期记忆。
+        # 仅清空当前会话历史，不影响长期记忆。
         confirm_input = self.console.input("[bold cyan]是否确认清除当前会话历史？(yes/y)[/] ")
         if self._normalize_command(confirm_input) in confirm_choice:
             self._build_system_prompt()
@@ -1149,7 +1729,7 @@ class Agent:
         return True, False
 
     def _handle_cmd_clear_history(self, confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
-        # 新增：清空当前会话历史并清空历史记忆。
+        # 清空当前会话历史并清空历史记忆。
         confirm_input = self.console.input("[bold cyan]是否确认清除当前会话历史和全部历史记忆？(yes/y)[/] ")
         if self._normalize_command(confirm_input) in confirm_choice:
             self._build_system_prompt()
@@ -1158,7 +1738,7 @@ class Agent:
         return True, False
 
     def _handle_cmd_clear_memory(self, confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
-        # 新增：兼容旧命令 clear memory，行为与 clear history 一致。
+        # 兼容旧命令 clear memory，行为与 clear history 一致。
         confirm_input = self.console.input("[bold cyan]是否确认清除历史记忆？(yes/y)[/] ")
         if self._normalize_command(confirm_input) in confirm_choice:
             self._clear_memory()
@@ -1166,12 +1746,12 @@ class Agent:
         return True, False
 
     def _handle_cmd_bash_approve_on(self, _confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
-        # 新增：开启 Bash 自动确认。
+        # 开启 Bash 自动确认。
         self._update_bash_approve_status(True)
         return True, False
 
     def _handle_cmd_bash_approve_off(self, _confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
-        # 新增：关闭 Bash 自动确认。
+        # 关闭 Bash 自动确认。
         self._update_bash_approve_status(False)
         return True, False
 
@@ -1181,16 +1761,16 @@ class Agent:
         :param enabled: 是否开启自动确认
         :return:
         """
-        # 新增：复用 on/off 两个命令的公共逻辑，避免重复代码。
+        # 复用 on/off 两个命令的公共逻辑，避免重复代码。
         old_status = self._bash_approve_status_text()
         self.set_bash_auto_approve(enabled)
         new_status = self._bash_approve_status_text()
         if old_status != new_status:
-            # 新增：当确认策略发生变化后，自动刷新状态展示，用户可立即看到最新配置。
+            # 当确认策略发生变化后，自动刷新状态展示，用户可立即看到最新配置。
             self.console.print(f"[dim]已更新 Bash 命令确认策略：{new_status}[/]")
             self._print_runtime_status()
         else:
-            # 新增：若用户重复设置同一状态，明确告知并保持当前展示一致。
+            # 若用户重复设置同一状态，明确告知并保持当前展示一致。
             self.console.print(f"[dim]Bash 命令确认策略未变化，当前为：{new_status}[/]")
 
     def _load_available_models(self) -> list[str]:
@@ -1198,12 +1778,12 @@ class Agent:
         读取当前已配置的可用模型列表。
         :return:
         """
-        # 新增：从 model_config.json 读取模型列表，作为可切换模型来源。
+        # 从 model_config.json 读取模型列表，作为可切换模型来源。
         models = self._read_model_config().get("models", [])
         return [model_info.get("name") for model_info in models if isinstance(model_info, dict) and model_info.get("name")]
 
     def _handle_cmd_model_list(self, _confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
-        # 新增：列出当前已配置模型；若暂无配置则先保留为空实现提示。
+        # 列出当前已配置模型；若暂无配置则先保留为空实现提示。
         available_models = self._load_available_models()
         if not available_models:
             self.console.print("[yellow]当前暂无可用模型配置，model_list 暂无可展示内容。[/]")
@@ -1215,13 +1795,13 @@ class Agent:
         return True, False
 
     def _handle_cmd_model_show_current(self, _confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
-        # 新增：展示当前模型并提示如何切换。
+        # 展示当前模型并提示如何切换。
         self.console.print(f"[dim]当前使用模型：{self.model}[/]")
         self.console.print("[dim]切换方式：model <模型名>，例如 model gpt-4o-mini[/]")
         return True, False
 
     def _handle_cmd_model_switch(self, _confirm_choice: tuple[str, ...], cmd: str) -> tuple[bool, bool]:
-        # 新增：处理 model <model_name> 命令，校验配置后执行切换。
+        # 处理 model <model_name> 命令，校验配置后执行切换。
         target_model = cmd.split(" ", 1)[1].strip()
         self.console.print(f"[dim]当前使用模型：{self.model}[/]")
         if not target_model:
@@ -1229,7 +1809,7 @@ class Agent:
             return True, False
         available_models = self._load_available_models()
         if target_model not in available_models:
-            # 新增：目标模型不在配置列表时，引导用户录入4个配置字段并写入 model_config.json。
+            # 目标模型不在配置列表时，引导用户录入4个配置字段并写入 model_config.json。
             self.console.print(f"[yellow]模型 {target_model} 未配置，开始新增模型配置。[/]")
             base_url = self.console.input("[bold cyan]请输入 base_url：[/] ").strip()
             api_key = self.console.input("[bold cyan]请输入 api_key：[/] ").strip()
@@ -1261,16 +1841,16 @@ class Agent:
         return True, False
 
     def _handle_cmd_compact_history(self, _confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
-        # 新增：主动触发当前会话历史压缩。
+        # 主动触发当前会话历史压缩。
         self._compact_messages(self._all_tools)
         self.console.print("[dim]已执行会话压缩检查（达到阈值时会执行压缩）。[/]")
         return True, False
 
     def _handle_cmd_status(self, _confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
-        # 新增：展示当前模型状态（模型名、已用 token、token 总量）。
+        # 展示当前模型状态（模型名、已用 token、token 总量）。
         used_tokens = self._used_token or self._estimate_messages_tokens(self.messages, self._all_tools)
         total_tokens = self._total_token or self._max_context_tokens
-        # 新增：status 命令展示 token 使用柱状图，直观反馈使用率。
+        # status 命令展示 token 使用柱状图，直观反馈使用率。
         usage_ratio = self._calculate_token_usage_ratio(used_tokens, self._max_context_tokens)
         token_bar = self._render_token_usage_bar(usage_ratio)
         self.console.print(f"[dim]模型名：{self.model}[/]")
@@ -1278,8 +1858,306 @@ class Agent:
         self.console.print(f"[dim]Token 总量：{total_tokens}[/]")
         self.console.print(f"[dim]上下文窗口：{self._max_context_tokens}[/]")
         self.console.print(f"[dim]上下文使用率：{usage_ratio * 100:.2f}%[/]")
-        # 新增：按评审意见直接打印柱状图，不额外增加提示前缀。
+        # 按评审意见直接打印柱状图，不额外增加提示前缀。
         self.console.print(token_bar)
+        return True, False
+
+    def _handle_cmd_history(self, _confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
+        # history 只展示真实用户任务，不展示 assistant/tool 等底层消息。
+        if self.session_manager is None:
+            self.console.print("[yellow]当前没有可管理的主会话。[/]")
+            return True, False
+        if self.session_manager.current_session_id is None:
+            self.console.print("[yellow]当前还没有已保存的用户任务。[/]")
+            return True, False
+        tasks = self.session_manager.list_tasks()
+        if not tasks:
+            self.console.print("[yellow]当前会话没有可展示的用户任务。[/]")
+            return True, False
+
+        result = open_task_history_viewer(tasks)
+        if result.action == "delete" and result.task:
+            self._delete_history_task(result.task)
+        return True, False
+
+    def _delete_history_task(self, task: dict[str, Any]) -> bool:
+        """
+        删除 history 中选中的用户任务。
+        :param task: history 任务项
+        :return: 是否删除成功
+        """
+        if self.session_manager is None:
+            return False
+        turn_id = task.get("turn_id")
+        if not turn_id:
+            self.console.print("[yellow]无法删除：任务缺少 turn_id。[/]")
+            return False
+
+        session_id = self.session_manager.current_session_id
+        memory_task_ids = [task_id for task_id in (task.get("memory_task_ids") or []) if task_id]
+        try:
+            # 删除采用追加式软删除事件，不物理删除 session 文件或长期记忆上下文文件。
+            self.session_manager.mark_turn_deleted(turn_id=turn_id, task_ids=memory_task_ids)
+            if self.memory_manager is not None:
+                self.memory_manager.record_deleted_task(
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    task_ids=memory_task_ids,
+                )
+            if session_id:
+                self._reload_messages_after_turn_delete(session_id)
+        except Exception as error:
+            self.console.print(f"[yellow]删除任务失败：{error}[/]")
+            return False
+
+        self.console.print(f"[dim]已软删除任务 {task.get('index')}（turn_id: {turn_id}）[/]")
+        return True
+
+    def _reload_messages_after_turn_delete(self, session_id: str) -> None:
+        """
+        删除 turn 后重建当前短期上下文。
+        :param session_id: 当前会话 id
+        :return:
+        """
+        if self.session_manager is None:
+            return
+        messages = self.session_manager.rebuild_messages(session_id)
+        # 删除长期记忆后刷新 system prompt，避免被软删除任务继续出现在当前上下文中。
+        current_system_prompt = self._build_system_prompt()
+        if messages and messages[0].get("role") == "system":
+            messages[0] = {"role": "system", "content": current_system_prompt}
+        else:
+            messages.insert(0, {"role": "system", "content": current_system_prompt})
+        self.messages = messages
+        self._used_token = self._estimate_messages_tokens(self.messages, self._all_tools)
+        self._total_token = self._used_token
+
+    def _reset_messages_for_session(self, record_system_message: bool):
+        """
+        重置当前短期上下文为新的 system prompt。
+        :param record_system_message: 是否把 system message 写入当前 session
+        :return:
+        """
+        self._cached_system_prompt = self._build_system_prompt()
+        self.messages = [{"role": "system", "content": self._cached_system_prompt}]
+        self._current_task_full_context = None
+        self._current_task_start_index = None
+        self._current_turn_id = None
+        self._used_token = 0
+        self._total_token = 0
+        if record_system_message:
+            # 新会话需要把 system prompt 作为可恢复上下文的第一条消息。
+            self._record_session_message(self.messages[0], turn_id=None)
+
+    def _load_messages_from_session(self, session_id: str) -> list[dict[str, Any]]:
+        """
+        从历史 session 重建短期上下文。
+        :param session_id: 会话 id
+        :return: OpenAI messages
+        """
+        if self.session_manager is None:
+            return []
+        messages = self.session_manager.rebuild_messages(session_id)
+        if not messages or messages[0].get("role") != "system":
+            # 老会话缺少 system message 时，只在内存中补齐，不反向改写历史文件。
+            system_prompt = self._cached_system_prompt or self._build_system_prompt()
+            messages.insert(0, {"role": "system", "content": system_prompt})
+        return messages
+
+    def _format_session_time(self, value: Any) -> str:
+        # 会话列表只做轻量展示，缺失时间用短横线占位。
+        return str(value or "-").replace("T", " ")
+
+    def _print_sessions_table(self, sessions: list[dict[str, Any]]) -> None:
+        """
+        打印会话列表。
+        :param sessions: 会话索引列表
+        :return:
+        """
+        if not sessions:
+            return
+
+        table = Table(title="最近会话", show_lines=False)
+        table.add_column("#", justify="right", no_wrap=True)
+        table.add_column("标题", overflow="fold")
+        table.add_column("更新时间", no_wrap=True)
+        table.add_column("状态", no_wrap=True)
+        table.add_column("session_id", no_wrap=True)
+        for index, item in enumerate(sessions, start=1):
+            marker = " *" if item.get("session_id") == self.session_manager.current_session_id else ""
+            table.add_row(
+                str(index),
+                f"{item.get('title') or '未命名会话'}{marker}",
+                self._format_session_time(item.get("updated_at") or item.get("created_at")),
+                item.get("status") or "active",
+                item.get("session_id") or "",
+            )
+        self.console.print(table)
+
+    def _handle_cmd_sessions(self, _confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
+        # 列出最近会话，序号可直接用于 session load。
+        if self.session_manager is None:
+            self.console.print("[yellow]当前没有可管理的主会话。[/]")
+            return True, False
+        sessions = self.session_manager.list_sessions(limit=20)
+        if not sessions:
+            self.console.print("[yellow]暂无历史会话。[/]")
+            return True, False
+
+        self._print_sessions_table(sessions)
+        return True, False
+
+    def _handle_cmd_session_current(self, _confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
+        # 展示当前会话完整定位信息，便于客户端化前人工排查。
+        if self.session_manager is None:
+            self.console.print("[yellow]当前没有可管理的主会话。[/]")
+            return True, False
+        if self.session_manager.current_session_id is None:
+            pending_title = self._pending_session_title or "未命名会话"
+            self.console.print("[dim]当前还没有已保存会话，提问新内容以创建新会话。[/]")
+            self.console.print(f"[dim]待创建标题：{pending_title}[/]")
+            return True, False
+        info = self.session_manager.get_current_session_info()
+        self.console.print(f"[dim]session_id：{info.get('session_id')}[/]")
+        self.console.print(f"[dim]标题：{info.get('title') or '未命名会话'}（来源：{info.get('title_source') or 'default'}）[/]")
+        self.console.print(f"[dim]模型：{info.get('model') or self.model}[/]")
+        self.console.print(f"[dim]状态：{info.get('status') or 'active'}[/]")
+        self.console.print(f"[dim]创建时间：{self._format_session_time(info.get('created_at'))}[/]")
+        self.console.print(f"[dim]路径：{info.get('path') or '-'}[/]")
+        return True, False
+
+    def _handle_cmd_session_new(self, _confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
+        # 创建新会话前先等待旧任务归档，避免 memory_saved 被写入新 session。
+        if self.session_manager is None:
+            self.console.print("[yellow]当前没有可管理的主会话。[/]")
+            return True, False
+        self._wait_for_pending_memory_updates()
+        self._end_session()
+        self.session_manager.detach_current_session()
+        self._session_title_auto_started = False
+        self._session_interrupted_recorded = False
+        self._pending_session_title = None
+        self._pending_session_title_source = None
+        self._reset_messages_for_session(record_system_message=False)
+        self.console.print("[dim]已准备新会话，第一条用户任务后会自动保存。[/]")
+        return True, False
+
+    def _resolve_session_load_selector(self, selector: str) -> str | None:
+        """
+        把用户输入的序号或 session_id 解析为 session_id。
+        :param selector: 序号或 session_id
+        :return: session_id
+        """
+        if self.session_manager is None:
+            return None
+        normalized_selector = str(selector or "").strip()
+        if not normalized_selector:
+            return None
+        if normalized_selector.isdigit():
+            sessions = self.session_manager.list_sessions(limit=20)
+            selected_index = int(normalized_selector)
+            if selected_index < 1 or selected_index > len(sessions):
+                self.console.print(f"[yellow]会话序号超出范围：{normalized_selector}[/]")
+                return None
+            # 序号与 sessions 命令展示顺序保持一致。
+            return sessions[selected_index - 1].get("session_id")
+        return normalized_selector
+
+    def _load_session_by_id(self, session_id: str) -> bool:
+        """
+        加载指定历史会话。
+        :param session_id: 会话 id
+        :return: 是否加载成功
+        """
+        if self.session_manager is None:
+            self.console.print("[yellow]当前没有可管理的主会话。[/]")
+            return False
+        target_session_id = (session_id or "").strip()
+        if not target_session_id:
+            self.console.print("[yellow]请输入 session_id，例如：session load session_20260521_120000_abcdef[/]")
+            return False
+
+        current_session_id = self.session_manager.get_current_session_info().get("session_id")
+        try:
+            if not self.session_manager.load_session(target_session_id):
+                self.console.print(f"[yellow]未找到会话：{target_session_id}[/]")
+                return False
+            self._wait_for_pending_memory_updates()
+            if current_session_id and current_session_id != target_session_id:
+                self._end_session()
+            info = self.session_manager.switch_session(target_session_id)
+            self.messages = self._load_messages_from_session(info["session_id"])
+            self._current_task_full_context = None
+            self._current_task_start_index = None
+            self._current_turn_id = None
+            self._used_token = self._estimate_messages_tokens(self.messages, self._all_tools)
+            self._total_token = self._used_token
+            # 继续历史会话时不再把下一条用户消息当作“第一个任务”自动改标题。
+            self._session_title_auto_started = True
+            self._session_interrupted_recorded = False
+            self._pending_session_title = None
+            self._pending_session_title_source = None
+        except Exception as error:
+            self.console.print(f"[yellow]会话加载失败：{error}[/]")
+            return False
+
+        self.console.print(f"[dim]已加载会话：{info.get('title') or '未命名会话'}（{info.get('session_id')}）[/]")
+        return True
+
+    def _handle_cmd_session_load(self, _confirm_choice: tuple[str, ...], session_id: str) -> tuple[bool, bool]:
+        # 加载历史会话会替换当前短期上下文，但加载动作本身不写入任何 session。
+        target_session_id = self._resolve_session_load_selector(session_id)
+        if target_session_id:
+            self._load_session_by_id(target_session_id)
+        return True, False
+
+    def _handle_cmd_session_load_prompt(self, _confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
+        # 不带参数时展示列表，让用户输入序号或 session_id。
+        if self.session_manager is None:
+            self.console.print("[yellow]当前没有可管理的主会话。[/]")
+            return True, False
+        sessions = self.session_manager.list_sessions(limit=20)
+        if not sessions:
+            self.console.print("[yellow]暂无历史会话。[/]")
+            return True, False
+        self._print_sessions_table(sessions)
+        selector = self.console.input("[bold cyan]请输入要加载的会话序号或 session_id：[/] ").strip()
+        target_session_id = self._resolve_session_load_selector(selector)
+        if target_session_id:
+            self._load_session_by_id(target_session_id)
+        return True, False
+
+    def _handle_cmd_continue_session(self, _confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
+        # 继续上一次会话。
+        if self.session_manager is None:
+            self.console.print("[yellow]当前没有可管理的主会话。[/]")
+            return True, False
+        sessions = self.session_manager.list_sessions(limit=1, include_empty=False)
+        if not sessions:
+            self.console.print("[yellow]没有可继续的历史会话。[/]")
+            return True, False
+        self._load_session_by_id(sessions[0].get("session_id"))
+        return True, False
+
+    def _handle_cmd_session_title_show(self, _confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
+        # 展示当前会话标题，便于用户确认客户端列表中会看到的名称。
+        if self.session_manager is None:
+            self.console.print("[yellow]当前没有可管理的主会话。[/]")
+            return True, False
+        if self.session_manager.current_session_id is None:
+            title = self._pending_session_title or "未命名会话"
+            source = self._pending_session_title_source or "default"
+            self.console.print(f"[dim]待创建会话标题：{title}（来源：{source}）[/]")
+            return True, False
+        session_info = self.session_manager.get_current_session_info()
+        title = session_info.get("title") or "未命名会话"
+        source = session_info.get("title_source") or "default"
+        self.console.print(f"[dim]当前会话标题：{title}（来源：{source}）[/]")
+        return True, False
+
+    def _handle_cmd_session_title_set(self, _confirm_choice: tuple[str, ...], title: str) -> tuple[bool, bool]:
+        # 用户手动设置的标题优先级最高，后续异步自动标题不会覆盖它。
+        self._set_session_title(title, source="user", silent=False)
         return True, False
 
     def _calculate_token_usage_ratio(self, used_tokens: int, context_window: int) -> float:
@@ -1289,7 +2167,7 @@ class Agent:
         :param context_window: 上下文窗口 token 上限
         :return:
         """
-        # 新增：统一处理边界情况，避免除零并将结果限制在 0~1。
+        # 统一处理边界情况，避免除零并将结果限制在 0~1。
         if context_window <= 0:
             return 0.0
         ratio = max(0.0, used_tokens / context_window)
@@ -1302,7 +2180,7 @@ class Agent:
         :param width: 柱状图宽度
         :return:
         """
-        # 新增：使用 Unicode 方块字符绘制柱状图，并根据阈值设置颜色。
+        # 使用 Unicode 方块字符绘制柱状图，并根据阈值设置颜色。
         ratio = min(max(usage_ratio, 0.0), 1.0)
         filled = int(width * ratio)
         bar = "█" * filled + "░" * (width - filled)
@@ -1320,7 +2198,7 @@ Team 类管理多个Agent，
 
 class Team:
     def __init__(self, agent_factory=None):
-        self.agents = {}  # name → Agent
+        self.agents = {}  # 名称到 Agent 的映射。
         self.agent_factory = agent_factory or (lambda name, role: Agent(role=role, name=name))
 
     def hire(self, name, role):

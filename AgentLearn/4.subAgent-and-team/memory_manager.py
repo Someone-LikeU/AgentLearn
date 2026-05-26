@@ -36,6 +36,7 @@ class MemoryManager:
         self.global_summary_file = self.memory_dir / "global_summary.md"
         self.task_index_file = self.memory_dir / "task_index.jsonl"
         self.task_summaries_file = self.memory_dir / "task_summaries.jsonl"
+        self.deleted_tasks_file = self.memory_dir / "deleted_tasks.jsonl"
         self.error_log_file = self.memory_dir / "memory_errors.log"
 
         # 只使用一个后台线程，保证 jsonl 追加和 global_summary.md 重写的顺序稳定。
@@ -47,17 +48,32 @@ class MemoryManager:
     def _ensure_memory_files(self):
         # 启动时按需创建目录和空文件，避免新检出项目需要手动初始化记忆结构。
         self.full_context_dir.mkdir(parents=True, exist_ok=True)
-        for file_path in (self.global_summary_file, self.task_index_file, self.task_summaries_file, self.error_log_file):
+        for file_path in (
+            self.global_summary_file,
+            self.task_index_file,
+            self.task_summaries_file,
+            self.deleted_tasks_file,
+            self.error_log_file,
+        ):
             file_path.touch(exist_ok=True)
 
-    def enqueue(self, task: str, result: str, context: list[dict[str, Any]]):
+    def enqueue(
+        self,
+        task: str,
+        result: str,
+        context: list[dict[str, Any]],
+        session_id: str | None = None,
+        turn_id: str | None = None,
+    ):
         if self._shutdown:
-            return
+            return None
         # Agent.chat() 结束后会清空当前任务上下文，因此这里先复制快照再交给后台线程。
         context_snapshot = deepcopy(context or [])
-        future = self._executor.submit(self._process_memory_update, task, result, context_snapshot)
+        metadata = {"session_id": session_id, "turn_id": turn_id}
+        future = self._executor.submit(self._process_memory_update, task, result, context_snapshot, metadata)
         self._futures.append(future)
         self._cleanup_finished_futures()
+        return future
 
     def has_pending(self) -> bool:
         self._cleanup_finished_futures()
@@ -119,7 +135,42 @@ class MemoryManager:
         self.global_summary_file.write_text("", encoding="utf-8")
         self.task_index_file.write_text("", encoding="utf-8")
         self.task_summaries_file.write_text("", encoding="utf-8")
+        self.deleted_tasks_file.write_text("", encoding="utf-8")
         self.error_log_file.write_text("", encoding="utf-8")
+
+    def record_deleted_task(
+        self,
+        session_id: str | None,
+        turn_id: str,
+        task_ids: list[str] | None = None,
+        reason: str = "user_deleted_from_session",
+    ) -> list[dict[str, Any]]:
+        """
+        记录被用户从会话中删除的长期记忆任务。
+        :param session_id: 会话 id
+        :param turn_id: 用户任务 turn_id
+        :param task_ids: 已关联的长期记忆 task_id
+        :param reason: 删除原因
+        :return: 写入的删除记录
+        """
+        self._ensure_memory_files()
+        timestamp = datetime.now().isoformat(timespec="seconds")
+        normalized_task_ids = [task_id for task_id in (task_ids or []) if task_id]
+        if not normalized_task_ids:
+            normalized_task_ids = [None]
+
+        records = []
+        for task_id in normalized_task_ids:
+            record = {
+                "task_id": task_id,
+                "session_id": session_id,
+                "turn_id": turn_id,
+                "deleted_at": timestamp,
+                "reason": reason,
+            }
+            self._append_jsonl(self.deleted_tasks_file, record)
+            records.append(record)
+        return records
 
     def get_task_full_context(self, task_id: str) -> dict[str, Any]:
         # 只允许读取 MemoryManager 自己生成的 task_id，避免模型传入任意路径。
@@ -150,19 +201,28 @@ class MemoryManager:
                 "message": "Failed to read or parse the full context file.",
             }
 
-    def _process_memory_update(self, task: str, result: str, context: list[dict[str, Any]]):
+    def _process_memory_update(
+        self,
+        task: str,
+        result: str,
+        context: list[dict[str, Any]],
+        metadata: dict[str, Any] | None = None,
+    ):
         try:
             # 先保存完整上下文，再写索引；这样索引里的 full_context_path 始终指向真实文件。
+            metadata = metadata or {}
             task_id = self._create_task_id()
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            full_context_path = self._save_task_full_context(task_id, timestamp, task, result, context)
+            full_context_path = self._save_task_full_context(task_id, timestamp, task, result, context, metadata)
             summary = self._summarize_task_memory(task_id, timestamp, task, result, context)
-            index_record = self._build_index_record(task_id, timestamp, summary, full_context_path)
+            index_record = self._build_index_record(task_id, timestamp, summary, full_context_path, metadata)
             self._append_task_index(index_record)
             self._append_task_summary(summary)
             self._update_global_memory_summary(summary)
+            return index_record
         except Exception:
             self._log_error("memory update failed", traceback.format_exc())
+            return None
 
     def _create_task_id(self) -> str:
         return f"task_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
@@ -174,6 +234,7 @@ class MemoryManager:
         task: str,
         result: str,
         context: list[dict[str, Any]],
+        metadata: dict[str, Any] | None = None,
     ) -> str:
         path = self.full_context_dir / f"{task_id}.json"
         payload = {
@@ -182,6 +243,7 @@ class MemoryManager:
             "task": task,
             "result": result,
             "messages": context,
+            "metadata": metadata or {},
         }
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         return str(path)
@@ -282,9 +344,11 @@ class MemoryManager:
         timestamp: str,
         summary: dict[str, Any],
         full_context_path: str,
+        metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         # 索引刻意保持轻量：system prompt 和后续 task_id 查找流程主要依赖它。
-        return {
+        metadata = metadata or {}
+        record = {
             "task_id": task_id,
             "timestamp": timestamp,
             "title": summary.get("title", task_id),
@@ -293,6 +357,11 @@ class MemoryManager:
             "summary": summary.get("result_summary", ""),
             "full_context_path": full_context_path,
         }
+        if metadata.get("session_id"):
+            record["session_id"] = metadata.get("session_id")
+        if metadata.get("turn_id"):
+            record["turn_id"] = metadata.get("turn_id")
+        return record
 
     def _update_global_memory_summary(self, task_summary: dict[str, Any]):
         # global_summary.md 由“旧汇总 + 新任务摘要”重新生成，只保留长期稳定的信息。
@@ -328,14 +397,64 @@ class MemoryManager:
             return []
         lines = self.task_index_file.read_text(encoding="utf-8").splitlines()
         records = []
-        for line in lines[-self.recent_limit:]:
+        deleted_task_ids, deleted_turn_refs = self._load_deleted_memory_refs()
+        for line in lines:
             if not line.strip():
                 continue
             try:
-                records.append(json.loads(line))
+                record = json.loads(line)
             except json.JSONDecodeError:
                 continue
-        return records
+            if self._is_deleted_memory_record(record, deleted_task_ids, deleted_turn_refs):
+                continue
+            records.append(record)
+        return records[-self.recent_limit:]
+
+    def _load_deleted_memory_refs(self) -> tuple[set[str], set[tuple[str | None, str]]]:
+        """
+        读取被软删除的长期记忆引用。
+        :return: (task_id 集合, (session_id, turn_id) 集合)
+        """
+        if not self.deleted_tasks_file.exists():
+            return set(), set()
+        deleted_task_ids: set[str] = set()
+        deleted_turn_refs: set[tuple[str | None, str]] = set()
+        for line in self.deleted_tasks_file.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            task_id = record.get("task_id")
+            turn_id = record.get("turn_id")
+            if task_id:
+                deleted_task_ids.add(str(task_id))
+            if turn_id:
+                deleted_turn_refs.add((record.get("session_id"), str(turn_id)))
+        return deleted_task_ids, deleted_turn_refs
+
+    def _is_deleted_memory_record(
+        self,
+        record: dict[str, Any],
+        deleted_task_ids: set[str],
+        deleted_turn_refs: set[tuple[str | None, str]],
+    ) -> bool:
+        """
+        判断长期记忆索引是否已被软删除。
+        :param record: task_index 记录
+        :param deleted_task_ids: 被删除的 task_id
+        :param deleted_turn_refs: 被删除的 session/turn 引用
+        :return: 是否应过滤
+        """
+        task_id = record.get("task_id")
+        if task_id and str(task_id) in deleted_task_ids:
+            return True
+        turn_id = record.get("turn_id")
+        if not turn_id:
+            return False
+        session_id = record.get("session_id")
+        return (session_id, str(turn_id)) in deleted_turn_refs or (None, str(turn_id)) in deleted_turn_refs
 
     def _append_task_index(self, record: dict[str, Any]) -> None:
         self._append_jsonl(self.task_index_file, record)

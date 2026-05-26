@@ -10,19 +10,14 @@ from subprocess import CompletedProcess
 from typing import Any, Callable
 from dataclasses import dataclass
 
-try:
-    from duckduckgo_search import DDGS
-except ModuleNotFoundError:
-    DDGS = None
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from prompt_loader import load_prompt
 from tools.base_tool import ToolSpec, FunctionTool
 from tools.tool_registry import ToolRegistry
 from tools.tool_names import ToolNameConstant
+from tools.web_tool import DDGS, WebTool
 
 
 @dataclass
@@ -39,6 +34,8 @@ class ToolManagerConfig:
     temperature: float
     # 是否是主 Agent，用于决定是否暴露 SUB_AGENT 等能力。
     is_main_agent: bool = True
+    # Spinner 创建函数，由 Agent 注入；普通测试场景可保持为空。
+    spinner_factory: Callable[..., Any] | None = None
 
 
 @dataclass
@@ -142,6 +139,11 @@ class ToolManager:
         self.temperature = config.temperature
         self.mcp_client = mcp_client
         self.is_main_agent = config.is_main_agent
+        self.web_tool = WebTool(
+            client=self.client,
+            model=self.model,
+            spinner_factory=config.spinner_factory,
+        )
 
         # 通过依赖注入方式注册“由 Agent 提供”的工具处理函数，
         # 这样 ToolManager 不需要直接依赖 Agent 具体实现。
@@ -170,6 +172,7 @@ class ToolManager:
         self.mcp_tools = self._load_mcp_tools() if self.mcp_client else []
         self.available_functions = self._build_available_functions()
         self.all_tools = self.local_tools + self.mcp_tools
+        self.last_web_search_results: dict[str, Any] | None = None
 
     def _build_local_functions(self) -> None:
         # 本地基础工具：文件、bash、检索、时间、联网搜索。
@@ -497,35 +500,30 @@ class ToolManager:
         from datetime import datetime
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+    def _search_with_duckduckgo(self, query: str, max_results: int) -> list[dict[str, str]]:
+        return self.web_tool._search_with_duckduckgo(query, max_results)
+
+    def _search_with_bing(self, query: str, max_results: int) -> list[dict[str, str]]:
+        return self.web_tool._search_with_bing(query, max_results)
+
+    def _web_search_backend_order(self) -> list[tuple[str, Callable[[str, int], list[dict[str, str]]]]]:
+        return self.web_tool._web_search_backend_order()
+
+    def web_extract(self, search_results: list[dict[str, Any]] | str, max_pages: int = 5) -> list[dict[str, Any]]:
+        return self.web_tool.web_extract(search_results, max_pages=max_pages)
+
+    def _summarize_web_search_results(
+            self,
+            query: str,
+            results: list[dict[str, str]],
+            extracted_pages: list[dict[str, Any]] | None = None,
+    ) -> str:
+        return self.web_tool._summarize_web_search_results(query, results, extracted_pages or [])
+
     def web_search(self, query: str, max_results: int = 10) -> str:
-        # 使用 duckduckgo 搜索后，交给当前模型总结，减少原始噪音。
-        max_results = int(max_results) if max_results else 10
-        max_results = max(1, min(max_results, 10))
-        try:
-            if DDGS is None:
-                return "WEB_SEARCH 执行失败: missing dependency duckduckgo_search"
-            with DDGS() as ddgs:
-                results = list(ddgs.text(query, max_results=max_results))
-            if not results:
-                return f"未搜索到与“{query}”相关的结果。"
-            search_text_lines = []
-            for i, item in enumerate(results, 1):
-                search_text_lines.append(
-                    f"{i}. 标题: {item.get('title', '').strip()}\n"
-                    f"   摘要: {item.get('body', '').strip()}\n"
-                    f"   链接: {item.get('href', '').strip()}\n"
-                )
-            summarization_prompt = load_prompt("web_search_summary_system.md")
-            user_content = load_prompt("web_search_summary_user.md", query=query, search_text="\n".join(search_text_lines))
-            summary_response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "system", "content": summarization_prompt}, {"role": "user", "content": user_content}],
-                temperature=0,
-            )
-            summary = summary_response.choices[0].message.content
-            return summary if summary else "未能生成总结。"
-        except Exception as e:
-            return f"WEB_SEARCH 执行失败: {e}"
+        result = self.web_tool.web_search(query, max_results)
+        self.last_web_search_results = self.web_tool.last_web_search_results
+        return result
 
     def list_dir(self, path):
         # 统一目录列表输出格式，显式区分文件与目录。

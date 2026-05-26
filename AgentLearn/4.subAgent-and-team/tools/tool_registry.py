@@ -37,4 +37,9 @@ class ToolRegistry:
 
     def as_function_map(self):
         """导出函数映射，兼容现有执行流程。"""
-        return {name: tool.call for name, tool in self._tools.items()}
+        function_map = {}
+        for name, tool in self._tools.items():
+            # Agent 执行工具时统一使用 function_impl(**kwargs)，这里把 kwargs
+            # 转回 Tool.call 需要的 args 字典，避免暴露 FunctionTool.call 的内部签名。
+            function_map[name] = lambda _tool=tool, **kwargs: _tool.call(kwargs)
+        return function_map
