@@ -3,6 +3,7 @@
 import atexit
 import json
 import os
+from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Thread, current_thread
 from types import SimpleNamespace
@@ -19,6 +20,58 @@ from tools.tool_names import ToolNameConstant
 from tools.tool_scheduler import ToolScheduler, ToolCallTask
 from spinner import Spinner
 from task_history_viewer import open_task_history_viewer
+
+
+@dataclass
+class ToolFailureGuardState:
+    """单轮 Agent 执行中的工具失败熔断状态。"""
+
+    active_tools: list[dict[str, Any]]
+    disabled_tools: set[str]
+    tools_without_make_plan: list[dict[str, Any]] | None = None
+    last_failure_key: tuple[str, str] | None = None
+    consecutive_failure_count: int = 0
+
+    def __post_init__(self):
+        if self.tools_without_make_plan is None:
+            self.refresh_tools_without_make_plan()
+
+    def refresh_tools_without_make_plan(self):
+        # active_tools 发生变化时同步刷新计划步骤可用工具，避免递归计划再次调用 MAKE_PLAN。
+        self.tools_without_make_plan = [
+            tool
+            for tool in self.active_tools
+            if tool.get("function", {}).get("name") != ToolNameConstant.MAKE_PLAN
+        ]
+
+
+@dataclass
+class StreamToolCallState:
+    """流式响应中单个 tool_call 的分片状态。"""
+
+    id: str | None = None
+    name_parts: list[str] = field(default_factory=list)
+    argument_parts: list[str] = field(default_factory=list)
+
+    @property
+    def name(self) -> str:
+        return "".join(self.name_parts)
+
+    @property
+    def arguments(self) -> str:
+        return "".join(self.argument_parts)
+
+
+@dataclass
+class StreamResponseState:
+    """流式响应累积状态。"""
+
+    content_parts: list[str] = field(default_factory=list)
+    tool_calls: dict[int, StreamToolCallState] = field(default_factory=dict)
+
+    @property
+    def content(self) -> str:
+        return "".join(self.content_parts)
 
 
 class Agent:
@@ -168,6 +221,7 @@ class Agent:
         self._mcp_tools = self._tool_manager.mcp_tools
         self._available_functions = self._tool_manager.available_functions
         self._all_tools = self._tool_manager.all_tools
+        self._all_tools_without_make_plan = self._build_tools_without_make_plan(self._all_tools)
         print(f"{len(self._local_tools)} local tools loaded")
         if self.mcp_client:
             print(f"{len(self._mcp_tools)} MCP tools loaded")
@@ -975,6 +1029,15 @@ class Agent:
             if tool.get("function", {}).get("name") != failed_tool_name
         ]
 
+    @staticmethod
+    def _build_tools_without_make_plan(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """生成去除 MAKE_PLAN 后的工具列表，供计划步骤递归调用复用。"""
+        return [
+            tool
+            for tool in tools
+            if tool.get("function", {}).get("name") != ToolNameConstant.MAKE_PLAN
+        ]
+
     def _format_tool_failure_response(self, task: ToolCallTask, error_type: str, message: str, retryable: bool = False) -> dict[str, Any]:
         """生成结构化工具错误，帮助模型区分工具系统失败和正常业务结果。"""
         return {
@@ -986,195 +1049,236 @@ class Agent:
             "message": message,
         }
 
-    def _run_agent_step(self, tools):
-        active_tools = list(tools)
-        last_failure_key = None
-        consecutive_failure_count = 0
-        disabled_tools: set[str] = set()
-
-        def _append_tool_result_and_guard(task: ToolCallTask, function_response):
-            nonlocal active_tools, last_failure_key, consecutive_failure_count
-
-            self._append_message(
-                {"role": "tool", "tool_call_id": task.tool_call_id, "content": json.dumps(function_response, ensure_ascii=False)}
+    def _request_next_model_message(self, active_tools):
+        # 模型调用前先做上下文压缩，避免把压缩逻辑散在主循环里。
+        self._compact_messages(active_tools)
+        spinner = self._start_spinner()
+        try:
+            response_stream = self.client.chat.completions.create(
+                model=self.model,
+                messages=self.messages,
+                tools=active_tools,
+                temperature=self.temperature,
+                stream=True,
             )
-            if not self._is_tool_call_failure(function_response):
-                last_failure_key = None
-                consecutive_failure_count = 0
-                return None
+            return self._deal_stream_response(response_stream, spinner=spinner)
+        finally:
+            spinner.stop()
 
-            failure_key = self._tool_call_failure_key(task)
-            if failure_key == last_failure_key:
-                consecutive_failure_count += 1
-            else:
-                last_failure_key = failure_key
-                consecutive_failure_count = 1
-
-            if consecutive_failure_count < self._MAX_CONSECUTIVE_TOOL_FAILURES:
-                return None
-
-            active_tools = self._filter_available_tools(active_tools, task.function_name)
-            disabled_tools.add(task.function_name)
-            user_reason = (
-                f"工具 {task.function_name} 使用相同参数连续失败 {consecutive_failure_count} 次。"
-                f"最后一次结果：{function_response}"
-            )
-            model_reason = (
-                f"Tool {task.function_name} failed {consecutive_failure_count} consecutive times "
-                f"with the same arguments. Last result: {function_response}"
-            )
-            if not active_tools:
-                return f"{user_reason}\n没有其他可用工具，已结束当前任务。"
-
-            # 提醒模型换用其他相关工具；如果没有合适工具，应直接给用户说明失败原因。
-            self._append_message(
+    def _append_assistant_response(self, message):
+        tool_calls = getattr(message, "tool_calls", None)
+        self._append_message({
+            "role": "assistant",
+            "content": message.content,
+            "tool_calls": [
                 {
-                    "role": "user",
-                    "content": (
-                        f"{model_reason}\n"
-                        f"Do not call {task.function_name} again. Use another relevant tool if available. "
-                        "If no suitable tool is available, stop tool use and explain why the task cannot be completed."
-                    ),
-                },
-                session_metadata={"is_task_entry": False, "tool_failure_guard": True},
-            )
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments,
+                    },
+                }
+                for tc in (tool_calls or [])
+            ] if tool_calls else None,
+        })
+
+    def _append_tool_result(self, task: ToolCallTask, function_response):
+        self._append_message(
+            {
+                "role": "tool",
+                "tool_call_id": task.tool_call_id,
+                "content": json.dumps(function_response, ensure_ascii=False),
+            }
+        )
+
+    def _append_tool_result_and_check_guard(
+            self,
+            task: ToolCallTask,
+            function_response,
+            guard_state: ToolFailureGuardState,
+    ):
+        self._append_tool_result(task, function_response)
+        if not self._is_tool_call_failure(function_response):
+            guard_state.last_failure_key = None
+            guard_state.consecutive_failure_count = 0
             return None
 
-        for i in range(self.max_iterations):
-            # 先压缩历史对话
-            self._compact_messages(active_tools)
-            # 模型调用前启动等待动画，首个流式数据片段到来后关闭。
-            spinner = self._start_spinner()
-            try:
-                response_stream = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=self.messages,
-                    tools=active_tools,
-                    temperature=self.temperature,
-                    stream=True,
-                )
-                message = self._deal_stream_response(response_stream, spinner=spinner)
-            finally:
-                spinner.stop()
-            print()
-            # 按照OpenAI的格式对message进行复原然后加回当前的短期历史记忆
-            self._append_message({
-                "role": "assistant",
-                "content": message.content,
-                "tool_calls": [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments,
-                        },
-                    }
-                    for tc in (message.tool_calls or [])
-                ] if message.tool_calls else None,
-            })
+        failure_key = self._tool_call_failure_key(task)
+        if failure_key == guard_state.last_failure_key:
+            guard_state.consecutive_failure_count += 1
+        else:
+            guard_state.last_failure_key = failure_key
+            guard_state.consecutive_failure_count = 1
 
-            # 无工具调用，结束
-            if not message.tool_calls:
-                return message.content
-            print(f"[Iter {i}]: message is: {message}")
-            # 第二版调度策略：依据工具画像（只读/并发安全/作用域）做分段并发。
-            scheduler = ToolScheduler(get_profile=self._tool_manager.get_tool_runtime_profile)
-            pending_tasks: list[ToolCallTask] = []
+        if guard_state.consecutive_failure_count < self._MAX_CONSECUTIVE_TOOL_FAILURES:
+            return None
 
-            for tool_call in message.tool_calls:
-                function_payload = getattr(tool_call, "function", None)
-                if function_payload is None:
-                    continue
-                function_name = str(getattr(function_payload, "name", ""))
-                raw_arguments = str(getattr(function_payload, "arguments", ""))
-                function_args = self._parse_tool_arguments(raw_arguments)
-                current_task = ToolCallTask(
-                    tool_call_id=tool_call.id,
-                    function_name=function_name,
-                    raw_arguments=raw_arguments,
-                    function_args=function_args,
-                )
+        guard_state.active_tools = self._filter_available_tools(guard_state.active_tools, task.function_name)
+        guard_state.disabled_tools.add(task.function_name)
+        guard_state.refresh_tools_without_make_plan()
+        user_reason = (
+            f"工具 {task.function_name} 使用相同参数连续失败 {guard_state.consecutive_failure_count} 次。"
+            f"最后一次结果：{function_response}"
+        )
+        model_reason = (
+            f"Tool {task.function_name} failed {guard_state.consecutive_failure_count} consecutive times "
+            f"with the same arguments. Last result: {function_response}"
+        )
+        if not guard_state.active_tools:
+            return f"{user_reason}\n没有其他可用工具，已结束当前任务。"
 
-                if function_name in disabled_tools:
-                    function_response = self._format_tool_failure_response(
-                        current_task,
-                        "disabled_repeated_failure",
-                        f"Tool {function_name} is disabled for this turn after repeated failures.",
-                        retryable=False,
-                    )
-                    self._append_message(
-                        {
-                            "role": "tool",
-                            "tool_call_id": current_task.tool_call_id,
-                            "content": json.dumps(function_response, ensure_ascii=False),
-                        }
-                    )
-                    return f"工具 {function_name} 已因连续失败被禁用，但模型再次请求该工具，已结束当前任务。"
+        # 提醒模型换用其他相关工具；如果没有合适工具，应直接给用户说明失败原因。
+        self._append_message(
+            {
+                "role": "user",
+                "content": (
+                    f"{model_reason}\n"
+                    f"Do not call {task.function_name} again. Use another relevant tool if available. "
+                    "If no suitable tool is available, stop tool use and explain why the task cannot be completed."
+                ),
+            },
+            session_metadata={"is_task_entry": False, "tool_failure_guard": True},
+        )
+        return None
 
-                # MAKE_PLAN 需要维持原有特殊流程，先刷新待执行队列再串行处理。
-                if function_name == ToolNameConstant.MAKE_PLAN:
-                    for task, function_response in scheduler.execute_batches(
-                        scheduler.plan_batches(pending_tasks), self._invoke_tool_task
-                    ):
-                        stop_reason = _append_tool_result_and_guard(task, function_response)
-                        if stop_reason:
-                            return stop_reason
-                    pending_tasks = []
+    def _build_tool_call_task(self, tool_call):
+        function_payload = getattr(tool_call, "function", None)
+        if function_payload is None:
+            return None
+        function_name = str(getattr(function_payload, "name", ""))
+        raw_arguments = str(getattr(function_payload, "arguments", ""))
+        return ToolCallTask(
+            tool_call_id=tool_call.id,
+            function_name=function_name,
+            raw_arguments=raw_arguments,
+            function_args=self._parse_tool_arguments(raw_arguments),
+        )
 
-                    function_impl = self._available_functions.get(function_name)
-                    if function_impl is None:
-                        function_response = self._format_tool_failure_response(
-                            current_task,
-                            "unknown_tool",
-                            f"Unknown tool '{function_name}'",
-                            retryable=False,
-                        )
-                    elif "_argument_error" in function_args:
-                        function_response = self._format_tool_failure_response(
-                            current_task,
-                            "argument_error",
-                            function_args["_argument_error"],
-                            retryable=False,
-                        )
-                    else:
-                        # 如果模型选择了先做计划，这个分支就对计划模式特殊处理
-                        self.plan_mode = True
-                        steps = function_impl(**function_args)
-                        if not isinstance(steps, list):
-                            function_response = steps
-                        else:
-                            results = []
-                            step_cnt = 0
-                            for step in steps:
-                                print(f"[Step {step_cnt + 1}]: {step}")
-                                self._append_message(
-                                    {"role": "user", "content": step},
-                                    session_metadata={"is_task_entry": False},
-                                )
-                                result = self._run_agent_step(
-                                    [t for t in active_tools if t["function"]["name"] != ToolNameConstant.MAKE_PLAN]
-                                )
-                                print(f"[Step {step_cnt + 1}] result:{result}, all messages: {self.messages}")
-                                step_cnt += 1
-                                results.append(result)
-                            function_response = "\n".join(results)
-                        self.plan_mode = False
-                        self.current_plan = []
-                    stop_reason = _append_tool_result_and_guard(current_task, function_response)
-                    if stop_reason:
-                        return stop_reason
-                    continue
+    def _append_disabled_tool_call_response(self, task: ToolCallTask):
+        function_response = self._format_tool_failure_response(
+            task,
+            "disabled_repeated_failure",
+            f"Tool {task.function_name} is disabled for this turn after repeated failures.",
+            retryable=False,
+        )
+        self._append_tool_result(task, function_response)
+        return f"工具 {task.function_name} 已因连续失败被禁用，但模型再次请求该工具，已结束当前任务。"
 
-                pending_tasks.append(current_task)
-
-            # 收尾执行剩余任务（可能包含并发批次）。
-            for task, function_response in scheduler.execute_batches(
+    def _execute_pending_tool_tasks(
+            self,
+            scheduler: ToolScheduler,
+            pending_tasks: list[ToolCallTask],
+            guard_state: ToolFailureGuardState,
+    ):
+        # 保留调度器的批次规划结果顺序，确保 tool message 和原 tool_call 一一对应。
+        for task, function_response in scheduler.execute_batches(
                 scheduler.plan_batches(pending_tasks), self._invoke_tool_task
-            ):
-                stop_reason = _append_tool_result_and_guard(task, function_response)
+        ):
+            stop_reason = self._append_tool_result_and_check_guard(task, function_response, guard_state)
+            if stop_reason:
+                return stop_reason
+        return None
+
+    def _run_plan_steps(self, steps: list[str], tools_without_make_plan: list[dict[str, Any]]):
+        results = []
+        step_cnt = 0
+        for step in steps:
+            print(f"[Step {step_cnt + 1}]: {step}")
+            self._append_message(
+                {"role": "user", "content": step},
+                session_metadata={"is_task_entry": False},
+            )
+            result = self._run_agent_step(tools_without_make_plan)
+            print(f"[Step {step_cnt + 1}] result:{result}, all messages: {self.messages}")
+            step_cnt += 1
+            results.append(result)
+        return "\n".join(results)
+
+    def _execute_make_plan_task(self, task: ToolCallTask, guard_state: ToolFailureGuardState):
+        function_impl = self._available_functions.get(task.function_name)
+        if function_impl is None:
+            return self._format_tool_failure_response(
+                task,
+                "unknown_tool",
+                f"Unknown tool '{task.function_name}'",
+                retryable=False,
+            )
+        if "_argument_error" in task.function_args:
+            return self._format_tool_failure_response(
+                task,
+                "argument_error",
+                task.function_args["_argument_error"],
+                retryable=False,
+            )
+
+        # MAKE_PLAN 会递归调用 Agent，递归调用时移除 MAKE_PLAN，避免计划中再次计划。
+        self.plan_mode = True
+        steps = function_impl(**task.function_args)
+        if not isinstance(steps, list):
+            function_response = steps
+        else:
+            function_response = self._run_plan_steps(steps, guard_state.tools_without_make_plan)
+        self.plan_mode = False
+        self.current_plan = []
+        return function_response
+
+    def _handle_tool_calls(self, tool_calls, guard_state: ToolFailureGuardState):
+        # 第二版调度策略：依据工具画像（只读/并发安全/作用域）做分段并发。
+        scheduler = ToolScheduler(get_profile=self._tool_manager.get_tool_runtime_profile)
+        pending_tasks: list[ToolCallTask] = []
+
+        for tool_call in tool_calls:
+            current_task = self._build_tool_call_task(tool_call)
+            if current_task is None:
+                continue
+
+            if current_task.function_name in guard_state.disabled_tools:
+                return self._append_disabled_tool_call_response(current_task)
+
+            if current_task.function_name == ToolNameConstant.MAKE_PLAN:
+                stop_reason = self._execute_pending_tool_tasks(scheduler, pending_tasks, guard_state)
                 if stop_reason:
                     return stop_reason
+                pending_tasks = []
+
+                function_response = self._execute_make_plan_task(current_task, guard_state)
+                stop_reason = self._append_tool_result_and_check_guard(
+                    current_task, function_response, guard_state
+                )
+                if stop_reason:
+                    return stop_reason
+                continue
+
+            pending_tasks.append(current_task)
+
+        return self._execute_pending_tool_tasks(scheduler, pending_tasks, guard_state)
+
+    def _run_agent_step(self, tools):
+        active_tools = list(tools)
+        tools_without_make_plan = (
+            list(self._all_tools_without_make_plan)
+            if tools is self._all_tools
+            else self._build_tools_without_make_plan(active_tools)
+        )
+        guard_state = ToolFailureGuardState(
+            active_tools=active_tools,
+            disabled_tools=set(),
+            tools_without_make_plan=tools_without_make_plan,
+        )
+
+        for i in range(self.max_iterations):
+            message = self._request_next_model_message(guard_state.active_tools)
+            print()
+            self._append_assistant_response(message)
+
+            if not message.tool_calls:
+                return message.content
+
+            print(f"[Iter {i}]: message is: {message}")
+            stop_reason = self._handle_tool_calls(message.tool_calls, guard_state)
+            if stop_reason:
+                return stop_reason
         return "Max iterations reached"
 
     def _should_show_tool_spinner(self) -> bool:
@@ -1240,87 +1344,103 @@ class Agent:
 
     def _deal_stream_response(self, stream_response, spinner: Spinner | None = None):
         """
-        为了用户体验，需要做流式响应，这里需要处理模型的流式响应，
-        所以需要 1）流式打印响应内容，2）累积工具调用的chunks,因为同一个工具调用的参数可能在两个chunk里分两次返回
-        :param stream_response:
-        :return: 转换后的一个message对象
+        处理模型流式响应，返回兼容 OpenAI message 结构的对象。
+        :param stream_response: 模型流式响应迭代器
+        :param spinner: 等待动画
+        :return: 转换后的 message 对象
         """
-        # 完整回复。
-        full_reply = ""
-        # 累积工具调用
-        tool_calls = {}
-        first_chunk_arrived = False
+        state = StreamResponseState()
         try:
-            for chunk in stream_response:
-                if not first_chunk_arrived and spinner is not None:
-                    # 首个响应到达后关闭等待动画，切换到真实流式输出。
-                    spinner.stop()
-                    first_chunk_arrived = True
-                # 流式响应中若包含 usage 字段，则实时更新 token 统计。
-                self._update_usage_from_response(chunk)
-                # 防御性处理，有时 delta 可能不存在。
-                choice = chunk.choices[0]
-                delta = choice.delta
-                # 1) 流式打印响应内容
-                content = getattr(delta, "content", None)
-                if content:
-                    print(content, end="", flush=True)
-                    full_reply += content
-
-                # 2) 累积还原工具调用
-                delta_tool_calls = getattr(delta, "tool_calls", None)
-                if delta_tool_calls:
-                    for tc in delta_tool_calls:
-                        idx = tc.index
-                        if idx not in tool_calls:
-                            tool_calls[idx] = {
-                                "id": getattr(tc, "id", None),
-                                "name": "",
-                                "arguments": "",
-                            }
-                        # 若后续数据片段才补齐 tool_call_id，这里做增量回填，避免首包无 id 导致丢失。
-                        if getattr(tc, "id", None):
-                            tool_calls[idx]["id"] = tc.id
-                        func = getattr(tc, "function", None)
-                        if func is not None:
-                            name = getattr(func, "name", None)
-                            args = getattr(func, "arguments", None)
-                            if name:
-                                # 使用追加方式拼接，兼容极端情况下 name 被分片返回。
-                                tool_calls[idx]["name"] += name
-                            if args:
-                                tool_calls[idx]["arguments"] += args
+            for chunk in self._iter_stream_chunks(stream_response, spinner):
+                self._consume_stream_chunk(chunk, state)
         except Exception as error:
-            if self.session_manager is not None and self._current_turn_id:
-                try:
-                    # 正常流式片段不落盘，只有异常时保存已收到内容辅助排查。
-                    self.session_manager.record_model_stream_error(
-                        turn_id=self._current_turn_id,
-                        partial_content=full_reply,
-                        error=str(error),
-                    )
-                except Exception:
-                    pass
+            self._record_stream_error(state.content, error)
             raise
+        return self._build_stream_message(state)
 
-        # 转换兼容的结构
+    def _iter_stream_chunks(self, stream_response, spinner: Spinner | None = None):
+        first_chunk_arrived = False
+        for chunk in stream_response:
+            if not first_chunk_arrived and spinner is not None:
+                # 首个响应到达后关闭等待动画，切换到真实流式输出。
+                spinner.stop()
+                first_chunk_arrived = True
+            yield chunk
+
+    def _consume_stream_chunk(self, chunk, state: StreamResponseState) -> None:
+        # 流式响应中若包含 usage 字段，则实时更新 token 统计。
+        self._update_usage_from_response(chunk)
+        choice = chunk.choices[0]
+        delta = choice.delta
+
+        content = getattr(delta, "content", None)
+        if content:
+            self._append_stream_content(content, state)
+
+        delta_tool_calls = getattr(delta, "tool_calls", None)
+        if delta_tool_calls:
+            self._append_tool_call_delta(delta_tool_calls, state)
+
+    def _append_stream_content(self, content: str, state: StreamResponseState) -> None:
+        print(content, end="", flush=True)
+        state.content_parts.append(content)
+
+    def _append_tool_call_delta(self, delta_tool_calls, state: StreamResponseState) -> None:
+        for tc in delta_tool_calls:
+            idx = tc.index
+            if idx not in state.tool_calls:
+                state.tool_calls[idx] = StreamToolCallState(id=getattr(tc, "id", None))
+            tool_call_state = state.tool_calls[idx]
+
+            # 若后续数据片段才补齐 tool_call_id，这里做增量回填，避免首包无 id 导致丢失。
+            tool_call_id = getattr(tc, "id", None)
+            if tool_call_id:
+                tool_call_state.id = tool_call_id
+
+            func = getattr(tc, "function", None)
+            if func is None:
+                continue
+            name = getattr(func, "name", None)
+            args = getattr(func, "arguments", None)
+            if name:
+                # 使用追加方式拼接，兼容极端情况下 name 被分片返回。
+                tool_call_state.name_parts.append(name)
+            if args:
+                tool_call_state.argument_parts.append(args)
+
+    def _record_stream_error(self, partial_content: str, error: Exception) -> None:
+        session_manager = getattr(self, "session_manager", None)
+        current_turn_id = getattr(self, "_current_turn_id", None)
+        if session_manager is None or not current_turn_id:
+            return
+        try:
+            # 正常流式片段不落盘，只有异常时保存已收到内容辅助排查。
+            session_manager.record_model_stream_error(
+                turn_id=current_turn_id,
+                partial_content=partial_content,
+                error=str(error),
+            )
+        except Exception:
+            pass
+
+    def _build_stream_message(self, state: StreamResponseState):
         ordered_tool_calls = []
-        for idx in sorted(tool_calls.keys()):
-            item = tool_calls[idx]
+        for idx in sorted(state.tool_calls.keys()):
+            item = state.tool_calls[idx]
             ordered_tool_calls.append(
                 SimpleNamespace(
-                    id=item["id"],
+                    id=item.id,
                     function=SimpleNamespace(
-                        name=item["name"],
-                        arguments=item["arguments"],
+                        name=item.name,
+                        arguments=item.arguments,
                     ),
                 )
             )
-        message = SimpleNamespace(
-            content=full_reply if full_reply else None,
+        content = state.content
+        return SimpleNamespace(
+            content=content if content else None,
             tool_calls=ordered_tool_calls if ordered_tool_calls else None,
         )
-        return message
 
     def _start_spinner(
             self,
@@ -1620,7 +1740,7 @@ class Agent:
         if lowered[0] not in session_aliases:
             return stripped
         if len(parts) == 1:
-            return stripped
+            return "session"
 
         sub_command = lowered[1]
         rest = parts[2] if len(parts) >= 3 else ""
@@ -1692,6 +1812,7 @@ class Agent:
             "history": self._handle_cmd_history,
             "sessions": self._handle_cmd_sessions,
             "continue": self._handle_cmd_continue_session,
+            "session": self._handle_cmd_session_help,
             "session current": self._handle_cmd_session_current,
             "session new": self._handle_cmd_session_new,
             "session load": self._handle_cmd_session_load_prompt,
@@ -1713,6 +1834,27 @@ class Agent:
     def _handle_cmd_tools(self, _confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
         # 展示当前已加载的本地工具和 MCP 工具。
         self._print_available_tools()
+        return True, False
+
+    def _handle_cmd_session_help(self, _confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
+        # 用户只输入 session 时展示会话相关命令，避免被当作普通问题发送给模型。
+        session_commands = [
+            ("sessions", "列出最近会话"),
+            ("continue", "继续上一次会话"),
+            ("session current", "查看当前会话信息"),
+            ("session new", "创建一个新会话"),
+            ("session load", "从最近会话列表中选择并加载"),
+            ("session load <序号|session_id>", "加载并继续一个历史会话"),
+            ("session title", "查看当前会话标题"),
+            ("session title <标题>", "自定义当前会话标题"),
+        ]
+        command_table = Table.grid(padding=(0, 2))
+        command_table.add_column(justify="left", no_wrap=True)
+        command_table.add_column(justify="left")
+        for command, description in session_commands:
+            command_table.add_row(f"[bold cyan]{command}[/]", f"[dim]{description}[/]")
+        self.console.print("[bold]session 相关命令[/]")
+        self.console.print(command_table)
         return True, False
 
     def _handle_cmd_clear_screen(self, _confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
@@ -1870,15 +2012,19 @@ class Agent:
         if self.session_manager.current_session_id is None:
             self.console.print("[yellow]当前还没有已保存的用户任务。[/]")
             return True, False
-        tasks = self.session_manager.list_tasks()
-        if not tasks:
-            self.console.print("[yellow]当前会话没有可展示的用户任务。[/]")
-            return True, False
 
-        result = open_task_history_viewer(tasks)
-        if result.action == "delete" and result.task:
-            self._delete_history_task(result.task)
-        return True, False
+        while True:
+            tasks = self.session_manager.list_tasks()
+            if not tasks:
+                self.console.print("[yellow]当前会话没有可展示的用户任务。[/]")
+                return True, False
+
+            result = open_task_history_viewer(tasks)
+            if result.action == "delete" and result.task:
+                # 删除会改变 session 事件和短期上下文，完成后重新拉取任务列表继续展示 history。
+                self._delete_history_task(result.task)
+                continue
+            return True, False
 
     def _delete_history_task(self, task: dict[str, Any]) -> bool:
         """
@@ -1910,7 +2056,7 @@ class Agent:
             self.console.print(f"[yellow]删除任务失败：{error}[/]")
             return False
 
-        self.console.print(f"[dim]已软删除任务 {task.get('index')}（turn_id: {turn_id}）[/]")
+        self.console.print(f"[dim]已删除任务 {task.get('index')}（turn_id: {turn_id}）[/]")
         return True
 
     def _reload_messages_after_turn_delete(self, session_id: str) -> None:
