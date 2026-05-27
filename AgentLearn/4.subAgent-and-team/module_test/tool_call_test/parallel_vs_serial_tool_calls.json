@@ -1,0 +1,583 @@
+{
+  "tool_profiles": {
+    "READ_FILE": {
+      "is_read_only": true,
+      "is_concurrency_safe": true,
+      "is_destructive": false,
+      "side_effect_scope": "filesystem"
+    },
+    "LIST_DIR": {
+      "is_read_only": true,
+      "is_concurrency_safe": true,
+      "is_destructive": false,
+      "side_effect_scope": "filesystem"
+    },
+    "GLOB": {
+      "is_read_only": true,
+      "is_concurrency_safe": true,
+      "is_destructive": false,
+      "side_effect_scope": "filesystem"
+    },
+    "GET_TIME": {
+      "is_read_only": true,
+      "is_concurrency_safe": true,
+      "is_destructive": false,
+      "side_effect_scope": "runtime"
+    },
+    "WRITE_FILE": {
+      "is_read_only": false,
+      "is_concurrency_safe": false,
+      "is_destructive": true,
+      "side_effect_scope": "filesystem"
+    },
+    "QUERY_FLIGHT_TICKETS": {
+      "is_read_only": true,
+      "is_concurrency_safe": true,
+      "is_destructive": false,
+      "side_effect_scope": "network"
+    },
+    "QUERY_WEATHER": {
+      "is_read_only": true,
+      "is_concurrency_safe": true,
+      "is_destructive": false,
+      "side_effect_scope": "network"
+    }
+  },
+  "scheduled_execution_order": [
+    {
+      "batch_index": 1,
+      "parallel": true,
+      "task_order": [
+        {
+          "tool_call_id": "call_read_file",
+          "function_name": "READ_FILE"
+        },
+        {
+          "tool_call_id": "call_list_dir",
+          "function_name": "LIST_DIR"
+        },
+        {
+          "tool_call_id": "call_glob",
+          "function_name": "GLOB"
+        },
+        {
+          "tool_call_id": "call_read_agent_teams",
+          "function_name": "READ_FILE"
+        }
+      ]
+    },
+    {
+      "batch_index": 2,
+      "parallel": false,
+      "task_order": [
+        {
+          "tool_call_id": "call_get_time",
+          "function_name": "GET_TIME"
+        }
+      ]
+    },
+    {
+      "batch_index": 3,
+      "parallel": false,
+      "task_order": [
+        {
+          "tool_call_id": "call_write_file",
+          "function_name": "WRITE_FILE"
+        }
+      ]
+    },
+    {
+      "batch_index": 4,
+      "parallel": true,
+      "task_order": [
+        {
+          "tool_call_id": "call_query_flight",
+          "function_name": "QUERY_FLIGHT_TICKETS"
+        },
+        {
+          "tool_call_id": "call_query_weather",
+          "function_name": "QUERY_WEATHER"
+        }
+      ]
+    },
+    {
+      "batch_index": 5,
+      "parallel": false,
+      "task_order": [
+        {
+          "tool_call_id": "call_read_written_file",
+          "function_name": "READ_FILE"
+        }
+      ]
+    }
+  ],
+  "parallel_started_order": [
+    "call_read_file",
+    "call_list_dir",
+    "call_glob",
+    "call_read_agent_teams",
+    "call_get_time",
+    "call_write_file",
+    "call_query_flight",
+    "call_query_weather",
+    "call_read_written_file"
+  ],
+  "parallel_finished_order": [
+    "call_list_dir",
+    "call_glob",
+    "call_read_file",
+    "call_read_agent_teams",
+    "call_get_time",
+    "call_write_file",
+    "call_query_weather",
+    "call_query_flight",
+    "call_read_written_file"
+  ],
+  "serial_started_order": [
+    "call_read_file",
+    "call_list_dir",
+    "call_glob",
+    "call_read_agent_teams",
+    "call_get_time",
+    "call_write_file",
+    "call_query_flight",
+    "call_query_weather",
+    "call_read_written_file"
+  ],
+  "serial_finished_order": [
+    "call_read_file",
+    "call_list_dir",
+    "call_glob",
+    "call_read_agent_teams",
+    "call_get_time",
+    "call_write_file",
+    "call_query_flight",
+    "call_query_weather",
+    "call_read_written_file"
+  ],
+  "planned_batches": [
+    {
+      "parallel": true,
+      "tasks": [
+        "READ_FILE",
+        "LIST_DIR",
+        "GLOB",
+        "READ_FILE"
+      ]
+    },
+    {
+      "parallel": false,
+      "tasks": [
+        "GET_TIME"
+      ]
+    },
+    {
+      "parallel": false,
+      "tasks": [
+        "WRITE_FILE"
+      ]
+    },
+    {
+      "parallel": true,
+      "tasks": [
+        "QUERY_FLIGHT_TICKETS",
+        "QUERY_WEATHER"
+      ]
+    },
+    {
+      "parallel": false,
+      "tasks": [
+        "READ_FILE"
+      ]
+    }
+  ],
+  "parallel_elapsed_seconds": 0.4159,
+  "serial_elapsed_seconds": 0.7976,
+  "parallel_results": [
+    {
+      "task_id": "call_read_file",
+      "function_name": "READ_FILE",
+      "result": {
+        "tool_call_id": "call_read_file",
+        "function_name": "READ_FILE",
+        "response": "   1 # encoding: utf-8\n   2 import json\n   3 import sys\n   4 import time\n   5 from pathlib import Path\n"
+      }
+    },
+    {
+      "task_id": "call_list_dir",
+      "function_name": "LIST_DIR",
+      "result": {
+        "tool_call_id": "call_list_dir",
+        "function_name": "LIST_DIR",
+        "response": "[file] __init__.py\n[dir] __pycache__\n[file] mcp_test.py\n[dir] session_copy\n[dir] session_rebuild\n[dir] session_test\n[file] test_agent_history_command.py\n[file] test_agent_stream_response.py\n[file] test_memory_manager.py\n[file] test_session_manager.py\n[file] test_session_manager.py.bak\n[file] test_session_manager.py.bak2\n[file] test_session_manager.py.bak3\n[file] test_task_history_viewer.py\n[file] test_tool_manager.py\n[dir] tool_call_test\n[file] web_search_smoke_test.py\n[file] web_search_test.py"
+      }
+    },
+    {
+      "task_id": "call_glob",
+      "function_name": "GLOB",
+      "result": {
+        "tool_call_id": "call_glob",
+        "function_name": "GLOB",
+        "response": "C:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_tool_manager.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_task_history_viewer.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\web_search_test.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_agent_stream_response.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_agent_history_command.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_session_manager.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\web_search_smoke_test.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\__init__.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_memory_manager.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\mcp_test.py"
+      }
+    },
+    {
+      "task_id": "call_read_agent_teams",
+      "function_name": "READ_FILE",
+      "result": {
+        "tool_call_id": "call_read_agent_teams",
+        "function_name": "READ_FILE",
+        "response": "   1 # encoding : utf-8\n   2 # @Time    : 2026/4/19\n   3 import atexit\n   4 import json\n   5 import os\n"
+      }
+    },
+    {
+      "task_id": "call_get_time",
+      "function_name": "GET_TIME",
+      "result": {
+        "tool_call_id": "call_get_time",
+        "function_name": "GET_TIME",
+        "response": "2026-05-27 16:09:18"
+      }
+    },
+    {
+      "task_id": "call_write_file",
+      "function_name": "WRITE_FILE",
+      "result": {
+        "tool_call_id": "call_write_file",
+        "function_name": "WRITE_FILE",
+        "response": "Successfully wrote to C:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\tool_call_test\\test_write_tool.txt"
+      }
+    },
+    {
+      "task_id": "call_query_flight",
+      "function_name": "QUERY_FLIGHT_TICKETS",
+      "result": {
+        "tool_call_id": "call_query_flight",
+        "function_name": "QUERY_FLIGHT_TICKETS",
+        "response": {
+          "tool": "QUERY_FLIGHT_TICKETS",
+          "args": {
+            "from_city": "上海",
+            "to_city": "北京",
+            "direct": false
+          }
+        }
+      }
+    },
+    {
+      "task_id": "call_query_weather",
+      "function_name": "QUERY_WEATHER",
+      "result": {
+        "tool_call_id": "call_query_weather",
+        "function_name": "QUERY_WEATHER",
+        "response": {
+          "tool": "QUERY_WEATHER",
+          "args": {
+            "city": "北京",
+            "days": 3
+          }
+        }
+      }
+    },
+    {
+      "task_id": "call_read_written_file",
+      "function_name": "READ_FILE",
+      "result": {
+        "tool_call_id": "call_read_written_file",
+        "function_name": "READ_FILE",
+        "response": "   1 test_123"
+      }
+    }
+  ],
+  "serial_results": [
+    {
+      "task_id": "call_read_file",
+      "function_name": "READ_FILE",
+      "result": {
+        "tool_call_id": "call_read_file",
+        "function_name": "READ_FILE",
+        "response": "   1 # encoding: utf-8\n   2 import json\n   3 import sys\n   4 import time\n   5 from pathlib import Path\n"
+      }
+    },
+    {
+      "task_id": "call_list_dir",
+      "function_name": "LIST_DIR",
+      "result": {
+        "tool_call_id": "call_list_dir",
+        "function_name": "LIST_DIR",
+        "response": "[file] __init__.py\n[dir] __pycache__\n[file] mcp_test.py\n[dir] session_copy\n[dir] session_rebuild\n[dir] session_test\n[file] test_agent_history_command.py\n[file] test_agent_stream_response.py\n[file] test_memory_manager.py\n[file] test_session_manager.py\n[file] test_session_manager.py.bak\n[file] test_session_manager.py.bak2\n[file] test_session_manager.py.bak3\n[file] test_task_history_viewer.py\n[file] test_tool_manager.py\n[dir] tool_call_test\n[file] web_search_smoke_test.py\n[file] web_search_test.py"
+      }
+    },
+    {
+      "task_id": "call_glob",
+      "function_name": "GLOB",
+      "result": {
+        "tool_call_id": "call_glob",
+        "function_name": "GLOB",
+        "response": "C:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_tool_manager.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_task_history_viewer.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\web_search_test.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_agent_stream_response.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_agent_history_command.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_session_manager.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\web_search_smoke_test.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\__init__.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_memory_manager.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\mcp_test.py"
+      }
+    },
+    {
+      "task_id": "call_read_agent_teams",
+      "function_name": "READ_FILE",
+      "result": {
+        "tool_call_id": "call_read_agent_teams",
+        "function_name": "READ_FILE",
+        "response": "   1 # encoding : utf-8\n   2 # @Time    : 2026/4/19\n   3 import atexit\n   4 import json\n   5 import os\n"
+      }
+    },
+    {
+      "task_id": "call_get_time",
+      "function_name": "GET_TIME",
+      "result": {
+        "tool_call_id": "call_get_time",
+        "function_name": "GET_TIME",
+        "response": "2026-05-27 16:09:19"
+      }
+    },
+    {
+      "task_id": "call_write_file",
+      "function_name": "WRITE_FILE",
+      "result": {
+        "tool_call_id": "call_write_file",
+        "function_name": "WRITE_FILE",
+        "response": "Successfully wrote to C:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\tool_call_test\\test_write_tool.txt"
+      }
+    },
+    {
+      "task_id": "call_query_flight",
+      "function_name": "QUERY_FLIGHT_TICKETS",
+      "result": {
+        "tool_call_id": "call_query_flight",
+        "function_name": "QUERY_FLIGHT_TICKETS",
+        "response": {
+          "tool": "QUERY_FLIGHT_TICKETS",
+          "args": {
+            "from_city": "上海",
+            "to_city": "北京",
+            "direct": false
+          }
+        }
+      }
+    },
+    {
+      "task_id": "call_query_weather",
+      "function_name": "QUERY_WEATHER",
+      "result": {
+        "tool_call_id": "call_query_weather",
+        "function_name": "QUERY_WEATHER",
+        "response": {
+          "tool": "QUERY_WEATHER",
+          "args": {
+            "city": "北京",
+            "days": 3
+          }
+        }
+      }
+    },
+    {
+      "task_id": "call_read_written_file",
+      "function_name": "READ_FILE",
+      "result": {
+        "tool_call_id": "call_read_written_file",
+        "function_name": "READ_FILE",
+        "response": "   1 test_123"
+      }
+    }
+  ],
+  "result_equal": false,
+  "parallel_results_normalized": [
+    {
+      "task_id": "call_read_file",
+      "function_name": "READ_FILE",
+      "result": {
+        "tool_call_id": "call_read_file",
+        "function_name": "READ_FILE",
+        "response": "   1 # encoding: utf-8\n   2 import json\n   3 import sys\n   4 import time\n   5 from pathlib import Path\n"
+      }
+    },
+    {
+      "task_id": "call_list_dir",
+      "function_name": "LIST_DIR",
+      "result": {
+        "tool_call_id": "call_list_dir",
+        "function_name": "LIST_DIR",
+        "response": "[file] __init__.py\n[dir] __pycache__\n[file] mcp_test.py\n[dir] session_copy\n[dir] session_rebuild\n[dir] session_test\n[file] test_agent_history_command.py\n[file] test_agent_stream_response.py\n[file] test_memory_manager.py\n[file] test_session_manager.py\n[file] test_session_manager.py.bak\n[file] test_session_manager.py.bak2\n[file] test_session_manager.py.bak3\n[file] test_task_history_viewer.py\n[file] test_tool_manager.py\n[dir] tool_call_test\n[file] web_search_smoke_test.py\n[file] web_search_test.py"
+      }
+    },
+    {
+      "task_id": "call_glob",
+      "function_name": "GLOB",
+      "result": {
+        "tool_call_id": "call_glob",
+        "function_name": "GLOB",
+        "response": "C:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_tool_manager.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_task_history_viewer.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\web_search_test.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_agent_stream_response.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_agent_history_command.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_session_manager.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\web_search_smoke_test.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\__init__.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_memory_manager.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\mcp_test.py"
+      }
+    },
+    {
+      "task_id": "call_read_agent_teams",
+      "function_name": "READ_FILE",
+      "result": {
+        "tool_call_id": "call_read_agent_teams",
+        "function_name": "READ_FILE",
+        "response": "   1 # encoding : utf-8\n   2 # @Time    : 2026/4/19\n   3 import atexit\n   4 import json\n   5 import os\n"
+      }
+    },
+    {
+      "task_id": "call_get_time",
+      "function_name": "GET_TIME",
+      "result": {
+        "tool_call_id": "call_get_time",
+        "function_name": "GET_TIME",
+        "response": "<dynamic-current-time>"
+      }
+    },
+    {
+      "task_id": "call_write_file",
+      "function_name": "WRITE_FILE",
+      "result": {
+        "tool_call_id": "call_write_file",
+        "function_name": "WRITE_FILE",
+        "response": "Successfully wrote to C:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\tool_call_test\\test_write_tool.txt"
+      }
+    },
+    {
+      "task_id": "call_query_flight",
+      "function_name": "QUERY_FLIGHT_TICKETS",
+      "result": {
+        "tool_call_id": "call_query_flight",
+        "function_name": "QUERY_FLIGHT_TICKETS",
+        "response": {
+          "tool": "QUERY_FLIGHT_TICKETS",
+          "args": {
+            "from_city": "上海",
+            "to_city": "北京",
+            "direct": false
+          }
+        }
+      }
+    },
+    {
+      "task_id": "call_query_weather",
+      "function_name": "QUERY_WEATHER",
+      "result": {
+        "tool_call_id": "call_query_weather",
+        "function_name": "QUERY_WEATHER",
+        "response": {
+          "tool": "QUERY_WEATHER",
+          "args": {
+            "city": "北京",
+            "days": 3
+          }
+        }
+      }
+    },
+    {
+      "task_id": "call_read_written_file",
+      "function_name": "READ_FILE",
+      "result": {
+        "tool_call_id": "call_read_written_file",
+        "function_name": "READ_FILE",
+        "response": "   1 test_123"
+      }
+    }
+  ],
+  "serial_results_normalized": [
+    {
+      "task_id": "call_read_file",
+      "function_name": "READ_FILE",
+      "result": {
+        "tool_call_id": "call_read_file",
+        "function_name": "READ_FILE",
+        "response": "   1 # encoding: utf-8\n   2 import json\n   3 import sys\n   4 import time\n   5 from pathlib import Path\n"
+      }
+    },
+    {
+      "task_id": "call_list_dir",
+      "function_name": "LIST_DIR",
+      "result": {
+        "tool_call_id": "call_list_dir",
+        "function_name": "LIST_DIR",
+        "response": "[file] __init__.py\n[dir] __pycache__\n[file] mcp_test.py\n[dir] session_copy\n[dir] session_rebuild\n[dir] session_test\n[file] test_agent_history_command.py\n[file] test_agent_stream_response.py\n[file] test_memory_manager.py\n[file] test_session_manager.py\n[file] test_session_manager.py.bak\n[file] test_session_manager.py.bak2\n[file] test_session_manager.py.bak3\n[file] test_task_history_viewer.py\n[file] test_tool_manager.py\n[dir] tool_call_test\n[file] web_search_smoke_test.py\n[file] web_search_test.py"
+      }
+    },
+    {
+      "task_id": "call_glob",
+      "function_name": "GLOB",
+      "result": {
+        "tool_call_id": "call_glob",
+        "function_name": "GLOB",
+        "response": "C:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_tool_manager.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_task_history_viewer.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\web_search_test.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_agent_stream_response.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_agent_history_command.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_session_manager.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\web_search_smoke_test.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\__init__.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_memory_manager.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\mcp_test.py"
+      }
+    },
+    {
+      "task_id": "call_read_agent_teams",
+      "function_name": "READ_FILE",
+      "result": {
+        "tool_call_id": "call_read_agent_teams",
+        "function_name": "READ_FILE",
+        "response": "   1 # encoding : utf-8\n   2 # @Time    : 2026/4/19\n   3 import atexit\n   4 import json\n   5 import os\n"
+      }
+    },
+    {
+      "task_id": "call_get_time",
+      "function_name": "GET_TIME",
+      "result": {
+        "tool_call_id": "call_get_time",
+        "function_name": "GET_TIME",
+        "response": "<dynamic-current-time>"
+      }
+    },
+    {
+      "task_id": "call_write_file",
+      "function_name": "WRITE_FILE",
+      "result": {
+        "tool_call_id": "call_write_file",
+        "function_name": "WRITE_FILE",
+        "response": "Successfully wrote to C:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\tool_call_test\\test_write_tool.txt"
+      }
+    },
+    {
+      "task_id": "call_query_flight",
+      "function_name": "QUERY_FLIGHT_TICKETS",
+      "result": {
+        "tool_call_id": "call_query_flight",
+        "function_name": "QUERY_FLIGHT_TICKETS",
+        "response": {
+          "tool": "QUERY_FLIGHT_TICKETS",
+          "args": {
+            "from_city": "上海",
+            "to_city": "北京",
+            "direct": false
+          }
+        }
+      }
+    },
+    {
+      "task_id": "call_query_weather",
+      "function_name": "QUERY_WEATHER",
+      "result": {
+        "tool_call_id": "call_query_weather",
+        "function_name": "QUERY_WEATHER",
+        "response": {
+          "tool": "QUERY_WEATHER",
+          "args": {
+            "city": "北京",
+            "days": 3
+          }
+        }
+      }
+    },
+    {
+      "task_id": "call_read_written_file",
+      "function_name": "READ_FILE",
+      "result": {
+        "tool_call_id": "call_read_written_file",
+        "function_name": "READ_FILE",
+        "response": "   1 test_123"
+      }
+    }
+  ],
+  "normalized_result_equal": true,
+  "output_path": "C:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\tool_call_test\\parallel_vs_serial_tool_calls.json"
+}

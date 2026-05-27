@@ -3,6 +3,7 @@ import json
 import sys
 import time
 from pathlib import Path
+from threading import Lock
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 # 测试可能从 module_test 或仓库根目录启动，这里确保阶段目录可被导入。
@@ -292,6 +293,231 @@ class ToolManagerLocalToolsTest(unittest.TestCase):
         self.assertTrue(batches[2].parallel)
         self.assertEqual([t.function_name for t in batches[2].tasks], ["D"])
 
+    def test_compare_parallel_and_serial_tool_call_results(self):
+        report = compare_parallel_and_serial_tool_calls()
+        self.assertTrue(report["normalized_result_equal"])
+        self.assertEqual(report["parallel_results_normalized"], report["serial_results_normalized"])
+        self.assertTrue(report["planned_batches"][0]["parallel"])
+
+
+def compare_parallel_and_serial_tool_calls(output_dir: Path | None = None) -> dict:
+    """
+    对比调度器并发执行和手动串行执行同一组工具调用的结果。
+    只使用 ToolManager 中已标记为只读且并发安全的本地工具，便于断点观察真实调度路径。
+    """
+    output_dir = output_dir or PROJECT_ROOT / "module_test" / "tool_call_test"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    write_test_path = output_dir / "test_write_tool.txt"
+    tool_manager = ToolManager(
+        config=ToolManagerConfig(
+            project_root=str(PROJECT_ROOT),
+            client=DummyClient(),
+            model="debug-model",
+            temperature=0,
+            is_main_agent=False,
+        ),
+        handlers=AgentToolHandlers(),
+        mcp_client=DummyMCPClient(),
+    )
+    tasks = [
+        ToolCallTask(
+            tool_call_id="call_read_file",
+            function_name=ToolNameConstant.READ_FILE,
+            raw_arguments=json.dumps(
+                {"path": str(PROJECT_ROOT / "module_test" / "test_tool_manager.py"), "offset": 0, "limit": 5},
+                ensure_ascii=False,
+            ),
+            function_args={
+                "path": str(PROJECT_ROOT / "module_test" / "test_tool_manager.py"),
+                "offset": 0,
+                "limit": 5,
+            },
+        ),
+        ToolCallTask(
+            tool_call_id="call_list_dir",
+            function_name=ToolNameConstant.LIST_DIR,
+            raw_arguments=json.dumps({"path": str(PROJECT_ROOT / "module_test")}, ensure_ascii=False),
+            function_args={"path": str(PROJECT_ROOT / "module_test")},
+        ),
+        ToolCallTask(
+            tool_call_id="call_glob",
+            function_name=ToolNameConstant.GLOB,
+            raw_arguments=json.dumps({"pattern": str(PROJECT_ROOT / "module_test" / "*.py")}, ensure_ascii=False),
+            function_args={"pattern": str(PROJECT_ROOT / "module_test" / "*.py")},
+        ),
+        ToolCallTask(
+            tool_call_id="call_read_agent_teams",
+            function_name=ToolNameConstant.READ_FILE,
+            raw_arguments=json.dumps(
+                {"path": str(PROJECT_ROOT / "agent_Teams.py"), "offset": 0, "limit": 5},
+                ensure_ascii=False,
+            ),
+            function_args={"path": str(PROJECT_ROOT / "agent_Teams.py"), "offset": 0, "limit": 5},
+        ),
+        ToolCallTask(
+            tool_call_id="call_get_time",
+            function_name=ToolNameConstant.GET_TIME,
+            raw_arguments="{}",
+            function_args={},
+        ),
+        ToolCallTask(
+            tool_call_id="call_write_file",
+            function_name=ToolNameConstant.WRITE_FILE,
+            raw_arguments=json.dumps(
+                {"path": str(write_test_path), "content": "test_123"},
+                ensure_ascii=False,
+            ),
+            function_args={"path": str(write_test_path), "content": "test_123"},
+        ),
+        ToolCallTask(
+            tool_call_id="call_query_flight",
+            function_name="QUERY_FLIGHT_TICKETS",
+            raw_arguments=json.dumps(
+                {"from_city": "上海", "to_city": "北京", "direct": False},
+                ensure_ascii=False,
+            ),
+            function_args={"from_city": "上海", "to_city": "北京", "direct": False},
+        ),
+        ToolCallTask(
+            tool_call_id="call_query_weather",
+            function_name="QUERY_WEATHER",
+            raw_arguments=json.dumps({"city": "北京", "days": 3}, ensure_ascii=False),
+            function_args={"city": "北京", "days": 3},
+        ),
+        ToolCallTask(
+            tool_call_id="call_read_written_file",
+            function_name=ToolNameConstant.READ_FILE,
+            raw_arguments=json.dumps({"path": str(write_test_path)}, ensure_ascii=False),
+            function_args={"path": str(write_test_path)},
+        ),
+    ]
+    scheduler = ToolScheduler(get_profile=tool_manager.get_tool_runtime_profile, max_workers=3)
+    delay_by_call_id = {
+        "call_read_file": 0.20,
+        "call_list_dir": 0.05,
+        "call_glob": 0.10,
+        "call_read_agent_teams": 0.15,
+        "call_get_time": 0.03,
+        "call_write_file": 0.02,
+        "call_query_flight": 0.12,
+        "call_query_weather": 0.08,
+        "call_read_written_file": 0.04,
+    }
+    parallel_started: list[str] = []
+    parallel_finished: list[str] = []
+    serial_started: list[str] = []
+    serial_finished: list[str] = []
+    execution_order_lock = Lock()
+
+    def invoke_debug_tool(task: ToolCallTask, *, mode: str) -> dict:
+        # 用不同耗时模拟乱序完成，验证 execute_batches 最终仍按原始 tool_call 顺序回填结果。
+        with execution_order_lock:
+            if mode == "parallel":
+                parallel_started.append(task.tool_call_id)
+            else:
+                serial_started.append(task.tool_call_id)
+        time.sleep(delay_by_call_id[task.tool_call_id])
+        function_impl = tool_manager.available_functions[task.function_name]
+        response = function_impl(**task.function_args)
+        with execution_order_lock:
+            if mode == "parallel":
+                parallel_finished.append(task.tool_call_id)
+            else:
+                serial_finished.append(task.tool_call_id)
+        return {
+            "tool_call_id": task.tool_call_id,
+            "function_name": task.function_name,
+            "response": response,
+        }
+
+    planned_batches = scheduler.plan_batches(tasks)
+    scheduled_execution_order = [
+        {
+            "batch_index": batch_index,
+            "parallel": batch.parallel,
+            "task_order": [
+                {
+                    "tool_call_id": task.tool_call_id,
+                    "function_name": task.function_name,
+                }
+                for task in batch.tasks
+            ],
+        }
+        for batch_index, batch in enumerate(planned_batches, 1)
+    ]
+    print("调度执行顺序:")
+    for batch in scheduled_execution_order:
+        mode = "并发" if batch["parallel"] and len(batch["task_order"]) > 1 else "串行"
+        names = " -> ".join(item["function_name"] for item in batch["task_order"])
+        print(f"  batch {batch['batch_index']} [{mode}]: {names}")
+
+    parallel_start = time.perf_counter()
+    parallel_pairs = scheduler.execute_batches(
+        planned_batches,
+        lambda task: invoke_debug_tool(task, mode="parallel"),
+    )
+    parallel_elapsed = time.perf_counter() - parallel_start
+
+    serial_start = time.perf_counter()
+    serial_pairs = [(task, invoke_debug_tool(task, mode="serial")) for task in tasks]
+    serial_elapsed = time.perf_counter() - serial_start
+
+    def normalize(pairs: list[tuple[ToolCallTask, dict]]) -> list[dict]:
+        return [
+            {
+                "task_id": task.tool_call_id,
+                "function_name": task.function_name,
+                "result": result,
+            }
+            for task, result in pairs
+        ]
+
+    def normalize_dynamic_results(results: list[dict]) -> list[dict]:
+        normalized = []
+        for item in results:
+            copy_item = json.loads(json.dumps(item, ensure_ascii=False))
+            if copy_item["function_name"] == ToolNameConstant.GET_TIME:
+                copy_item["result"]["response"] = "<dynamic-current-time>"
+            normalized.append(copy_item)
+        return normalized
+
+    parallel_results = normalize(parallel_pairs)
+    serial_results = normalize(serial_pairs)
+    parallel_results_normalized = normalize_dynamic_results(parallel_results)
+    serial_results_normalized = normalize_dynamic_results(serial_results)
+    report = {
+        "tool_profiles": {
+            task.function_name: tool_manager.get_tool_runtime_profile(task.function_name)
+            for task in tasks
+        },
+        "scheduled_execution_order": scheduled_execution_order,
+        "parallel_started_order": parallel_started,
+        "parallel_finished_order": parallel_finished,
+        "serial_started_order": serial_started,
+        "serial_finished_order": serial_finished,
+        "planned_batches": [
+            {
+                "parallel": batch.parallel,
+                "tasks": [task.function_name for task in batch.tasks],
+            }
+            for batch in planned_batches
+        ],
+        "parallel_elapsed_seconds": round(parallel_elapsed, 4),
+        "serial_elapsed_seconds": round(serial_elapsed, 4),
+        "parallel_results": parallel_results,
+        "serial_results": serial_results,
+        "result_equal": parallel_results == serial_results,
+        "parallel_results_normalized": parallel_results_normalized,
+        "serial_results_normalized": serial_results_normalized,
+        "normalized_result_equal": parallel_results_normalized == serial_results_normalized,
+    }
+
+    # 调试输出统一落到 module_test/tool_call_test，避免散落到项目根目录。
+    output_path = output_dir / "parallel_vs_serial_tool_calls.json"
+    report["output_path"] = str(output_path)
+    output_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    return report
+
 
 def debug_web_search(query: str, max_results: int = 5) -> dict:
     """
@@ -393,5 +619,8 @@ if __name__ == "__main__":
         search_query = sys.argv[2] if len(sys.argv) > 2 else "OpenAI"
         search_max_results = int(sys.argv[3]) if len(sys.argv) > 3 else 5
         debug_web_search(search_query, search_max_results)
+    elif len(sys.argv) > 1 and sys.argv[1] == "debug_tool_call_parallel":
+        debug_report = compare_parallel_and_serial_tool_calls()
+        print(json.dumps(debug_report, ensure_ascii=False, indent=2))
     else:
         unittest.main()
