@@ -3,11 +3,12 @@ from dataclasses import dataclass
 from typing import Any, Callable
 import shutil
 import sys
+import unicodedata
 
 
 DEFAULT_WINDOW_SIZE = 5
 LIST_HINT_TEXT = "↑/↓: move   Enter: detail   d/Delete: delete task   q: quit"
-DETAIL_HINT_TEXT = "↑/↓/PgUp/PgDn/Mouse if supported: scroll   Esc/Backspace: back   d/Delete: delete task   q: quit"
+DETAIL_HINT_TEXT = "↑/↓/PgUp/PgDn: scroll   Esc/Backspace: back   d/Delete: delete task   q: quit"
 DELETE_CONFIRM_HINT_TEXT = "y: confirm delete   n/Esc/Backspace: cancel   q: quit"
 
 
@@ -217,15 +218,20 @@ class TaskHistoryViewer:
 		task: dict[str, Any] | None = None,
 		scroll_offset: int = 0,
 		viewport_height: int | None = None,
+		viewport_width: int | None = None,
 	) -> list[tuple[str, str]]:
 		"""
 		按当前滚动位置渲染详情页视口。
 		:param task: 任务信息
 		:param scroll_offset: 起始行偏移
 		:param viewport_height: 可见内容行数
+		:param viewport_width: 可见内容宽度
 		:return: prompt_toolkit 格式化文本片段
 		"""
-		lines = self._fragment_lines(self._render_detail_body_fragments(task))
+		lines = self._fragment_display_lines(
+			self._render_detail_body_fragments(task),
+			viewport_width or self._default_detail_view_width(),
+		)
 		viewport_height = viewport_height or self._default_detail_view_height()
 		viewport_height = max(3, viewport_height)
 		max_offset = max(0, len(lines) - viewport_height)
@@ -236,14 +242,23 @@ class TaskHistoryViewer:
 		fragments.append(("class:hint", f"Lines {scroll_offset + 1}-{min(len(lines), scroll_offset + viewport_height)}/{len(lines)}   {DETAIL_HINT_TEXT}"))
 		return fragments
 
-	def detail_max_scroll(self, task: dict[str, Any] | None = None, viewport_height: int | None = None) -> int:
+	def detail_max_scroll(
+		self,
+		task: dict[str, Any] | None = None,
+		viewport_height: int | None = None,
+		viewport_width: int | None = None,
+	) -> int:
 		"""
 		计算详情页最大滚动偏移。
 		:param task: 任务信息
 		:param viewport_height: 可见内容行数
+		:param viewport_width: 可见内容宽度
 		:return: 最大偏移
 		"""
-		lines = self._fragment_lines(self._render_detail_body_fragments(task))
+		lines = self._fragment_display_lines(
+			self._render_detail_body_fragments(task),
+			viewport_width or self._default_detail_view_width(),
+		)
 		viewport_height = viewport_height or self._default_detail_view_height()
 		return max(0, len(lines) - max(3, viewport_height))
 
@@ -265,6 +280,13 @@ class TaskHistoryViewer:
 		:return: 可见内容行数
 		"""
 		return max(6, shutil.get_terminal_size((100, 24)).lines - 4)
+
+	def _default_detail_view_width(self) -> int:
+		"""
+		根据终端宽度估算详情内容视口。
+		:return: 可见内容列数
+		"""
+		return max(20, shutil.get_terminal_size((100, 24)).columns - 1)
 
 	@staticmethod
 	def _fragment_lines(fragments: list[tuple[str, str]]) -> list[list[tuple[str, str]]]:
@@ -297,6 +319,46 @@ class TaskHistoryViewer:
 			if line:
 				fragments.extend(line)
 		return fragments
+
+	@classmethod
+	def _fragment_display_lines(cls, fragments: list[tuple[str, str]], width: int) -> list[list[tuple[str, str]]]:
+		"""
+		把 prompt_toolkit 片段按终端显示宽度拆成物理行。
+		:param fragments: 格式化文本片段
+		:param width: 最大显示列数
+		:return: 按物理行组织的片段
+		"""
+		width = max(1, width)
+		lines: list[list[tuple[str, str]]] = [[]]
+		column = 0
+		for style, text in fragments:
+			for char in str(text):
+				if char == "\n":
+					lines.append([])
+					column = 0
+					continue
+				display_text = "    " if char == "\t" else char
+				display_width = cls._display_text_width(display_text)
+				if column > 0 and column + display_width > width:
+					lines.append([])
+					column = 0
+				lines[-1].append((style, display_text))
+				column += display_width
+		return lines
+
+	@staticmethod
+	def _display_text_width(text: str) -> int:
+		"""
+		估算文本在终端中的显示宽度。
+		:param text: 待估算文本
+		:return: 显示宽度
+		"""
+		width = 0
+		for char in text:
+			if unicodedata.combining(char):
+				continue
+			width += 2 if unicodedata.east_asian_width(char) in {"F", "W"} else 1
+		return width
 
 	def render_delete_confirm(self, task: dict[str, Any] | None = None) -> str:
 		"""
@@ -372,10 +434,13 @@ class TaskHistoryViewer:
 		def detail_view_height() -> int:
 			return self._default_detail_view_height()
 
+		def detail_view_width() -> int:
+			return self._default_detail_view_width()
+
 		def clamp_detail_scroll() -> None:
 			detail_scroll["value"] = min(
 				max(0, detail_scroll["value"]),
-				self.detail_max_scroll(viewport_height=detail_view_height()),
+				self.detail_max_scroll(viewport_height=detail_view_height(), viewport_width=detail_view_width()),
 			)
 
 		def scroll_detail(delta: int) -> None:
@@ -389,7 +454,11 @@ class TaskHistoryViewer:
 				return self.render_delete_confirm_fragments()
 			if show_detail["value"]:
 				clamp_detail_scroll()
-				return self.render_detail_view_fragments(scroll_offset=detail_scroll["value"], viewport_height=detail_view_height())
+				return self.render_detail_view_fragments(
+					scroll_offset=detail_scroll["value"],
+					viewport_height=detail_view_height(),
+					viewport_width=detail_view_width(),
+				)
 			return self.render_list_fragments()
 
 		key_bindings = KeyBindings()
@@ -469,23 +538,8 @@ class TaskHistoryViewer:
 			result["value"] = TaskHistoryResult(action="quit")
 			event.app.exit()
 
-		def _mouse_scroll_up(event):
-			scroll_detail(-3)
-			event.app.invalidate()
-
-		def _mouse_scroll_down(event):
-			scroll_detail(3)
-			event.app.invalidate()
-
-		# 鼠标滚轮键名在不同 prompt_toolkit 版本中可能不可用，失败时保留键盘滚动。
-		for key_name, handler in (("scroll-up", _mouse_scroll_up), ("scroll-down", _mouse_scroll_down)):
-			try:
-				key_bindings.add(key_name)(handler)
-			except Exception:
-				pass
-
 		control = FormattedTextControl(text=current_text)
-		root = HSplit([Window(content=control, wrap_lines=True, always_hide_cursor=True)])
+		root = HSplit([Window(content=control, wrap_lines=False, always_hide_cursor=True)])
 		style = Style.from_dict(
 			{
 				"header": "bold #00af87",
@@ -500,7 +554,6 @@ class TaskHistoryViewer:
 			key_bindings=key_bindings,
 			style=style,
 			full_screen=False,
-			mouse_support=True,
 		)
 		try:
 			application.run()
