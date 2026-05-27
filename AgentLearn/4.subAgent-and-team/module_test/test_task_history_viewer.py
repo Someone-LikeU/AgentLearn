@@ -109,6 +109,21 @@ class TaskHistoryViewerTest(unittest.TestCase):
 		self.assertIn("Lines", later_view)
 		self.assertGreater(viewer.detail_max_scroll(viewport_height=6), 0)
 
+	def test_detail_view_wraps_long_lines_before_slicing(self):
+		viewer = TaskHistoryViewer(self._tasks(1), window_size=5)
+		viewer.tasks[0]["content"] = "生成一篇古代文言文风格的情书，不少于500字"
+		viewer.tasks[0]["final_output"] = "卿卿之容，沉鱼落雁，闭月羞花；" * 20
+
+		fragments = viewer.render_detail_view_fragments(scroll_offset=0, viewport_height=8, viewport_width=24)
+		view_text = "".join(text for _, text in fragments)
+		physical_lines = TaskHistoryViewer._fragment_lines(fragments)
+
+		self.assertLessEqual(len(physical_lines), 9)
+		self.assertIn("Lines 1-8/", view_text)
+		self.assertIn("PgUp/PgDn: scroll", view_text)
+		self.assertNotIn("Mouse", view_text)
+		self.assertGreater(viewer.detail_max_scroll(viewport_height=8, viewport_width=24), 0)
+
 	def test_format_helpers(self):
 		self.assertEqual(format_task_time("2026-05-21T14:21:09"), "2026-05-21 14:21")
 		self.assertEqual(format_task_time(""), "---- -- -- --:--")
