@@ -158,9 +158,9 @@ class ToolManagerLocalToolsTest(unittest.TestCase):
         bing_search.assert_called_once_with("test", 1)
         self.assertEqual(out, "总结结果")
 
-    def test_web_search_default_backend_prefers_bing(self):
+    def test_web_search_default_backend_uses_duckduckgo(self):
         backend_names = [name for name, _ in self.tm._web_search_backend_order()]
-        self.assertEqual(backend_names[:2], ["bing", "duckduckgo"])
+        self.assertEqual(backend_names, ["duckduckgo"])
 
     def test_web_extract_quotes_chinese_url(self):
         raw_url = "https://example.com/zh-hans/2026年世界一级方程式锦标赛?kw=结果"
@@ -190,6 +190,69 @@ class ToolManagerLocalToolsTest(unittest.TestCase):
             )
         self.assertEqual(out, "总结结果")
         self.assertEqual(self.tm.last_web_search_results["backend"], "duckduckgo")
+
+    def test_web_search_fallback_uses_raw_results_when_filter_empty(self):
+        search_results = [
+            {
+                "title": "2024年夏季奥林匹克运动会乒乓球男子单打比赛",
+                "body": "樊振东 在决赛中获得冠军",
+                "href": "https://example.com/table-tennis",
+                "source": "duckduckgo",
+            }
+        ]
+        with patch.object(
+            self.tm.web_tool,
+            "_web_search_backend_order",
+            return_value=[("duckduckgo", Mock(return_value=search_results))],
+        ), patch.object(
+            self.tm.web_tool,
+            "_filter_relevant_results",
+            return_value=[],
+        ), patch.object(
+            self.tm.web_tool,
+            "web_extract",
+            return_value=[{"ok": True, "href": "https://example.com/table-tennis", "text": "detail"}],
+        ):
+            out = self.tm.available_functions[ToolNameConstant.WEB_SEARCH](
+                query="2024年世界乒乓球锦标赛男单冠军",
+                max_results=1,
+            )
+        self.assertEqual(out, "总结结果")
+        self.assertTrue(self.tm.last_web_search_results["fallback_used"])
+        self.assertEqual(self.tm.last_web_search_results["extracted_pages"][0]["text"], "detail")
+
+    def test_web_summary_input_avoids_repeated_body_for_extracted_pages(self):
+        results = [
+            {
+                "title": "已抓取页面",
+                "body": "这段摘要不应该重复发送",
+                "href": "https://example.com/ok",
+                "source": "duckduckgo",
+            },
+            {
+                "title": "抓取失败页面",
+                "body": "失败页面保留搜索摘要",
+                "href": "https://example.com/fail",
+                "source": "duckduckgo",
+            },
+        ]
+        pages = [
+            {"ok": True, "href": "https://example.com/ok", "title": "已抓取页面", "text": "正文详情"},
+            {
+                "ok": False,
+                "href": "https://example.com/fail",
+                "title": "抓取失败页面",
+                "error_type": "HTTPError",
+                "error": "HTTP Error 403: Forbidden",
+            },
+        ]
+        search_text = self.tm.web_tool._format_search_results(results, pages)
+        detail_text = self.tm.web_tool._format_extracted_pages(pages)
+
+        self.assertNotIn("这段摘要不应该重复发送", search_text)
+        self.assertIn("失败页面保留搜索摘要", search_text)
+        self.assertIn("读取失败: HTTPError", detail_text)
+        self.assertNotIn("HTTP Error 403: Forbidden", detail_text)
 
     def test_mcp_capability_parallel_read(self):
         tm = ToolManager(
@@ -256,6 +319,7 @@ def debug_web_search(query: str, max_results: int = 5) -> dict:
         start_time = time.perf_counter()
         try:
             # 直接调用搜索后端，绕过模型总结，方便看到标题、摘要、链接等原始搜索结果。
+            print(f"使用backend_name: {backend_name}执行搜索。。。")
             results = search_func(query, max_results)
             if results and not first_success_results:
                 first_success_results = results
@@ -269,6 +333,7 @@ def debug_web_search(query: str, max_results: int = 5) -> dict:
                 }
             )
         except Exception as error:
+            print(f"发生异常， {error}")
             backend_results.append(
                 {
                     "backend": backend_name,
@@ -282,6 +347,7 @@ def debug_web_search(query: str, max_results: int = 5) -> dict:
     if first_success_results:
         extract_start_time = time.perf_counter()
         try:
+            print("开始调用web_extract")
             extracted_pages = tool_manager.web_tool.web_extract(
                 first_success_results,
                 max_pages=min(max_results, 5),
@@ -317,6 +383,7 @@ def debug_web_search(query: str, max_results: int = 5) -> dict:
             "raw_search_results": tool_manager.last_web_search_results,
         },
     }
+    print("debug结果：")
     print(json.dumps(debug_result, ensure_ascii=False, indent=2))
     return debug_result
 

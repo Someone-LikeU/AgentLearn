@@ -14,4 +14,4 @@ sys.path.insert(0, project_root_str)
 from module_test.test_tool_manager import debug_web_search
 
 if __name__ == '__main__':
-	debug_web_search("2023赛季F1大奖赛积分榜", 5)
+	debug_web_search("F1方程式赛车2023赛季新加坡站", 5)
