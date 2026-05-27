@@ -989,12 +989,8 @@ class Agent:
                     "For details from an archived task, call LOAD_FULL_MEMORY_CONTEXT with the task_id."
                 ),
             },
-            {
-                "role": "assistant",
-                "content": "Understood. I will load archived task context by task_id when needed.",
-            },
-            {"role": "user", "content": load_prompt("conversation_compaction_summary_message.md", summary=summary)},
-            {"role": "assistant", "content": load_prompt("conversation_compaction_ack.md")},
+            {"role": "user", "content": load_prompt("conversation_compaction_summary_message.md", summary=summary) +
+             "\nContinue this conversation based on previous context."},
             *recent_messages
         ]
 
