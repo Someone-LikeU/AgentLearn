@@ -377,7 +377,16 @@ class Agent:
         :return:
         """
         self._model_client_bypass_proxy = self._is_local_model_base_url(base_url)
-        if self._model_client_bypass_proxy:
+        return self._build_openai_client(base_url, api_key)
+
+    def _build_openai_client(self, base_url: str | None, api_key: str | None) -> OpenAI:
+        """
+        创建不修改 Agent 运行状态的 OpenAI 兼容客户端。
+        :param base_url: 模型服务地址
+        :param api_key: API Key
+        :return:
+        """
+        if self._is_local_model_base_url(base_url):
             # 本地 Ollama 等 loopback 服务不应走 Clash 全局代理，否则 localhost 可能被代理层错误处理。
             return OpenAI(
                 base_url=base_url,
@@ -1716,6 +1725,7 @@ class Agent:
             ("bash approve off", "关闭 Bash 命令人工确认"),
             ("model_list/models", "查看可用模型配置"),
             ("model", "查看模型相关命令"),
+            ("model add", "新增模型配置并测试"),
             ("model <name|编号>", "切换到指定模型"),
             ("tools", "列出当前可用工具"),
             ("compact", "压缩当前会话上下文"),
@@ -1892,6 +1902,7 @@ class Agent:
             "model_list": self._handle_cmd_model_list,
             "models": self._handle_cmd_model_list,
             "model": self._handle_cmd_model_show_current,
+            "model add": self._handle_cmd_model_add,
             "tools": self._handle_cmd_tools,
             "clear": self._handle_cmd_clear_screen,
             "campact": self._handle_cmd_compact_history,
@@ -2037,7 +2048,75 @@ class Agent:
             "[dim]：切换模型，例如 [/][bold cyan]model[/] [bold green]1[/]"
             "[dim] 或 [/][bold cyan]model[/] [bold cyan]gpt-4o-mini[/]"
         )
+        self.console.print("[bold cyan]model add[/][dim]：新增模型配置[/]")
         self.console.print("[bold cyan]status[/][dim]：查看当前模型和 token 状态[/]")
+        return True, False
+
+    def _handle_cmd_model_add(self, confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
+        # 新增模型前先真实发送一条测试消息，避免把不可用配置写入模型列表。
+        model_name = self.console.input("[bold cyan]请输入模型名：[/] ").strip()
+        base_url = self.console.input("[bold cyan]请输入 base_url：[/] ").strip()
+        api_key = self.console.input("[bold cyan]请输入 api_key：[/] ").strip()
+        context_token_input = self.console.input("[bold cyan]请输入上下文窗口大小：[/] ").strip()
+
+        if not model_name or not base_url:
+            self.console.print("[yellow]模型名和 base_url 不能为空，已取消新增。[/]")
+            return True, False
+        if self._get_model_config_by_name(model_name):
+            self.console.print(f"[yellow]模型 {model_name} 已存在，已取消新增。[/]")
+            return True, False
+        try:
+            max_model_context_token = int(context_token_input)
+            if max_model_context_token <= 0:
+                raise ValueError
+        except ValueError:
+            self.console.print("[yellow]上下文窗口大小必须是正整数，已取消新增。[/]")
+            return True, False
+
+        self.console.print(f"[dim]正在测试新模型：[/][bold cyan]{model_name}[/]")
+        temp_client = None
+        try:
+            temp_client = self._build_openai_client(base_url, api_key)
+            test_response = temp_client.chat.completions.create(
+                model=model_name,
+                messages=[{"role": "user", "content": "Say this is a test"}],
+            )
+        except Exception as error:
+            self.console.print(
+                f"[yellow]模型信息错误，请检查模型名、base_url、api_key 和服务状态。"
+                f"错误类型：{type(error).__name__}；错误信息：{error}[/]"
+            )
+            return True, False
+        finally:
+            close_temp_client = getattr(temp_client, "close", None)
+            if callable(close_temp_client):
+                close_temp_client()
+
+        test_content = getattr(test_response.choices[0].message, "content", "")
+        self.console.print(f"[green]模型测试成功。响应：[/][dim]{test_content}[/]")
+
+        config = self._read_model_config()
+        config.setdefault("models", [])
+        config["models"].append(
+            {
+                "name": model_name,
+                "base_url": base_url,
+                "api_key": api_key,
+                "max_model_context_token": max_model_context_token,
+            }
+        )
+        self._write_model_config(config)
+        self.console.print("[green]模型配置已写入 agent/config/model_config.json[/]")
+
+        switch_input = self.console.input("[bold cyan]是否立即切换到新模型？(yes/y)[/] ").strip()
+        if self._normalize_command(switch_input) in confirm_choice:
+            self.model = model_name
+            self._apply_model_config_by_name(self.model)
+            self._max_context_tokens = self._load_model_context_window()
+            self.console.print(
+                f"[green]模型已切换为：{self.model}（上下文窗口：{self._max_context_tokens}）[/]"
+            )
+            self._print_runtime_status()
         return True, False
 
     def _resolve_model_selector(self, selector: str, available_models: list[str]) -> str | None:
@@ -2065,29 +2144,8 @@ class Agent:
         if target_model is None:
             return True, False
         if target_model not in available_models:
-            # 目标模型不在配置列表时，引导用户录入4个配置字段并写入 model_config.json。
-            self.console.print(f"[yellow]模型 {target_model} 未配置，开始新增模型配置。[/]")
-            base_url = self.console.input("[bold cyan]请输入 base_url：[/] ").strip()
-            api_key = self.console.input("[bold cyan]请输入 api_key：[/] ").strip()
-            context_token_input = self.console.input("[bold cyan]请输入 max_model_context_token：[/] ").strip()
-            try:
-                max_model_context_token = int(context_token_input)
-            except ValueError:
-                self.console.print("[red]max_model_context_token 必须是整数，已取消新增。[/]")
-                return True, False
-
-            config = self._read_model_config()
-            config.setdefault("models", [])
-            config["models"].append(
-                {
-                    "name": target_model,
-                    "base_url": base_url,
-                    "api_key": api_key,
-                    "max_model_context_token": max_model_context_token,
-                }
-            )
-            self._write_model_config(config)
-            self.console.print(f"[green]模型 {target_model} 配置已写入 model_config.json[/]")
+            self.console.print(f"[yellow]模型 {target_model} 未配置，请先使用 model add 新增并测试。[/]")
+            return True, False
 
         self.model = target_model
         self._apply_model_config_by_name(self.model)

@@ -12,13 +12,20 @@ client = OpenAI(
 )
 
 if __name__ == '__main__':
-    chat_completion = client.chat.completions.create(
-        messages=[
-            {
-                'role': 'user',
-                'content': 'who are you?',
-            }
-        ],
-        model='qwen3.5:9b',
-    )
-    print(chat_completion.choices[0].message.content)
+    try:
+        chat_completion = client.chat.completions.create(
+            messages=[
+                {
+                    'role': 'user',
+                    'content': 'Say "this is a test", do not do anything else.',
+                }
+            ],
+            model='deepseek-r1:14b',
+        )
+        print(chat_completion)
+    except Exception as error:
+        print(error)
+    finally:
+        close_client = getattr(client, "close", None)
+        if callable(close_client):
+            close_client()

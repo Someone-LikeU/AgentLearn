@@ -11,6 +11,12 @@
       "base_url": "https://api.longcat.chat/openai",
       "api_key": "ak_2Nu3Zp7IO0fa5M01Aa3xq6F66uh0k",
       "max_model_context_token": 1000000
+    },
+    {
+      "name": "deepseek-r1:14b",
+      "base_url": "http://localhost:11434/v1",
+      "api_key": "ollama",
+      "max_model_context_token": 131072
     }
   ]
 }
