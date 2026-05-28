@@ -2079,7 +2079,7 @@ class Agent:
             temp_client = self._build_openai_client(base_url, api_key)
             test_response = temp_client.chat.completions.create(
                 model=model_name,
-                messages=[{"role": "user", "content": "Say this is a test"}],
+                messages=[{"role": "user", "content": "Say 'this is a test', don't do anything else"}],
             )
         except Exception as error:
             self.console.print(
