@@ -33,6 +33,8 @@ class ToolFailureGuardState:
     tools_without_make_plan: list[dict[str, Any]] | None = None
     last_failure_key: tuple[str, str] | None = None
     consecutive_failure_count: int = 0
+    executed_tool_count: int = 0
+    completion_continue_count: int = 0
 
     def __post_init__(self):
         if self.tools_without_make_plan is None:
@@ -110,6 +112,7 @@ class Agent:
     _MIDDLE_COMPACT_RATIO = 0.3
     _KEEP_RECENT = 10
     _MAX_CONSECUTIVE_TOOL_FAILURES = 2
+    _MAX_TASK_COMPLETION_CONTINUES = 2
 
     def __init__(self, model="qwen3.5:9b",
                  temperature: float = 0.1,
@@ -263,6 +266,9 @@ class Agent:
         # 当前任务的完整上下文，用于保存长期记忆
         self._current_task_full_context = None
         self._current_task_start_index = None
+
+        # 当前会话的当前用户任务
+        self._current_task = None
 
     def _mcp_client_ping_ok(self) -> bool:
         """
@@ -1149,6 +1155,7 @@ class Agent:
             guard_state: ToolFailureGuardState,
     ):
         self._append_tool_result(task, function_response)
+        guard_state.executed_tool_count += 1
         if not self._is_tool_call_failure(function_response):
             guard_state.last_failure_key = None
             guard_state.consecutive_failure_count = 0
@@ -1239,7 +1246,7 @@ class Agent:
                 {"role": "user", "content": step},
                 session_metadata={"is_task_entry": False},
             )
-            result = self._run_agent_step(tools_without_make_plan)
+            result = self._run_agent_step(tools_without_make_plan, task_goal=step)
             print(f"[Step {step_cnt + 1}] result:{result}, all messages: {self.messages}")
             step_cnt += 1
             results.append(result)
@@ -1304,7 +1311,113 @@ class Agent:
 
         return self._execute_pending_tool_tasks(scheduler, pending_tasks, guard_state)
 
-    def _run_agent_step(self, tools):
+    def _is_trivial_task(self, task_goal: str) -> bool:
+        text = " ".join(str(task_goal or "").strip().lower().split())
+        trivial_tasks = {
+            "hi", "hello", "hey", "你好", "您好", "谢谢", "thanks", "thank you", "ok", "好的", "嗯",
+            "good bye", "see you", "再见", "yep", "good", "that's it", "alright", "yes, it is", "yes"
+        }
+        return text in trivial_tasks or len(text) <= 2
+
+    def _is_execution_task(self, task_goal: str) -> bool:
+        text = str(task_goal or "").lower()
+        keywords = (
+            "写", "创建", "生成", "修改", "修复", "实现", "重构", "整理", "搜索", "检查",
+            "删除", "运行", "测试", "分析", "阅读", "查找", "保存", "更新", "提交",
+            "write", "create", "generate", "modify", "fix", "implement", "refactor",
+            "search", "check", "delete", "run", "test", "analyze", "read", "find",
+            "save", "update", "commit",
+        )
+        return any(keyword in text for keyword in keywords)
+
+    def _looks_like_terminal_response(self, content: str | None) -> bool:
+        text = str(content or "").strip().lower()
+        if not text:
+            return False
+        terminal_markers = (
+            "需要你", "请提供", "请补充", "无法继续", "不能继续", "没有足够信息",
+            "已完成", "已经完成", "已保存", "已写入", "任务完成",
+            "need you", "please provide", "need more information", "cannot continue",
+            "unable to continue", "completed", "done", "saved",
+        )
+        return any(marker in text for marker in terminal_markers)
+
+    def _should_check_task_complete(
+            self,
+            task_goal: str | None,
+            message,
+            guard_state: ToolFailureGuardState,
+    ) -> bool:
+        if not task_goal:
+            return False
+        if guard_state.completion_continue_count >= self._MAX_TASK_COMPLETION_CONTINUES:
+            return False
+        if self._is_trivial_task(task_goal):
+            return False
+        if self._looks_like_terminal_response(getattr(message, "content", None)):
+            return False
+        # 计划步骤、工具链任务和执行型任务才需要额外判断，普通问答直接结束。
+        return self.plan_mode or guard_state.executed_tool_count > 0 or self._is_execution_task(task_goal)
+
+    def _completion_check_recent_messages(self, limit: int = 5) -> list[dict[str, Any]]:
+        recent_messages = []
+        for message in self.messages[-limit:]:
+            recent_messages.append(self._normalize_message_for_memory(message))
+        return recent_messages
+
+    def _parse_completion_status(self, answer: str | None) -> str:
+        text = str(answer or "").strip().upper()
+        normalized = text
+        for char in "{}[]():,;\"'":
+            normalized = normalized.replace(char, " ")
+        for status in ("DONE", "CONTINUE", "NEED_USER", "BLOCKED"):
+            if text.startswith(status) or status in normalized.split():
+                return status
+        return "DONE"
+
+    def _check_task_complete(self, task_goal: str, last_reply: str | None) -> str:
+        """
+        轻量检查当前执行目标是否完成，返回 DONE/CONTINUE/NEED_USER/BLOCKED。
+        """
+        recent_messages = json.dumps(
+            self._completion_check_recent_messages(),
+            ensure_ascii=False,
+            default=str,
+        )
+        check_prompt = load_prompt(
+            "task_completion_check_user.md",
+            task_goal=task_goal,
+            recent_messages=recent_messages,
+            last_reply=last_reply or "",
+        )
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": load_prompt("task_completion_check_system.md"),
+                    },
+                    {"role": "user", "content": check_prompt},
+                ],
+                temperature=0,
+            )
+        except Exception:
+            return "DONE"
+        self._update_usage_from_response(response)
+        answer = response.choices[0].message.content
+        return self._parse_completion_status(answer)
+
+    def _append_task_completion_continue_prompt(self, task_goal: str) -> None:
+        self._append_message(
+            {
+                "role": "user",
+                "content": load_prompt("task_completion_continue_user.md", task_goal=task_goal),
+            },
+            session_metadata={"is_task_entry": False, "task_completion_guard": True},
+        )
+
+    def _run_agent_step(self, tools, task_goal: str | None = None):
         active_tools = list(tools)
         tools_without_make_plan = (
             list(self._all_tools_without_make_plan)
@@ -1323,8 +1436,17 @@ class Agent:
             self._append_assistant_response(message)
 
             if not message.tool_calls:
-                return message.content
+                # 没有工具调用，可能是任务结束了，先判断然后再返回结果
+                if not self._should_check_task_complete(task_goal, message, guard_state):
+                    return message.content
 
+                status = self._check_task_complete(task_goal, message.content)
+                # 任务没有完成，需要继续
+                if status == "CONTINUE":
+                    guard_state.completion_continue_count += 1
+                    self._append_task_completion_continue_prompt(task_goal)
+                    continue
+                return message.content
             print(f"[Iter {i}]: message is: {message}")
             stop_reason = self._handle_tool_calls(message.tool_calls, guard_state)
             if stop_reason:
@@ -1642,7 +1764,11 @@ class Agent:
                 {"role": "user", "content": task},
                 session_metadata={"is_task_entry": True},
             )
-            final_result = self._run_agent_step(self._all_tools)
+            self._current_task = task
+            try:
+                final_result = self._run_agent_step(self._all_tools, task_goal=task)
+            finally:
+                self._current_task = None
             # print(f"final result: {final_result}")
             self._schedule_memory_update(task, final_result)
             if self.session_manager is not None:
