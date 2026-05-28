@@ -3,7 +3,7 @@
 import httpx
 from openai import OpenAI
 
-# token自由
+# token自由，运行时记得终端里先运行ollama serve
 client = OpenAI(
     base_url='http://localhost:11434/v1/',
     # required but ignored
