@@ -2,9 +2,15 @@
   "models": [
     {
       "name": "qwen3.5:9b",
-      "base_url": "http://localhost:5173/",
-      "api_key": "",
+      "base_url": "http://localhost:11434/v1",
+      "api_key": "ollama",
       "max_model_context_token": 258000
+    },
+    {
+      "name": "LongCat-Flash-Chat",
+      "base_url": "https://api.longcat.chat/openai",
+      "api_key": "ak_2Nu3Zp7IO0fa5M01Aa3xq6F66uh0k",
+      "max_model_context_token": 1000000
     }
   ]
 }

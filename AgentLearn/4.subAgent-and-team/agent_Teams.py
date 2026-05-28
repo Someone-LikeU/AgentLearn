@@ -1,6 +1,7 @@
 # encoding : utf-8
 # @Time    : 2026/4/19
 import atexit
+import httpx
 import json
 import os
 from dataclasses import dataclass, field
@@ -8,7 +9,8 @@ from pathlib import Path
 from threading import Thread, current_thread
 from types import SimpleNamespace
 from typing import Any
-from openai import OpenAI
+from urllib.parse import urlparse
+from openai import OpenAI, OpenAIError
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
@@ -142,10 +144,8 @@ class Agent:
         self._api_key = os.environ.get("OPENAI_API_KEY") if api_key is None else api_key
 
         # OpenAI 请求客户端
-        self.client = OpenAI(
-            base_url=self._base_url,
-            api_key=self._api_key,
-        )
+        self._model_client_bypass_proxy = False
+        self.client = self._create_openai_client(self._base_url, self._api_key)
 
         # 是否是主 Agent，False 表示由 Agent 创建的子 Agent，默认为 True。
         self._is_main_agent = is_main_agent
@@ -359,6 +359,54 @@ class Agent:
                 return model_info
         return None
 
+    def _is_local_model_base_url(self, base_url: str | None) -> bool:
+        """
+        判断模型地址是否是本机服务。
+        :param base_url: 模型服务地址
+        :return:
+        """
+        parsed = urlparse(base_url or "")
+        hostname = (parsed.hostname or "").lower()
+        return hostname in {"localhost", "127.0.0.1", "::1"}
+
+    def _create_openai_client(self, base_url: str | None, api_key: str | None) -> OpenAI:
+        """
+        根据模型地址创建 OpenAI 兼容客户端。
+        :param base_url: 模型服务地址
+        :param api_key: API Key
+        :return:
+        """
+        self._model_client_bypass_proxy = self._is_local_model_base_url(base_url)
+        if self._model_client_bypass_proxy:
+            # 本地 Ollama 等 loopback 服务不应走 Clash 全局代理，否则 localhost 可能被代理层错误处理。
+            return OpenAI(
+                base_url=base_url,
+                api_key=api_key,
+                http_client=httpx.Client(trust_env=False),
+            )
+        return OpenAI(
+            base_url=base_url,
+            api_key=api_key,
+        )
+
+    def _sync_model_runtime_dependencies(self):
+        """
+        模型客户端切换后同步依赖该客户端的运行时组件。
+        :return:
+        """
+        # ToolManager 和 MemoryManager 在初始化时持有 client/model，运行时切换模型后需要显式同步。
+        if hasattr(self, "memory_manager") and self.memory_manager is not None:
+            self.memory_manager.client = self.client
+            self.memory_manager.model = self.model
+            self.memory_manager.temperature = self.temperature
+        if hasattr(self, "_tool_manager") and self._tool_manager is not None:
+            self._tool_manager.client = self.client
+            self._tool_manager.model = self.model
+            self._tool_manager.temperature = self.temperature
+            if hasattr(self._tool_manager, "web_tool"):
+                self._tool_manager.web_tool.client = self.client
+                self._tool_manager.web_tool.model = self.model
+
     def _apply_model_config_by_name(self, model_name: str):
         """
         根据模型名应用模型配置（base_url/api_key）。
@@ -371,10 +419,8 @@ class Agent:
             return
         self._base_url = model_info.get("base_url") or self._base_url
         self._api_key = model_info.get("api_key") or self._api_key
-        self.client = OpenAI(
-            base_url=self._base_url,
-            api_key=self._api_key,
-        )
+        self.client = self._create_openai_client(self._base_url, self._api_key)
+        self._sync_model_runtime_dependencies()
 
     def receive(self, sender, message):
         """
@@ -989,8 +1035,7 @@ class Agent:
                     "For details from an archived task, call LOAD_FULL_MEMORY_CONTEXT with the task_id."
                 ),
             },
-            {"role": "user", "content": load_prompt("conversation_compaction_summary_message.md", summary=summary) +
-             "\nContinue this conversation based on previous context."},
+            {"role": "user", "content": load_prompt("conversation_compaction_summary_message.md", summary=summary)},
             *recent_messages
         ]
 
@@ -1511,6 +1556,43 @@ class Agent:
             return
         self.memory_manager.clear()
 
+    def _rollback_messages_to(self, start_index: int):
+        """
+        回滚短期上下文到指定位置。
+        :param start_index: 保留到的消息下标
+        :return:
+        """
+        # 模型请求失败时不保留本轮未完成上下文，避免切换模型后被旧任务污染。
+        if start_index < 0:
+            return
+        if len(self.messages) > start_index:
+            self.messages = self.messages[:start_index]
+
+    def _print_model_call_error(self, error: Exception):
+        """
+        使用 Rich 展示模型调用失败信息。
+        :param error: 模型调用异常
+        :return:
+        """
+        status_code = getattr(error, "status_code", None)
+        status_text = f"\n[yellow]状态码：[/] {status_code}" if status_code else ""
+        self.console.print(
+            Panel(
+                (
+                    "[bold red]模型调用失败，当前任务已中止。[/]\n\n"
+                    f"[yellow]当前模型：[/] {self.model}\n"
+                    f"[yellow]接口地址：[/] {self._base_url or '-'}"
+                    f"{status_text}\n"
+                    f"[yellow]错误类型：[/] {type(error).__name__}\n"
+                    f"[yellow]错误信息：[/] {error}\n\n"
+                    "[cyan]请检查模型配置、模型服务状态或网络代理；也可以使用 "
+                    "[bold]model <名称或编号>[/] 切换模型后重试。[/]"
+                ),
+                title="[bold red]Model Error[/]",
+                border_style="red",
+            )
+        )
+
     def chat(self, task):
         """
         Agent单次任务运行入口
@@ -1518,6 +1600,7 @@ class Agent:
         :return: 执行任务结果
         """
         self._ensure_session_started()
+        rollback_message_index = len(self.messages)
         # 初始化当前任务的完整上下文记录
         self._current_turn_id = (
             self.session_manager.create_turn_id()
@@ -1560,6 +1643,9 @@ class Agent:
         except KeyboardInterrupt:
             self._record_session_interrupted("keyboard_interrupt")
             raise
+        except OpenAIError:
+            self._rollback_messages_to(rollback_message_index)
+            raise
         finally:
             self._current_task_full_context = None
             self._current_turn_id = None
@@ -1593,6 +1679,9 @@ class Agent:
                 # 上面分支都没中，就是用户任务了
                 self.chat(user_input)
                 self.console.print()
+            except OpenAIError as error:
+                self._print_model_call_error(error)
+                self.console.print()
             except KeyboardInterrupt:
                 self._record_session_interrupted("keyboard_interrupt")
                 self._end_session()
@@ -1625,9 +1714,9 @@ class Agent:
             ("clear memory", "只清空长期记忆"),
             ("bash approve on", "开启 Bash 命令人工确认"),
             ("bash approve off", "关闭 Bash 命令人工确认"),
-            ("model_list", "查看可用模型配置"),
-            ("model", "查看当前模型"),
-            ("model <name>", "切换到指定模型"),
+            ("model_list/models", "查看可用模型配置"),
+            ("model", "查看模型相关命令"),
+            ("model <name|编号>", "切换到指定模型"),
             ("tools", "列出当前可用工具"),
             ("compact", "压缩当前会话上下文"),
             ("status", "查看当前运行状态"),
@@ -1689,6 +1778,8 @@ class Agent:
         # 抽取状态打印逻辑，便于启动时和配置变更后统一刷新展示。
         self.console.print(f"[dim]当前工作目录：{os.getcwd()}[/]")
         self.console.print(f"[dim]使用模型：{self.model}[/]")
+        proxy_mode = "本地直连（忽略系统代理）" if self._model_client_bypass_proxy else "默认网络环境"
+        self.console.print(f"[dim]模型连接方式：{proxy_mode}[/]")
         self.console.print(f"[dim]Bash 命令确认策略：{self._bash_approve_status_text()}[/]")
 
     def _print_input_header(self):
@@ -1778,7 +1869,7 @@ class Agent:
             return self._handle_cmd_session_load(confirm_choice, raw_parts[2].strip())
         # 支持带参数命令，例如 model gpt-4o-mini。
         if cmd.startswith("model "):
-            return self._handle_cmd_model_switch(confirm_choice, cmd)
+            return self._handle_cmd_model_switch(confirm_choice, raw_cmd)
         return False, False
 
     def _command_handler_map(self):
@@ -1799,6 +1890,7 @@ class Agent:
             "bash approve on": self._handle_cmd_bash_approve_on,
             "bash approve off": self._handle_cmd_bash_approve_off,
             "model_list": self._handle_cmd_model_list,
+            "models": self._handle_cmd_model_list,
             "model": self._handle_cmd_model_show_current,
             "tools": self._handle_cmd_tools,
             "clear": self._handle_cmd_clear_screen,
@@ -1924,28 +2016,54 @@ class Agent:
         # 列出当前已配置模型；若暂无配置则先保留为空实现提示。
         available_models = self._load_available_models()
         if not available_models:
-            self.console.print("[yellow]当前暂无可用模型配置，model_list 暂无可展示内容。[/]")
+            self.console.print("[yellow]当前暂无可用模型配置，model_list/models 暂无可展示内容。[/]")
             return True, False
         self.console.print("[dim]已配置模型列表：[/]")
         for index, model_name in enumerate(available_models, start=1):
-            marker = "（当前）" if model_name == self.model else ""
-            self.console.print(f"[dim]{index}. {model_name} {marker}[/]")
+            marker = " [bold green]（当前）[/]" if model_name == self.model else ""
+            self.console.print(f"[bold green]{index}[/]. [bold cyan]{model_name}[/]{marker}")
+        self.console.print(
+            "[dim]切换方式：[/][bold cyan]model[/] "
+            "[bold yellow]<模型名|编号>[/][dim]，例如 [/][bold cyan]model[/] [bold green]1[/]"
+        )
         return True, False
 
     def _handle_cmd_model_show_current(self, _confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
-        # 展示当前模型并提示如何切换。
-        self.console.print(f"[dim]当前使用模型：{self.model}[/]")
-        self.console.print("[dim]切换方式：model <模型名>，例如 model gpt-4o-mini[/]")
+        # 只输入 model 时展示模型相关命令，避免把 model 当成普通问题发给模型。
+        self.console.print(f"[dim]当前使用模型：[/][bold cyan]{self.model}[/]")
+        self.console.print("[bold cyan]model_list/models[/][dim]：查看可用模型配置[/]")
+        self.console.print(
+            "[bold cyan]model[/] [bold yellow]<模型名|编号>[/]"
+            "[dim]：切换模型，例如 [/][bold cyan]model[/] [bold green]1[/]"
+            "[dim] 或 [/][bold cyan]model[/] [bold cyan]gpt-4o-mini[/]"
+        )
+        self.console.print("[bold cyan]status[/][dim]：查看当前模型和 token 状态[/]")
         return True, False
 
+    def _resolve_model_selector(self, selector: str, available_models: list[str]) -> str | None:
+        normalized_selector = (selector or "").strip()
+        if not normalized_selector:
+            return None
+        if normalized_selector.isdigit():
+            selected_index = int(normalized_selector)
+            if selected_index < 1 or selected_index > len(available_models):
+                self.console.print(f"[yellow]模型编号超出范围：{normalized_selector}[/]")
+                return None
+            # 编号和 model_list/models 展示顺序保持一致。
+            return available_models[selected_index - 1]
+        return normalized_selector
+
     def _handle_cmd_model_switch(self, _confirm_choice: tuple[str, ...], cmd: str) -> tuple[bool, bool]:
-        # 处理 model <model_name> 命令，校验配置后执行切换。
-        target_model = cmd.split(" ", 1)[1].strip()
+        # 处理 model <model_name|编号> 命令，校验配置后执行切换。
+        target_selector = cmd.split(" ", 1)[1].strip()
         self.console.print(f"[dim]当前使用模型：{self.model}[/]")
-        if not target_model:
-            self.console.print("[yellow]请输入目标模型，例如：model gpt-4o-mini[/]")
+        if not target_selector:
+            self.console.print("[yellow]请输入目标模型，例如：model 1 或 model gpt-4o-mini[/]")
             return True, False
         available_models = self._load_available_models()
+        target_model = self._resolve_model_selector(target_selector, available_models)
+        if target_model is None:
+            return True, False
         if target_model not in available_models:
             # 目标模型不在配置列表时，引导用户录入4个配置字段并写入 model_config.json。
             self.console.print(f"[yellow]模型 {target_model} 未配置，开始新增模型配置。[/]")
