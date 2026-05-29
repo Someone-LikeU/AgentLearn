@@ -326,6 +326,24 @@ class ToolManager:
         # 对外入口保持简单，安全检查和日志由 hook 管道负责。
         return self._execute_bash_with_hooks(command)
 
+    def set_bash_auto_approve(self, enabled: bool) -> None:
+        """
+        设置 Bash 工具执行前是否自动确认。
+        :param enabled: True 表示自动确认，False 表示执行前人工确认
+        :return:
+        """
+        # Bash 安全策略状态统一由 ToolManager 持有，Agent 只负责展示和命令入口。
+        self._BASH_AUTO_APPROVE = bool(enabled)
+
+    def bash_approve_status_text(self) -> str:
+        """
+        返回 Bash 执行确认策略的展示文案。
+        :return:
+        """
+        if self._BASH_AUTO_APPROVE:
+            return "自动确认（无需手动确认）"
+        return "手动确认（每次需确认）"
+
     def _run_bash_command(self, command):
         # 只负责执行与解码；是否可执行由 before hook 决定。
         # 这里改为流式读取子进程输出，避免长命令执行期间控制台长时间无反馈。

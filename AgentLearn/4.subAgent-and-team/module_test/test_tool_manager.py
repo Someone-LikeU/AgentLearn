@@ -111,6 +111,19 @@ class ToolManagerLocalToolsTest(unittest.TestCase):
         out = self.tm.execute_bash("rm -rf /")
         self.assertIn("dangerous", out)
 
+    def test_bash_auto_approve_status_is_owned_by_tool_manager(self):
+        self.assertEqual(self.tm.bash_approve_status_text(), "自动确认（无需手动确认）")
+
+        self.tm.set_bash_auto_approve(False)
+
+        self.assertEqual(self.tm.bash_approve_status_text(), "手动确认（每次需确认）")
+        with patch("builtins.input", return_value="n"):
+            out = self.tm.execute_bash("echo skipped")
+        self.assertIn("skipped by user", out)
+
+        self.tm.set_bash_auto_approve(True)
+        self.assertEqual(self.tm.bash_approve_status_text(), "自动确认（无需手动确认）")
+
     def test_web_search(self):
         search_results = [{"title": "test result", "body": "b", "href": "https://example.com", "source": "duckduckgo"}]
         with patch.object(

@@ -81,32 +81,6 @@ class StreamResponseState:
 class Agent:
     """支持本地工具 + MCP工具的Agent。"""
 
-    # Bash 命令黑名单：只放明确高风险、不可自动执行的模式。
-    # 这里同时覆盖 Linux/macOS 常见危险命令和 Windows 批量删除命令。
-    _BASH_DANGEROUS_PATTERNS: tuple[str, ...] = (
-        r'\brm\s+(-[a-zA-Z]*f[a-zA-Z]*\s+|.*--no-preserve-root)',
-        r'\brm\s+(-[a-zA-Z]*r[a-zA-Z]*\s+)?/',
-        r'\bmkfs\b',
-        r'\bdd\s+.*of\s*=\s*/dev/',
-        r'>\s*/dev/sd[a-z]',
-        r'\bchmod\s+(-R\s+)?777\s+/',
-        r':\(\)\s*\{',
-        r'\bcurl\b.*\|\s*(ba)?sh',
-        r'\bwget\b.*\|\s*(ba)?sh',
-        r'\bshutdown\b',
-        r'\breboot\b',
-        r'\bdd\s+if\s*=',
-        r'\bdel\s+/s\b',
-        r'\brd\s+/s\b',
-        r'\brmdir\s+/s\b',
-        r'\bRemove-Item\b',
-        r'\brm\s+-rf\b',
-    )
-    # 默认不弹出交互确认，避免子 Agent 批量执行任务时阻塞。
-    # 如需人工确认，可在实例或类上改为 False。
-    _BASH_AUTO_APPROVE = True
-    # 目前没有默认加入 after hook，保留给后续控制超长输出时使用。
-    _BASH_MAX_OUTPUT_LENGTH = 5000
     _DEFAULT_CONTEXT_WINDOW = 32768
     _COMPACT_TRIGGER_RATIO = 0.8
     _MIDDLE_COMPACT_RATIO = 0.3
@@ -766,22 +740,18 @@ class Agent:
 
     def set_bash_auto_approve(self, enabled: bool):
         """
-        设置当前 Agent 的 Bash 命令是否自动确认执行。
+        设置 Bash 工具是否自动确认执行。
         :param enabled: True 表示自动确认，False 表示需要手动确认
         :return:
         """
-        # 支持运行时切换 Bash 自动确认配置，便于用户动态控制安全策略。
-        self._BASH_AUTO_APPROVE = bool(enabled)
+        self._tool_manager.set_bash_auto_approve(enabled)
 
     def _bash_approve_status_text(self) -> str:
         """
         返回当前 Bash 执行确认策略的文本描述。
         :return:
         """
-        # 统一管理状态文案，避免 run() 中重复拼接字符串。
-        if self._BASH_AUTO_APPROVE:
-            return "自动确认（无需手动确认）"
-        return "手动确认（每次需确认）"
+        return self._tool_manager.bash_approve_status_text()
 
     def _record_session_message(self, message, turn_id=None, metadata=None):
         """
