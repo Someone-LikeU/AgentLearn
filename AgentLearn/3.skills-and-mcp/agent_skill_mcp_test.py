@@ -1,11 +1,12 @@
 from agent_skill_mcp import Agent
 import sys
+import os
 
 
 if __name__ == '__main__':
 	# 美团龙猫模型
-	API_KEY = "ak_2Nu3Zp7IO0fa5M01Aa3xq6F66uh0k"
-	BASE_URL = "https://api.longcat.chat/openai"
+	API_KEY = os.environ.get("LONGCAT_API_KEY", "NO")
+	BASE_URL = os.environ.get("LONGCAT_BASE_URL", "NO")
 	MODEL = "LongCat-Flash-Lite"
 	myAgent = Agent(
 		model=MODEL,
