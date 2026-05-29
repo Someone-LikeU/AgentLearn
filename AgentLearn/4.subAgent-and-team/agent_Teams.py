@@ -2205,7 +2205,7 @@ class Agent:
             temp_client = self._build_openai_client(base_url, api_key)
             test_response = temp_client.chat.completions.create(
                 model=model_name,
-                messages=[{"role": "user", "content": "Say 'this is a test', don't do anything else"}],
+                messages=[{"role": "user", "content": "Say 'Hello', don't do anything else"}],
             )
         except Exception as error:
             self.console.print(
@@ -2780,19 +2780,7 @@ def plan_team(task):
 
 def run_team(task):
     return TeamOrchestrator().run(task)
-"""
-TODO 压缩方案优化方向：
- 压缩前先写回永久记忆，（问GPT，先实现永久记忆用RAG （用chroma 向量数据库）， 还是先实现这里的写回永久记忆
- 触发条件：	消息条数超过固定阈值  ->	基于 token 数精确计算，考虑模型的实际窗口大小
-压缩方式：	一次性把所有旧消息压缩成一段摘要 ->	分层压缩：最近的保留原文，稍远的做摘要，更远的只保留关键事实
-保留策略：	固定保留最近 N 条   ->	智能选择：保留包含文件路径、错误信息等关键消息
-摘要质量：	通用摘要 prompt	-> 针对 coding 场景优化的摘要 prompt，确保保留文件路径、代码片段、决策原因
- 
-"""
 
-# TODO 优化：每次启动的会话中所有短期记忆在退出时都写到磁盘的长期记忆里
-# TODO 优化：短期记忆的加载方式以及系统提示
-# TODO 优化思考：当前通过 MemoryManager 在一次 chat(task) 期间保存“本任务上下文快照”，并异步写入 agent/memory/full_context。
 
 if __name__ == "__main__":
     from agent_run import AgentRunner

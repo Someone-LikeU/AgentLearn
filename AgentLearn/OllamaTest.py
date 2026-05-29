@@ -2,12 +2,13 @@
 # @File    : OllamaTest.py
 import httpx
 from openai import OpenAI
+import os
 
 # token自由，运行时记得终端里先运行ollama serve
 client = OpenAI(
-    base_url='http://localhost:11434/v1/',
+    base_url=os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434/v1/"),
     # required but ignored
-    api_key='ollama',
+    api_key=os.environ.get("OLLAMA_API_KEY", "ollama"),
     http_client=httpx.Client(trust_env=False),
 )
 
