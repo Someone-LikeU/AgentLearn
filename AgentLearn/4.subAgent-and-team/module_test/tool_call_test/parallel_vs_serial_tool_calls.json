@@ -191,8 +191,8 @@
       ]
     }
   ],
-  "parallel_elapsed_seconds": 0.4165,
-  "serial_elapsed_seconds": 0.7964,
+  "parallel_elapsed_seconds": 0.4167,
+  "serial_elapsed_seconds": 0.8009,
   "parallel_results": [
     {
       "task_id": "call_read_file",
@@ -209,7 +209,7 @@
       "result": {
         "tool_call_id": "call_list_dir",
         "function_name": "LIST_DIR",
-        "response": "[file] __init__.py\n[dir] __pycache__\n[file] mcp_test.py\n[dir] session_copy\n[dir] session_rebuild\n[dir] session_test\n[file] test_agent_history_command.py\n[file] test_agent_stream_response.py\n[file] test_memory_manager.py\n[file] test_session_manager.py\n[file] test_session_manager.py.bak\n[file] test_session_manager.py.bak2\n[file] test_session_manager.py.bak3\n[file] test_task_history_viewer.py\n[file] test_tool_manager.py\n[dir] tool_call_test\n[file] web_search_smoke_test.py\n[file] web_search_test.py"
+        "response": "[file] __init__.py\n[dir] __pycache__\n[file] mcp_test.py\n[dir] session_copy\n[dir] session_rebuild\n[dir] session_test\n[file] test_agent_completion_guard.py\n[file] test_agent_history_command.py\n[file] test_agent_stream_response.py\n[file] test_memory_manager.py\n[file] test_session_manager.py\n[file] test_session_manager.py.bak\n[file] test_session_manager.py.bak2\n[file] test_session_manager.py.bak3\n[file] test_task_history_viewer.py\n[file] test_tool_manager.py\n[dir] tool_call_test\n[file] web_search_smoke_test.py\n[file] web_search_test.py"
       }
     },
     {
@@ -218,7 +218,7 @@
       "result": {
         "tool_call_id": "call_glob",
         "function_name": "GLOB",
-        "response": "C:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_tool_manager.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_task_history_viewer.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\web_search_test.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_agent_stream_response.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_agent_history_command.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_session_manager.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\web_search_smoke_test.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\__init__.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_memory_manager.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\mcp_test.py"
+        "response": "C:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_tool_manager.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_agent_completion_guard.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_task_history_viewer.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\web_search_test.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_agent_stream_response.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_agent_history_command.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_session_manager.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\web_search_smoke_test.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\__init__.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_memory_manager.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\mcp_test.py"
       }
     },
     {
@@ -227,7 +227,7 @@
       "result": {
         "tool_call_id": "call_read_agent_teams",
         "function_name": "READ_FILE",
-        "response": "   1 # encoding : utf-8\n   2 # @Time    : 2026/4/19\n   3 import atexit\n   4 import json\n   5 import os\n"
+        "response": "   1 # encoding : utf-8\n   2 # @Time    : 2026/4/19\n   3 import atexit\n   4 import httpx\n   5 import json\n"
       }
     },
     {
@@ -236,7 +236,7 @@
       "result": {
         "tool_call_id": "call_get_time",
         "function_name": "GET_TIME",
-        "response": "2026-05-27 17:18:07"
+        "response": "2026-05-29 11:47:01"
       }
     },
     {
@@ -305,7 +305,7 @@
       "result": {
         "tool_call_id": "call_list_dir",
         "function_name": "LIST_DIR",
-        "response": "[file] __init__.py\n[dir] __pycache__\n[file] mcp_test.py\n[dir] session_copy\n[dir] session_rebuild\n[dir] session_test\n[file] test_agent_history_command.py\n[file] test_agent_stream_response.py\n[file] test_memory_manager.py\n[file] test_session_manager.py\n[file] test_session_manager.py.bak\n[file] test_session_manager.py.bak2\n[file] test_session_manager.py.bak3\n[file] test_task_history_viewer.py\n[file] test_tool_manager.py\n[dir] tool_call_test\n[file] web_search_smoke_test.py\n[file] web_search_test.py"
+        "response": "[file] __init__.py\n[dir] __pycache__\n[file] mcp_test.py\n[dir] session_copy\n[dir] session_rebuild\n[dir] session_test\n[file] test_agent_completion_guard.py\n[file] test_agent_history_command.py\n[file] test_agent_stream_response.py\n[file] test_memory_manager.py\n[file] test_session_manager.py\n[file] test_session_manager.py.bak\n[file] test_session_manager.py.bak2\n[file] test_session_manager.py.bak3\n[file] test_task_history_viewer.py\n[file] test_tool_manager.py\n[dir] tool_call_test\n[file] web_search_smoke_test.py\n[file] web_search_test.py"
       }
     },
     {
@@ -314,7 +314,7 @@
       "result": {
         "tool_call_id": "call_glob",
         "function_name": "GLOB",
-        "response": "C:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_tool_manager.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_task_history_viewer.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\web_search_test.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_agent_stream_response.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_agent_history_command.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_session_manager.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\web_search_smoke_test.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\__init__.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_memory_manager.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\mcp_test.py"
+        "response": "C:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_tool_manager.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_agent_completion_guard.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_task_history_viewer.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\web_search_test.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_agent_stream_response.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_agent_history_command.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_session_manager.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\web_search_smoke_test.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\__init__.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_memory_manager.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\mcp_test.py"
       }
     },
     {
@@ -323,7 +323,7 @@
       "result": {
         "tool_call_id": "call_read_agent_teams",
         "function_name": "READ_FILE",
-        "response": "   1 # encoding : utf-8\n   2 # @Time    : 2026/4/19\n   3 import atexit\n   4 import json\n   5 import os\n"
+        "response": "   1 # encoding : utf-8\n   2 # @Time    : 2026/4/19\n   3 import atexit\n   4 import httpx\n   5 import json\n"
       }
     },
     {
@@ -332,7 +332,7 @@
       "result": {
         "tool_call_id": "call_get_time",
         "function_name": "GET_TIME",
-        "response": "2026-05-27 17:18:07"
+        "response": "2026-05-29 11:47:02"
       }
     },
     {
@@ -385,7 +385,7 @@
       }
     }
   ],
-  "result_equal": true,
+  "result_equal": false,
   "parallel_results_normalized": [
     {
       "task_id": "call_read_file",
@@ -402,7 +402,7 @@
       "result": {
         "tool_call_id": "call_list_dir",
         "function_name": "LIST_DIR",
-        "response": "[file] __init__.py\n[dir] __pycache__\n[file] mcp_test.py\n[dir] session_copy\n[dir] session_rebuild\n[dir] session_test\n[file] test_agent_history_command.py\n[file] test_agent_stream_response.py\n[file] test_memory_manager.py\n[file] test_session_manager.py\n[file] test_session_manager.py.bak\n[file] test_session_manager.py.bak2\n[file] test_session_manager.py.bak3\n[file] test_task_history_viewer.py\n[file] test_tool_manager.py\n[dir] tool_call_test\n[file] web_search_smoke_test.py\n[file] web_search_test.py"
+        "response": "[file] __init__.py\n[dir] __pycache__\n[file] mcp_test.py\n[dir] session_copy\n[dir] session_rebuild\n[dir] session_test\n[file] test_agent_completion_guard.py\n[file] test_agent_history_command.py\n[file] test_agent_stream_response.py\n[file] test_memory_manager.py\n[file] test_session_manager.py\n[file] test_session_manager.py.bak\n[file] test_session_manager.py.bak2\n[file] test_session_manager.py.bak3\n[file] test_task_history_viewer.py\n[file] test_tool_manager.py\n[dir] tool_call_test\n[file] web_search_smoke_test.py\n[file] web_search_test.py"
       }
     },
     {
@@ -411,7 +411,7 @@
       "result": {
         "tool_call_id": "call_glob",
         "function_name": "GLOB",
-        "response": "C:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_tool_manager.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_task_history_viewer.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\web_search_test.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_agent_stream_response.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_agent_history_command.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_session_manager.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\web_search_smoke_test.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\__init__.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_memory_manager.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\mcp_test.py"
+        "response": "C:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_tool_manager.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_agent_completion_guard.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_task_history_viewer.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\web_search_test.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_agent_stream_response.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_agent_history_command.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_session_manager.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\web_search_smoke_test.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\__init__.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_memory_manager.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\mcp_test.py"
       }
     },
     {
@@ -420,7 +420,7 @@
       "result": {
         "tool_call_id": "call_read_agent_teams",
         "function_name": "READ_FILE",
-        "response": "   1 # encoding : utf-8\n   2 # @Time    : 2026/4/19\n   3 import atexit\n   4 import json\n   5 import os\n"
+        "response": "   1 # encoding : utf-8\n   2 # @Time    : 2026/4/19\n   3 import atexit\n   4 import httpx\n   5 import json\n"
       }
     },
     {
@@ -498,7 +498,7 @@
       "result": {
         "tool_call_id": "call_list_dir",
         "function_name": "LIST_DIR",
-        "response": "[file] __init__.py\n[dir] __pycache__\n[file] mcp_test.py\n[dir] session_copy\n[dir] session_rebuild\n[dir] session_test\n[file] test_agent_history_command.py\n[file] test_agent_stream_response.py\n[file] test_memory_manager.py\n[file] test_session_manager.py\n[file] test_session_manager.py.bak\n[file] test_session_manager.py.bak2\n[file] test_session_manager.py.bak3\n[file] test_task_history_viewer.py\n[file] test_tool_manager.py\n[dir] tool_call_test\n[file] web_search_smoke_test.py\n[file] web_search_test.py"
+        "response": "[file] __init__.py\n[dir] __pycache__\n[file] mcp_test.py\n[dir] session_copy\n[dir] session_rebuild\n[dir] session_test\n[file] test_agent_completion_guard.py\n[file] test_agent_history_command.py\n[file] test_agent_stream_response.py\n[file] test_memory_manager.py\n[file] test_session_manager.py\n[file] test_session_manager.py.bak\n[file] test_session_manager.py.bak2\n[file] test_session_manager.py.bak3\n[file] test_task_history_viewer.py\n[file] test_tool_manager.py\n[dir] tool_call_test\n[file] web_search_smoke_test.py\n[file] web_search_test.py"
       }
     },
     {
@@ -507,7 +507,7 @@
       "result": {
         "tool_call_id": "call_glob",
         "function_name": "GLOB",
-        "response": "C:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_tool_manager.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_task_history_viewer.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\web_search_test.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_agent_stream_response.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_agent_history_command.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_session_manager.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\web_search_smoke_test.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\__init__.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_memory_manager.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\mcp_test.py"
+        "response": "C:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_tool_manager.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_agent_completion_guard.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_task_history_viewer.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\web_search_test.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_agent_stream_response.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_agent_history_command.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_session_manager.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\web_search_smoke_test.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\__init__.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\test_memory_manager.py\nC:\\Users\\13266\\PycharmProjects\\AgentLearn\\AgentLearn\\4.subAgent-and-team\\module_test\\mcp_test.py"
       }
     },
     {
@@ -516,7 +516,7 @@
       "result": {
         "tool_call_id": "call_read_agent_teams",
         "function_name": "READ_FILE",
-        "response": "   1 # encoding : utf-8\n   2 # @Time    : 2026/4/19\n   3 import atexit\n   4 import json\n   5 import os\n"
+        "response": "   1 # encoding : utf-8\n   2 # @Time    : 2026/4/19\n   3 import atexit\n   4 import httpx\n   5 import json\n"
       }
     },
     {

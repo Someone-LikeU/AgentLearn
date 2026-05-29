@@ -1,12 +1,22 @@
 from agent_Teams import Agent
+import os
 
 from mcp_client import create_tcp_mcp_client
 
 if __name__ == '__main__':
-	# 美团龙猫模型
-	API_KEY = "ak_2Nu3Zp7IO0fa5M01Aa3xq6F66uh0k"
-	BASE_URL = "https://api.longcat.chat/openai"
-	MODEL = "LongCat-Flash-Chat"
+	"""
+	美团龙猫LongCat-Flash-Chat
+	LONGCAT_API_KEY
+	LONGCAT_BASE_URL
+	
+	智普  glm-4.5-air
+	GLM_4_5_AIR_API_KEY
+	GLM_4_5_AIR_BASE_URL
+	"""
+	
+	API_KEY = os.environ.get("GLM_4_5_AIR_API_KEY", "NO")
+	BASE_URL = os.environ.get("GLM_4_5_AIR_BASE_URL", "NO")
+	MODEL = "glm-4.5-air"
 	mcp_client = None
 	server_process = None
 	try:
@@ -33,7 +43,3 @@ if __name__ == '__main__':
 			# 只关闭本入口自动启动的 MCP server，不影响用户手动启动的外部服务。
 			server_process.terminate()
 			server_process.wait(timeout=3)
-	
-	
-	# TODO 4.28晚调试记录:天气和机票工具不可用，应该是进程没就绪的问题。2.网络搜索工具不可用，看响应的工具调用找到了这个工具，但是接着就直接失败了，或许还要优化一下提示词。
-	# TODO 此外，要用mcp 客户端的tcp模式的话，还要加一段代码先启动tcp server

@@ -2,21 +2,33 @@
   "models": [
     {
       "name": "qwen3.5:9b",
-      "base_url": "http://localhost:11434/v1",
-      "api_key": "ollama",
+      "base_url_env": "OLLAMA_BASE_URL",
+      "api_key_env": "OLLAMA_API_KEY",
       "max_model_context_token": 258000
     },
     {
       "name": "LongCat-Flash-Chat",
-      "base_url": "https://api.longcat.chat/openai",
-      "api_key": "ak_2Nu3Zp7IO0fa5M01Aa3xq6F66uh0k",
+      "base_url_env": "LONGCAT_BASE_URL",
+      "api_key_env": "LONGCAT_API_KEY",
       "max_model_context_token": 1000000
     },
     {
       "name": "deepseek-r1:14b",
-      "base_url": "http://localhost:11434/v1",
-      "api_key": "ollama",
+      "base_url_env": "OLLAMA_BASE_URL",
+      "api_key_env": "OLLAMA_API_KEY",
       "max_model_context_token": 131072
+    },
+    {
+      "name": "glm-4.5-air",
+      "base_url_env": "GLM_4_5_AIR_BASE_URL",
+      "api_key_env": "GLM_4_5_AIR_API_KEY",
+      "max_model_context_token": 128000
+    },
+    {
+      "name": "glm-4.6v",
+      "base_url_env": "GLM_4_6V_BASE_URL",
+      "api_key_env": "GLM_4_6V_API_KEY",
+      "max_model_context_token": 200000
     }
   ]
 }

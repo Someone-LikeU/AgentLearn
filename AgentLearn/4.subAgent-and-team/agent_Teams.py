@@ -4,6 +4,9 @@ import atexit
 import httpx
 import json
 import os
+import re
+import subprocess
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Thread, current_thread
@@ -78,6 +81,18 @@ class StreamResponseState:
         return "".join(self.content_parts)
 
 
+@dataclass
+class PendingModelConfig:
+    """待新增模型配置，测试成功后才写入配置文件。"""
+
+    model_name: str
+    base_url: str
+    api_key: str
+    base_url_env: str
+    api_key_env: str
+    max_model_context_token: int
+
+
 class Agent:
     """支持本地工具 + MCP工具的Agent。"""
 
@@ -115,6 +130,7 @@ class Agent:
         self.inbox = []
 
         # base_url
+        explicit_model_connection = base_url is not None or api_key is not None
         self._base_url = os.environ.get("OPENAI_BASE_URL") if base_url is None else base_url
 
         # api_key
@@ -122,6 +138,7 @@ class Agent:
 
         # OpenAI 请求客户端
         self._model_client_bypass_proxy = False
+        self._missing_model_env_vars = []
         self.client = self._create_openai_client(self._base_url, self._api_key)
 
         # 是否是主 Agent，False 表示由 Agent 创建的子 Agent，默认为 True。
@@ -132,8 +149,11 @@ class Agent:
 
         # 使用模型
         self.model = model
-        # 根据传入模型从 model_config.json 读取模型配置（base_url/api_key/上下文窗口等）。
-        self._apply_model_config_by_name(self.model)
+        # 显式传入连接信息时优先使用传参；否则再按模型配置解析环境变量引用。
+        if explicit_model_connection:
+            self._missing_model_env_vars = []
+        else:
+            self._apply_model_config_by_name(self.model)
         self._max_context_tokens = self._load_model_context_window()
         # 记录最近一次模型调用的已使用 token 和总 token（来自 OpenAI 标准 usage 字段）。
         self._used_token = 0
@@ -339,6 +359,113 @@ class Agent:
                 return model_info
         return None
 
+    def _normalize_model_env_prefix(self, model_name: str) -> str:
+        """
+        根据模型名生成适合环境变量使用的前缀。
+        :param model_name: 模型名
+        :return:
+        """
+        # 环境变量名只保留字母、数字和下划线，避免模型名里的冒号、点号、横线影响系统环境变量。
+        prefix = re.sub(r"[^0-9A-Za-z]+", "_", str(model_name or "")).strip("_").upper()
+        return prefix or "MODEL"
+
+    def _model_env_var_names(self, model_name: str) -> tuple[str, str]:
+        """
+        生成模型连接信息对应的环境变量名。
+        :param model_name: 模型名
+        :return: (base_url_env, api_key_env)
+        """
+        prefix = self._normalize_model_env_prefix(model_name)
+        return f"{prefix}_BASE_URL", f"{prefix}_API_KEY"
+
+    def _resolve_model_connection_config(self, model_info: dict) -> tuple[str | None, str | None, list[str]]:
+        """
+        从模型配置中解析真实 base_url/api_key。
+        :param model_info: model_config.json 中的单个模型配置
+        :return: (base_url, api_key, missing_env_vars)
+        """
+        missing_env_vars: list[str] = []
+
+        base_url_env = model_info.get("base_url_env")
+        if base_url_env:
+            base_url = os.environ.get(str(base_url_env))
+            if base_url is None:
+                missing_env_vars.append(str(base_url_env))
+        else:
+            base_url = model_info.get("base_url")
+
+        api_key_env = model_info.get("api_key_env")
+        if api_key_env:
+            api_key = os.environ.get(str(api_key_env))
+            if api_key is None:
+                missing_env_vars.append(str(api_key_env))
+        else:
+            api_key = model_info.get("api_key")
+
+        return base_url, api_key, missing_env_vars
+
+    def _set_persistent_environment_variable(self, name: str, value: str) -> tuple[bool, str | None]:
+        """
+        写入当前进程和当前用户环境变量。
+        :param name: 环境变量名
+        :param value: 环境变量值
+        :return: (是否成功, 错误信息)
+        """
+        os.environ[name] = value
+        if os.name != "nt":
+            return True, "当前平台仅已写入本进程环境变量，请手动写入 shell profile 后再开启新终端。"
+
+        try:
+            env = os.environ.copy()
+            env["AGENTLEARN_ENV_NAME"] = name
+            env["AGENTLEARN_ENV_VALUE"] = value
+            subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "[Environment]::SetEnvironmentVariable($env:AGENTLEARN_ENV_NAME,$env:AGENTLEARN_ENV_VALUE,'User')",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=env,
+            )
+        except Exception as error:
+            return False, str(error)
+        return True, None
+
+    def _persist_environment_variables_async(self, env_vars: dict[str, str]) -> None:
+        """
+        后台持久化环境变量，避免 model add 前台等待 PowerShell 写入。
+        :param env_vars: 环境变量名和值
+        :return:
+        """
+        # 当前进程先同步写入，保证本次运行立即可用；Windows 用户环境变量持久化交给后台线程。
+        for name, value in env_vars.items():
+            os.environ[name] = value
+
+        def _persist_worker():
+            for env_name, env_value in env_vars.items():
+                ok, warning_or_error = self._set_persistent_environment_variable(env_name, env_value)
+                if not ok:
+                    self.console.print(f"[yellow]后台写入环境变量 {env_name} 失败：{warning_or_error}[/]")
+                    continue
+                if warning_or_error:
+                    self.console.print(f"[yellow]{warning_or_error}[/]")
+                else:
+                    self.console.print(f"[green]后台环境变量 {env_name} 持久化完成。[/]")
+            self.console.print("[dim]环境变量后台写入任务已结束；新开的终端才能自动继承这些变量。[/]")
+
+        Thread(
+            target=_persist_worker,
+            daemon=True,
+            name="model-env-persister",
+        ).start()
+
     def _is_local_model_base_url(self, base_url: str | None) -> bool:
         """
         判断模型地址是否是本机服务。
@@ -396,20 +523,26 @@ class Agent:
                 self._tool_manager.web_tool.client = self.client
                 self._tool_manager.web_tool.model = self.model
 
-    def _apply_model_config_by_name(self, model_name: str):
+    def _apply_model_config_by_name(self, model_name: str) -> bool:
         """
         根据模型名应用模型配置（base_url/api_key）。
         :param model_name: 模型名
-        :return:
+        :return: 是否成功应用模型连接配置
         """
         # 在不改变初始化接口的前提下，按模型配置自动补全连接信息。
         model_info = self._get_model_config_by_name(model_name)
         if not model_info:
-            return
-        self._base_url = model_info.get("base_url") or self._base_url
-        self._api_key = model_info.get("api_key") or self._api_key
+            self._missing_model_env_vars = []
+            return False
+        base_url, api_key, missing_env_vars = self._resolve_model_connection_config(model_info)
+        self._missing_model_env_vars = missing_env_vars
+        if missing_env_vars:
+            return False
+        self._base_url = base_url if base_url is not None else self._base_url
+        self._api_key = api_key if api_key is not None else self._api_key
         self.client = self._create_openai_client(self._base_url, self._api_key)
         self._sync_model_runtime_dependencies()
+        return True
 
     def receive(self, sender, message):
         """
@@ -1886,6 +2019,9 @@ class Agent:
         self.console.print(f"[dim]使用模型：{self.model}[/]")
         proxy_mode = "本地直连（忽略系统代理）" if self._model_client_bypass_proxy else "默认网络环境"
         self.console.print(f"[dim]模型连接方式：{proxy_mode}[/]")
+        if self._missing_model_env_vars:
+            missing_names = ", ".join(self._missing_model_env_vars)
+            self.console.print(f"[yellow]模型环境变量缺失：{missing_names}[/]")
         self.console.print(f"[dim]Bash 命令确认策略：{self._bash_approve_status_text()}[/]")
 
     def _print_input_header(self):
@@ -1907,6 +2043,93 @@ class Agent:
         if cmd.startswith("/"):
             cmd = cmd[1:].strip()
         return cmd
+
+    def _input_masked_secret(self, prompt: str, mask: str = "*") -> str:
+        """
+        读取敏感输入，同时用固定掩码字符反馈输入长度。
+        :param prompt: 输入提示
+        :param mask: 掩码字符
+        :return: 用户输入的原始内容
+        """
+        try:
+            self.console.print(prompt, end="")
+            if os.name == "nt":
+                return self._read_masked_secret_windows(mask)
+            return self._read_masked_secret_posix(mask)
+        except (KeyboardInterrupt, EOFError):
+            raise
+        except Exception:
+            # 回退到 Rich 的隐藏输入，避免特殊终端下自定义按键读取失败。
+            self.console.print()
+            return self.console.input(prompt, password=True)
+
+    def _read_masked_secret_windows(self, mask: str) -> str:
+        """
+        Windows 终端下逐字符读取敏感输入。
+        :param mask: 掩码字符
+        :return: 用户输入的原始内容
+        """
+        import msvcrt
+
+        chars: list[str] = []
+        while True:
+            char = msvcrt.getwch()
+            if char in ("\r", "\n"):
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                return "".join(chars)
+            if char == "\x03":
+                raise KeyboardInterrupt
+            if char == "\x1a":
+                raise EOFError
+            if char in ("\b", "\x7f"):
+                if chars:
+                    chars.pop()
+                    sys.stdout.write("\b \b")
+                    sys.stdout.flush()
+                continue
+            if char in ("\x00", "\xe0"):
+                msvcrt.getwch()
+                continue
+            chars.append(char)
+            sys.stdout.write(mask)
+            sys.stdout.flush()
+
+    def _read_masked_secret_posix(self, mask: str) -> str:
+        """
+        POSIX 终端下逐字符读取敏感输入。
+        :param mask: 掩码字符
+        :return: 用户输入的原始内容
+        """
+        import termios
+        import tty
+
+        file_descriptor = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(file_descriptor)
+        chars: list[str] = []
+        try:
+            tty.setcbreak(file_descriptor)
+            while True:
+                char = sys.stdin.read(1)
+                if char in ("\r", "\n"):
+                    sys.stdout.write("\n")
+                    sys.stdout.flush()
+                    return "".join(chars)
+                if char == "\x03":
+                    raise KeyboardInterrupt
+                if char == "\x04":
+                    raise EOFError
+                if char in ("\b", "\x7f"):
+                    if chars:
+                        chars.pop()
+                        sys.stdout.write("\b \b")
+                        sys.stdout.flush()
+                    continue
+                chars.append(char)
+                sys.stdout.write(mask)
+                sys.stdout.flush()
+        finally:
+            termios.tcsetattr(file_descriptor, termios.TCSADRAIN, old_settings)
 
     def _normalize_session_command_alias(self, raw_cmd: str) -> str:
         """
@@ -2148,33 +2371,61 @@ class Agent:
         self.console.print("[bold cyan]status[/][dim]：查看当前模型和 token 状态[/]")
         return True, False
 
-    def _handle_cmd_model_add(self, confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
-        # 新增模型前先真实发送一条测试消息，避免把不可用配置写入模型列表。
+    def _collect_model_add_config(self) -> PendingModelConfig | None:
+        """
+        收集 model add 需要的输入并做本地校验。
+        :return: 待写入的模型配置；校验失败时返回 None
+        """
         model_name = self.console.input("[bold cyan]请输入模型名：[/] ").strip()
-        base_url = self.console.input("[bold cyan]请输入 base_url：[/] ").strip()
-        api_key = self.console.input("[bold cyan]请输入 api_key：[/] ").strip()
-        context_token_input = self.console.input("[bold cyan]请输入上下文窗口大小：[/] ").strip()
-
-        if not model_name or not base_url:
-            self.console.print("[yellow]模型名和 base_url 不能为空，已取消新增。[/]")
-            return True, False
+        if not model_name:
+            self.console.print("[yellow]模型名不能为空，已取消新增。[/]")
+            return None
         if self._get_model_config_by_name(model_name):
             self.console.print(f"[yellow]模型 {model_name} 已存在，已取消新增。[/]")
-            return True, False
+            return None
+
+        # 环境变量名由模型名生成，配置文件只保存变量名引用。
+        base_url_env, api_key_env = self._model_env_var_names(model_name)
+        self.console.print(
+            "[dim]将写入当前用户环境变量：[/]"
+            f"[bold cyan]{base_url_env}[/][dim] 和 [/][bold cyan]{api_key_env}[/]"
+        )
+        base_url = self.console.input("[bold cyan]请输入 base_url：[/] ").strip()
+        api_key = self._input_masked_secret("[bold cyan]请输入 api_key：[/] ").strip()
+        context_token_input = self.console.input("[bold cyan]请输入上下文窗口大小：[/] ").strip()
+
+        if not base_url:
+            self.console.print("[yellow]base_url 不能为空，已取消新增。[/]")
+            return None
         try:
             max_model_context_token = int(context_token_input)
             if max_model_context_token <= 0:
                 raise ValueError
         except ValueError:
             self.console.print("[yellow]上下文窗口大小必须是正整数，已取消新增。[/]")
-            return True, False
+            return None
 
-        self.console.print(f"[dim]正在测试新模型：[/][bold cyan]{model_name}[/]")
+        return PendingModelConfig(
+            model_name=model_name,
+            base_url=base_url,
+            api_key=api_key,
+            base_url_env=base_url_env,
+            api_key_env=api_key_env,
+            max_model_context_token=max_model_context_token,
+        )
+
+    def _test_pending_model_config(self, pending_config: PendingModelConfig) -> bool:
+        """
+        使用临时客户端测试待新增模型。
+        :param pending_config: 待新增模型配置
+        :return: 测试是否通过
+        """
+        self.console.print(f"[dim]正在测试新模型：[/][bold cyan]{pending_config.model_name}[/]")
         temp_client = None
         try:
-            temp_client = self._build_openai_client(base_url, api_key)
+            temp_client = self._build_openai_client(pending_config.base_url, pending_config.api_key)
             test_response = temp_client.chat.completions.create(
-                model=model_name,
+                model=pending_config.model_name,
                 messages=[{"role": "user", "content": "Say 'Hello', don't do anything else"}],
             )
         except Exception as error:
@@ -2182,7 +2433,7 @@ class Agent:
                 f"[yellow]模型信息错误，请检查模型名、base_url、api_key 和服务状态。"
                 f"错误类型：{type(error).__name__}；错误信息：{error}[/]"
             )
-            return True, False
+            return False
         finally:
             close_temp_client = getattr(temp_client, "close", None)
             if callable(close_temp_client):
@@ -2190,29 +2441,72 @@ class Agent:
 
         test_content = getattr(test_response.choices[0].message, "content", "")
         self.console.print(f"[green]模型测试成功。响应：[/][dim]{test_content}[/]")
+        return True
+
+    def _write_pending_model_config(self, pending_config: PendingModelConfig) -> None:
+        """
+        写入环境变量和模型配置文件。
+        :param pending_config: 待新增模型配置
+        :return:
+        """
+        # 先让当前进程立即可用，持久化环境变量交给后台线程处理。
+        self._persist_environment_variables_async(
+            {
+                pending_config.base_url_env: pending_config.base_url,
+                pending_config.api_key_env: pending_config.api_key,
+            }
+        )
+        self.console.print(
+            "[dim]环境变量已写入当前进程，本次运行可立即使用；"
+            "持久化到 Windows 用户环境变量将在后台继续执行，请勿立即退出当前程序。[/]"
+        )
 
         config = self._read_model_config()
         config.setdefault("models", [])
         config["models"].append(
             {
-                "name": model_name,
-                "base_url": base_url,
-                "api_key": api_key,
-                "max_model_context_token": max_model_context_token,
+                "name": pending_config.model_name,
+                "base_url_env": pending_config.base_url_env,
+                "api_key_env": pending_config.api_key_env,
+                "max_model_context_token": pending_config.max_model_context_token,
             }
         )
         self._write_model_config(config)
-        self.console.print("[green]模型配置已写入 agent/config/model_config.json[/]")
+        self.console.print("[green]模型配置已写入 agent/config/model_config.json（仅保存环境变量名）[/]")
 
+    def _switch_to_pending_model_if_requested(
+            self,
+            pending_config: PendingModelConfig,
+            confirm_choice: tuple[str, ...],
+    ) -> None:
+        """
+        根据用户确认决定是否立即切换到新增模型。
+        :param pending_config: 已写入的新增模型配置
+        :param confirm_choice: 确认输入集合
+        :return:
+        """
         switch_input = self.console.input("[bold cyan]是否立即切换到新模型？(yes/y)[/] ").strip()
         if self._normalize_command(switch_input) in confirm_choice:
-            self.model = model_name
-            self._apply_model_config_by_name(self.model)
+            self.model = pending_config.model_name
+            if not self._apply_model_config_by_name(self.model):
+                missing_names = ", ".join(self._missing_model_env_vars)
+                self.console.print(f"[yellow]新模型环境变量缺失：{missing_names}[/]")
+                return
             self._max_context_tokens = self._load_model_context_window()
             self.console.print(
                 f"[green]模型已切换为：{self.model}（上下文窗口：{self._max_context_tokens}）[/]"
             )
             self._print_runtime_status()
+
+    def _handle_cmd_model_add(self, confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
+        # 新增模型前先真实发送一条测试消息，避免把不可用配置写入模型列表。
+        pending_config = self._collect_model_add_config()
+        if pending_config is None:
+            return True, False
+        if not self._test_pending_model_config(pending_config):
+            return True, False
+        self._write_pending_model_config(pending_config)
+        self._switch_to_pending_model_if_requested(pending_config, confirm_choice)
         return True, False
 
     def _resolve_model_selector(self, selector: str, available_models: list[str]) -> str | None:
@@ -2244,7 +2538,10 @@ class Agent:
             return True, False
 
         self.model = target_model
-        self._apply_model_config_by_name(self.model)
+        if not self._apply_model_config_by_name(self.model):
+            missing_names = ", ".join(self._missing_model_env_vars)
+            self.console.print(f"[yellow]模型 {target_model} 的环境变量缺失：{missing_names}[/]")
+            return True, False
         self._max_context_tokens = self._load_model_context_window()
         self.console.print(f"[green]模型已切换为：{self.model}（上下文窗口：{self._max_context_tokens}）[/]")
         self._print_runtime_status()
