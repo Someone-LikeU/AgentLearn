@@ -94,8 +94,7 @@ class PendingModelConfig:
 
 
 class Agent:
-    """支持本地工具 + MCP工具的Agent。"""
-
+    
     _DEFAULT_CONTEXT_WINDOW = 32768
     _COMPACT_TRIGGER_RATIO = 0.8
     _MIDDLE_COMPACT_RATIO = 0.3
