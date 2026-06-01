@@ -9,6 +9,10 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from rich.console import Console
+
+from spinner import Spinner
+
 
 class MCPClient:
 	"""
@@ -28,7 +32,6 @@ class MCPClient:
 		base_dir = __import__("os").path.dirname(__import__("os").path.abspath(__file__))
 		self.server_script = server_script or __import__("os").path.join(base_dir, "mcp_server.py")
 		self.mode = mode
-		print(f"MCP client working mode {self.mode}")
 		self.host = host
 		self.port = port
 		
@@ -164,6 +167,13 @@ class MCPClient:
 			pass
 
 
+def _start_mcp_spinner(message: str) -> Spinner:
+	console = Console()
+	spinner = Spinner(console, messages=[message])
+	spinner.start()
+	return spinner
+
+
 def create_tcp_mcp_client(
 	host: str = "127.0.0.1",
 	port: int = 7777,
@@ -178,14 +188,18 @@ def create_tcp_mcp_client(
 	:param startup_wait: 启动服务端后的等待秒数
 	:return: MCP 客户端，以及本函数自动启动的服务端进程；如果复用已有服务端，则进程为 None
 	"""
+	spinner = _start_mcp_spinner(f"正在连接 MCP 客户端（tcp {host}:{port}）...")
 	client = MCPClient(server_script=server_script, mode="tcp", host=host, port=port)
 	try:
 		# 先尝试复用已经启动的 TCP 服务端，避免重复拉起服务进程。
 		client.start()
+		spinner.stop()
 		return client, None
 	except (OSError, RuntimeError):
+		spinner.stop()
 		client.close()
 
+	spinner = _start_mcp_spinner(f"正在启动 MCP TCP 服务（{host}:{port}）...")
 	server_path = Path(client.server_script).resolve()
 	server_process = subprocess.Popen(
 		[sys.executable, "-u", str(server_path), "--mode", "tcp", "--host", host, "--port", str(port)],
@@ -202,12 +216,14 @@ def create_tcp_mcp_client(
 		# 服务端由本函数启动后，再创建新的客户端连接并校验 ping。
 		client.start()
 	except Exception:
+		spinner.stop()
 		client.close()
 		if server_process.poll() is None:
 			# 连接失败时只清理本函数启动的服务端进程。
 			server_process.terminate()
 			server_process.wait(timeout=3)
 		raise
+	spinner.stop()
 	return client, server_process
 
 

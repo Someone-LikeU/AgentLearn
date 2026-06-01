@@ -167,6 +167,79 @@ class SessionManager:
             }
         )
 
+    def record_response_usage(
+        self,
+        turn_id: str | None,
+        usage: Any,
+        response_kind: str,
+        model: str | None = None,
+        message_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """
+        记录一次模型响应的真实 usage。
+        :param turn_id: 当前用户任务 id
+        :param usage: OpenAI usage 字典或对象
+        :param response_kind: 响应类型
+        :param model: 当前模型名
+        :param message_id: 关联的 assistant message_id
+        :param metadata: 额外元信息
+        :return: 实际写入的事件
+        """
+        normalized_usage = self._normalize_usage(usage)
+        if not normalized_usage:
+            raise ValueError("Response usage cannot be empty.")
+        event = {
+            "event": "response_usage",
+            "turn_id": turn_id,
+            "response_kind": response_kind or "unknown",
+            "usage": normalized_usage,
+        }
+        if model:
+            event["model"] = model
+        if message_id:
+            event["message_id"] = message_id
+        if metadata:
+            event["metadata"] = metadata
+        return self.append_event(event)
+
+    def calculate_session_usage(self, session_id: str | None = None, include_deleted: bool = True) -> dict[str, Any]:
+        """
+        汇总 session 中已持久化的真实模型 usage。
+        :param session_id: 会话 id，默认当前会话
+        :param include_deleted: 是否包含已软删除 turn 的真实消耗
+        :return: usage 汇总
+        """
+        target_session_id = session_id or self.current_session_id
+        summary = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "response_count": 0,
+            "has_real_usage": False,
+        }
+        if not target_session_id:
+            return summary
+        events = self.load_session(target_session_id)
+        deleted_turn_ids = self._deleted_turn_ids(events) if not include_deleted else set()
+        for event in events:
+            if event.get("event") != "response_usage":
+                continue
+            if not include_deleted and event.get("turn_id") in deleted_turn_ids:
+                continue
+            usage = self._normalize_usage(event.get("usage"))
+            if not usage:
+                continue
+            prompt_tokens = usage.get("prompt_tokens", 0)
+            completion_tokens = usage.get("completion_tokens", 0)
+            total_tokens = usage.get("total_tokens", prompt_tokens + completion_tokens)
+            summary["prompt_tokens"] += prompt_tokens
+            summary["completion_tokens"] += completion_tokens
+            summary["total_tokens"] += total_tokens
+            summary["response_count"] += 1
+            summary["has_real_usage"] = True
+        return summary
+
     def record_memory_saved(
         self,
         turn_id: str,
@@ -394,6 +467,10 @@ class SessionManager:
             records = self._scan_session_files()
         else:
             records = self._merge_session_index_records(records)
+        # 索引是追加式日志，用户手动删除 session 文件后可能留下孤儿记录；列表展示只保留文件仍存在的会话。
+        records = [record for record in records if self._session_record_file_exists(record)]
+        if not records:
+            records = self._scan_session_files()
         # 同一秒内可能创建多个 session，因此用读取顺序作为稳定的第二排序键。
         ordered_records = []
         for order, record in enumerate(records):
@@ -555,6 +632,40 @@ class SessionManager:
                 continue
         return records
 
+    @classmethod
+    def _normalize_usage(cls, usage: Any) -> dict[str, int]:
+        normalized = {}
+        prompt_tokens = cls._normalize_token_value(cls._usage_value(usage, "prompt_tokens"))
+        completion_tokens = cls._normalize_token_value(cls._usage_value(usage, "completion_tokens"))
+        total_tokens = cls._normalize_token_value(cls._usage_value(usage, "total_tokens"))
+        if total_tokens is None:
+            prompt = prompt_tokens or 0
+            completion = completion_tokens or 0
+            total_tokens = prompt + completion if prompt + completion > 0 else None
+        if prompt_tokens is not None:
+            normalized["prompt_tokens"] = prompt_tokens
+        if completion_tokens is not None:
+            normalized["completion_tokens"] = completion_tokens
+        if total_tokens is not None:
+            normalized["total_tokens"] = total_tokens
+        return normalized
+
+    @staticmethod
+    def _usage_value(usage: Any, key: str) -> Any:
+        if isinstance(usage, dict):
+            return usage.get(key)
+        return getattr(usage, key, None)
+
+    @staticmethod
+    def _normalize_token_value(value: Any) -> int | None:
+        if isinstance(value, bool) or value is None:
+            return None
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            return None
+        return number if number >= 0 else None
+
     def _resolve_session_path(self, session_id: str) -> Path | None:
         # 当前会话优先返回内存中的路径，避免刚创建但索引尚未重读时查找失败。
         if self.current_session_id == session_id and self.current_session_path is not None:
@@ -562,11 +673,23 @@ class SessionManager:
         # 常规路径从索引文件解析。
         for record in self._read_jsonl(self.index_file):
             if record.get("session_id") == session_id and record.get("path"):
-                return Path(record.get("path"))
+                path = Path(record.get("path"))
+                if path.exists():
+                    return path
         # 索引不完整时最后再扫描目录。
         for path in self.sessions_dir.rglob(f"{session_id}.jsonl"):
             return path
         return None
+
+    def _session_record_file_exists(self, record: dict[str, Any]) -> bool:
+        path_value = record.get("path")
+        if path_value:
+            return Path(path_value).exists()
+        session_id = record.get("session_id")
+        if not session_id:
+            return False
+        # 兼容极早期没有 path 字段的索引记录，必要时按 session_id 回退扫描。
+        return any(self.sessions_dir.rglob(f"{session_id}.jsonl"))
 
     def _scan_session_files(self) -> list[dict[str, Any]]:
         records = []

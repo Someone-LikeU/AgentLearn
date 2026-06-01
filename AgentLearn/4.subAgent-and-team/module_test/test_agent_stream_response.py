@@ -34,6 +34,9 @@ class AgentStreamResponseTest(unittest.TestCase):
 			chunk.usage = usage
 		return chunk
 
+	def _usage_chunk(self, usage):
+		return SimpleNamespace(choices=[], usage=usage)
+
 	def _tool_delta(self, index, tool_id=None, name=None, arguments=None):
 		function = SimpleNamespace()
 		if name is not None:
@@ -59,7 +62,55 @@ class AgentStreamResponseTest(unittest.TestCase):
 		self.assertEqual(output.getvalue(), "你好")
 		self.assertEqual(message.content, "你好")
 		self.assertIsNone(message.tool_calls)
+		self.assertEqual(message.usage["total_tokens"], 7)
 		self.assertEqual(agent._used_token, 7)
+
+	def test_stream_usage_chunk_without_choices_is_accepted(self):
+		agent = self._agent()
+		stream = [
+			self._chunk(content="ok"),
+			self._usage_chunk(SimpleNamespace(prompt_tokens=3, completion_tokens=4, total_tokens=7)),
+		]
+		output = io.StringIO()
+
+		with redirect_stdout(output):
+			message = agent._deal_stream_response(stream)
+
+		self.assertEqual(output.getvalue(), "ok")
+		self.assertEqual(message.content, "ok")
+		self.assertEqual(message.usage["prompt_tokens"], 3)
+		self.assertEqual(message.usage["completion_tokens"], 4)
+		self.assertEqual(message.usage["total_tokens"], 7)
+		self.assertEqual(agent._used_token, 7)
+
+	def test_run_agent_step_retries_empty_response_after_tool_result(self):
+		agent = self._agent()
+		agent.max_iterations = 5
+		agent._all_tools = []
+		agent._all_tools_without_make_plan = []
+		tool_call_message = SimpleNamespace(content=None, tool_calls=[SimpleNamespace(id="call_1")])
+		empty_message = SimpleNamespace(content=None, tool_calls=None)
+		final_message = SimpleNamespace(content="done", tool_calls=None)
+		responses = iter([tool_call_message, empty_message, final_message])
+		appended_messages = []
+		continue_prompts = []
+
+		def handle_tool_calls(_tool_calls, guard_state):
+			guard_state.executed_tool_count += 1
+			return None
+
+		agent._request_next_model_message = lambda _tools: next(responses)
+		agent._append_assistant_response = lambda message: appended_messages.append(message)
+		agent._handle_tool_calls = handle_tool_calls
+		agent._append_empty_tool_followup_prompt = lambda task_goal: continue_prompts.append(task_goal)
+		agent._should_check_task_complete = lambda _task_goal, _message, _guard_state: False
+
+		with redirect_stdout(io.StringIO()):
+			result = agent._run_agent_step(agent._all_tools, task_goal="今天是星期几？")
+
+		self.assertEqual(result, "done")
+		self.assertEqual(continue_prompts, ["今天是星期几？"])
+		self.assertEqual(appended_messages, [tool_call_message, empty_message, final_message])
 
 	def test_tool_call_chunks_are_merged_in_order(self):
 		agent = self._agent()

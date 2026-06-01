@@ -92,6 +92,57 @@ class SessionManagerTest(unittest.TestCase):
             self.assertEqual(manager.list_tasks(session_id), [])
             self.assertEqual(manager.rebuild_messages(session_id), [{"role": "system", "content": "system prompt"}])
 
+    def test_response_usage_is_recorded_and_summarized(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = SessionManager(project_root=tmp)
+            session_id = manager.start_session("test-model")
+            turn_id = manager.create_turn_id()
+
+            event = manager.record_response_usage(
+                turn_id=turn_id,
+                usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+                response_kind="assistant_response",
+                model="test-model",
+                message_id="msg_1",
+            )
+            manager.record_response_usage(
+                turn_id=turn_id,
+                usage={"prompt_tokens": 7, "completion_tokens": 3},
+                response_kind="task_completion_check",
+                model="test-model",
+            )
+
+            summary = manager.calculate_session_usage(session_id)
+
+            self.assertEqual(event["event"], "response_usage")
+            self.assertEqual(event["usage"]["total_tokens"], 15)
+            self.assertEqual(summary["prompt_tokens"], 17)
+            self.assertEqual(summary["completion_tokens"], 8)
+            self.assertEqual(summary["total_tokens"], 25)
+            self.assertEqual(summary["response_count"], 2)
+            self.assertTrue(summary["has_real_usage"])
+
+    def test_response_usage_keeps_deleted_turns_by_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = SessionManager(project_root=tmp)
+            session_id = manager.start_session("test-model")
+            turn_id = manager.create_turn_id()
+
+            manager.record_response_usage(
+                turn_id=turn_id,
+                usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+                response_kind="assistant_response",
+            )
+            manager.mark_turn_deleted(turn_id)
+
+            default_summary = manager.calculate_session_usage(session_id)
+            filtered_summary = manager.calculate_session_usage(session_id, include_deleted=False)
+
+            self.assertEqual(default_summary["total_tokens"], 15)
+            self.assertEqual(default_summary["response_count"], 1)
+            self.assertEqual(filtered_summary["total_tokens"], 0)
+            self.assertFalse(filtered_summary["has_real_usage"])
+
     def test_list_sessions_uses_index(self):
         with tempfile.TemporaryDirectory() as tmp:
             manager = SessionManager(project_root=tmp)
@@ -102,6 +153,20 @@ class SessionManagerTest(unittest.TestCase):
             self.assertEqual(len(sessions), 2)
             self.assertEqual(sessions[0]["session_id"], second)
             self.assertEqual(sessions[1]["session_id"], first)
+
+    def test_list_sessions_skips_deleted_session_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = SessionManager(project_root=tmp)
+            deleted_session_id = manager.start_session("model-a")
+            deleted_session_path = manager.current_session_path
+            kept_session_id = manager.start_session("model-b")
+
+            deleted_session_path.unlink()
+            sessions = manager.list_sessions(limit=10)
+            session_ids = {item["session_id"] for item in sessions}
+
+            self.assertIn(kept_session_id, session_ids)
+            self.assertNotIn(deleted_session_id, session_ids)
 
     def test_session_title_update_and_user_priority(self):
         with tempfile.TemporaryDirectory() as tmp:

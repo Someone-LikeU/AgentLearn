@@ -25,6 +25,7 @@ from tools.tool_names import ToolNameConstant
 from tools.tool_scheduler import ToolScheduler, ToolCallTask
 from spinner import Spinner
 from task_history_viewer import open_task_history_viewer
+from token_tracker import TokenTracker
 
 
 @dataclass
@@ -75,6 +76,7 @@ class StreamResponseState:
 
     content_parts: list[str] = field(default_factory=list)
     tool_calls: dict[int, StreamToolCallState] = field(default_factory=dict)
+    usage: dict[str, int] | None = None
 
     @property
     def content(self) -> str:
@@ -154,9 +156,10 @@ class Agent:
         else:
             self._apply_model_config_by_name(self.model)
         self._max_context_tokens = self._load_model_context_window()
-        # 记录最近一次模型调用的已使用 token 和总 token（来自 OpenAI 标准 usage 字段）。
-        self._used_token = 0
-        self._total_token = 0
+        self._token_tracker = TokenTracker(
+            max_context_tokens=self._max_context_tokens,
+            default_context_window=self._DEFAULT_CONTEXT_WINDOW,
+        )
 
         # LLM 温度参数
         self.temperature = temperature
@@ -189,40 +192,51 @@ class Agent:
 
         # MCP 客户端（由外部传入，不在 Agent 内部创建）。
         self.mcp_client = mcp_client
-        self._prepare_mcp_client()
         self.console = Console()
-        self._tool_manager = ToolManager(
-            config=ToolManagerConfig(
-                project_root=os.path.dirname(__file__),
-                client=self.client,
-                model=self.model,
-                temperature=self.temperature,
-                is_main_agent=self._is_main_agent,
-                spinner_factory=(
-                    lambda preset=Spinner.DEFAULT, **context: self._start_spinner(preset=preset, **context)
-                    if self._should_show_tool_spinner()
-                    else None
+        mcp_mode = getattr(self.mcp_client, "mode", "none") if self.mcp_client else "none"
+        if self.mcp_client:
+            startup_spinner = self._start_spinner(messages=[f"正在初始化 MCP 客户端（mode: {mcp_mode}）..."])
+            try:
+                self._prepare_mcp_client()
+            finally:
+                startup_spinner.stop()
+        else:
+            self._prepare_mcp_client()
+
+        startup_spinner = self._start_spinner(messages=["正在加载本地工具和 MCP 工具..."])
+        try:
+            self._tool_manager = ToolManager(
+                config=ToolManagerConfig(
+                    project_root=os.path.dirname(__file__),
+                    client=self.client,
+                    model=self.model,
+                    temperature=self.temperature,
+                    is_main_agent=self._is_main_agent,
+                    spinner_factory=(
+                        lambda preset=Spinner.DEFAULT, **context: self._start_spinner(preset=preset, **context)
+                        if self._should_show_tool_spinner()
+                        else None
+                    ),
                 ),
-            ),
-            handlers=AgentToolHandlers(
-                make_plan_handler=self._make_plan,
-                load_skill_detail_handler=self._load_skill_detail_by_name,
-                load_full_memory_context_handler=self._load_full_memory_context,
-                sub_agent_handler=self._sub_agent if self._is_main_agent else None,
-            ),
-            mcp_client=self.mcp_client,
-        )
+                handlers=AgentToolHandlers(
+                    make_plan_handler=self._make_plan,
+                    load_skill_detail_handler=self._load_skill_detail_by_name,
+                    load_full_memory_context_handler=self._load_full_memory_context,
+                    sub_agent_handler=self._sub_agent if self._is_main_agent else None,
+                ),
+                mcp_client=self.mcp_client,
+            )
+        finally:
+            startup_spinner.stop()
         self._local_tools = self._tool_manager.local_tools
         self._local_functions = self._tool_manager.local_functions
         self._mcp_tools = self._tool_manager.mcp_tools
         self._available_functions = self._tool_manager.available_functions
         self._all_tools = self._tool_manager.all_tools
         self._all_tools_without_make_plan = self._build_tools_without_make_plan(self._all_tools)
-        print(f"{len(self._local_tools)} local tools loaded")
-        if self.mcp_client:
-            print(f"{len(self._mcp_tools)} MCP tools loaded")
-        else:
-            print("No MCP client provided, MCP tools not loaded")
+        mcp_tool_count = len(self._mcp_tools) if self.mcp_client else 0
+        mcp_status = f"{mcp_tool_count} MCP tools" if self.mcp_client else "MCP disabled"
+        self.console.print(f"[dim]工具加载完成：{len(self._local_tools)} local tools，{mcp_status}[/]")
 
         # 基础提示词，用于主 Agent。
         self._base_prompt_main_agent = load_prompt("base_main_agent.md")
@@ -263,6 +277,106 @@ class Agent:
         # 当前会话的当前用户任务
         self._current_task = None
 
+    def _ensure_token_tracker(self) -> TokenTracker:
+        if not hasattr(self, "_token_tracker"):
+            # 兼容测试中通过 Agent.__new__ 构造的轻量对象，首次访问时补齐 tracker。
+            self._token_tracker = TokenTracker(
+                max_context_tokens=getattr(self, "_max_context_tokens", self._DEFAULT_CONTEXT_WINDOW),
+                default_context_window=self._DEFAULT_CONTEXT_WINDOW,
+            )
+        return self._token_tracker
+
+    @property
+    def _used_token(self) -> int:
+        return self._ensure_token_tracker().used_token
+
+    @_used_token.setter
+    def _used_token(self, value: int) -> None:
+        self._ensure_token_tracker().used_token = int(value or 0)
+
+    @property
+    def _total_token(self) -> int:
+        return self._ensure_token_tracker().total_token
+
+    @_total_token.setter
+    def _total_token(self, value: int) -> None:
+        self._ensure_token_tracker().total_token = int(value or 0)
+
+    def _refresh_token_context_window(self) -> int:
+        self._max_context_tokens = self._load_model_context_window()
+        self._ensure_token_tracker().update_context_window(self._max_context_tokens)
+        return self._max_context_tokens
+
+    def _update_usage_from_response(self, response) -> dict[str, int] | None:
+        # 保留旧私有方法入口，实际 token 解析和状态更新统一交给 TokenTracker。
+        return self._ensure_token_tracker().update_from_response(response)
+
+    def _update_and_record_response_usage(
+            self,
+            response,
+            response_kind: str,
+            message_id: str | None = None,
+            metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        usage = self._update_usage_from_response(response)
+        if not usage:
+            return None
+        return self._record_response_usage(usage, response_kind, message_id=message_id, metadata=metadata)
+
+    def _record_response_usage(
+            self,
+            response_or_usage,
+            response_kind: str,
+            message_id: str | None = None,
+            metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        usage = self._ensure_token_tracker().extract_usage(response_or_usage)
+        if not usage:
+            return None
+        session_manager = getattr(self, "session_manager", None)
+        if session_manager is None or session_manager.current_session_id is None:
+            return None
+        try:
+            event = session_manager.record_response_usage(
+                turn_id=getattr(self, "_current_turn_id", None),
+                usage=usage,
+                response_kind=response_kind,
+                model=getattr(self, "model", None),
+                message_id=message_id,
+                metadata=metadata,
+            )
+            self._restore_session_usage_summary()
+            return event
+        except Exception as error:
+            self.console.print(f"[yellow]usage 记录写入失败：{error}[/]")
+            return None
+
+    def _restore_session_usage_summary(self, session_id: str | None = None) -> dict[str, Any]:
+        tracker = self._ensure_token_tracker()
+        session_manager = getattr(self, "session_manager", None)
+        target_session_id = session_id or getattr(session_manager, "current_session_id", None)
+        if session_manager is None or not target_session_id:
+            tracker.clear_session_usage()
+            return tracker.session_usage_summary()
+        summary = session_manager.calculate_session_usage(target_session_id)
+        tracker.set_session_usage_summary(summary)
+        return summary
+
+    def _message_text(self, message) -> str:
+        return self._ensure_token_tracker().message_text(message)
+
+    def _estimate_text_tokens(self, text) -> int:
+        return self._ensure_token_tracker().estimate_text_tokens(text)
+
+    def _estimate_messages_tokens(self, messages, tools=None) -> int:
+        return self._ensure_token_tracker().estimate_messages_tokens(messages, tools)
+
+    def _calculate_token_usage_ratio(self, used_tokens: int, context_window: int) -> float:
+        return self._ensure_token_tracker().calculate_usage_ratio(used_tokens, context_window)
+
+    def _render_token_usage_bar(self, usage_ratio: float, width: int = 30) -> str:
+        return self._ensure_token_tracker().render_usage_bar(usage_ratio, width)
+
     def _mcp_client_ping_ok(self) -> bool:
         """
         检查 MCP 客户端是否可以 ping 通。
@@ -293,7 +407,7 @@ class Agent:
         start = getattr(self.mcp_client, "start", None)
         if not callable(start):
             # 传入对象无法启动且当前不可用，禁用 MCP，避免 ToolManager 初始化时报错。
-            print("传入的 MCP 客户端不可用：ping 不通且没有 start 方法，将只使用本地工具")
+            self.console.print("[yellow]传入的 MCP 客户端不可用：ping 不通且没有 start 方法，将只使用本地工具[/]")
             self.mcp_client = None
             return
 
@@ -306,7 +420,10 @@ class Agent:
             if self._mcp_client_ping_ok():
                 return
 
-        print(f"传入的 MCP 客户端不可用：尝试启动 {max_attempts} 次后仍 ping 不通，将只使用本地工具。最后错误：{last_error}")
+        self.console.print(
+            f"[yellow]传入的 MCP 客户端不可用：尝试启动 {max_attempts} 次后仍 ping 不通，"
+            f"将只使用本地工具。最后错误：{last_error}[/]"
+        )
         self.mcp_client = None
 
     def _model_config_file_path(self) -> Path:
@@ -868,6 +985,9 @@ class Agent:
         # session_start 后立刻写入 system message，保证历史会话可完整恢复。
         if self.messages:
             self._record_session_message(self.messages[0], turn_id=None)
+        # 这里只在新建 session 的分支执行；已有会话会在前面的 current_session_id 分支直接返回。
+        # 清空会话级 usage 是为了避免新会话继承上一个会话的累计 API token。
+        self._ensure_token_tracker().clear_session_usage()
         return session_id
 
     def set_bash_auto_approve(self, enabled: bool):
@@ -894,18 +1014,19 @@ class Agent:
         :return:
         """
         if self.session_manager is None or self.session_manager.current_session_id is None:
-            return
+            return None
         try:
             # 会话记录失败不应该打断 Agent 正常回答。
-            self.session_manager.append_message(message, turn_id=turn_id, metadata=metadata)
+            return self.session_manager.append_message(message, turn_id=turn_id, metadata=metadata)
         except Exception as error:
             self.console.print(f"[yellow]会话记录写入失败：{error}[/]")
+            return None
 
     def _append_message(self, message, capture_full_context=True, session_metadata=None):
         self.messages.append(message)
         if capture_full_context and self._current_task_full_context is not None:
             self._current_task_full_context.append(self._normalize_message_for_memory(message))
-        self._record_session_message(message, turn_id=self._current_turn_id, metadata=session_metadata)
+        return self._record_session_message(message, turn_id=self._current_turn_id, metadata=session_metadata)
 
     def _normalize_message_for_memory(self, message):
         if isinstance(message, dict):
@@ -943,8 +1064,8 @@ class Agent:
             )
         finally:
             spinner.stop()
-        # 每次模型调用后更新 token 使用统计。
-        self._update_usage_from_response(response)
+        # 计划模型调用也属于当前任务的真实 API 消耗，需要写入 session usage。
+        self._update_and_record_response_usage(response, "task_planning")
         try:
             plan_data = json.loads(response.choices[0].message.content)
             print("make plan response is: ", response)
@@ -1043,38 +1164,12 @@ class Agent:
             return message.get("role", "unknown")
         return getattr(message, "role", "unknown")
 
-    def _message_text(self, message):
-        if isinstance(message, dict):
-            parts = [str(message.get("role", "")), str(message.get("content", ""))]
-            if message.get("tool_calls"):
-                parts.append(json.dumps(message.get("tool_calls"), ensure_ascii=False, default=str))
-            if message.get("tool_call_id"):
-                parts.append(str(message.get("tool_call_id")))
-            return "\n".join(part for part in parts if part)
-
-        parts = [str(getattr(message, "role", "")), str(getattr(message, "content", ""))]
-        tool_calls = getattr(message, "tool_calls", None)
-        if tool_calls:
-            parts.append(json.dumps(tool_calls, ensure_ascii=False, default=str))
-        return "\n".join(part for part in parts if part)
-
-    def _estimate_text_tokens(self, text):
-        text = text or ""
-        ascii_count = sum(1 for char in text if ord(char) < 128)
-        non_ascii_count = len(text) - ascii_count
-        return max(1, ascii_count // 4 + non_ascii_count * 2)
-
-    def _estimate_messages_tokens(self, messages, tools=None):
-        total = 0
-        for message in messages:
-            total += 4 + self._estimate_text_tokens(self._message_text(message))
-        if tools:
-            total += self._estimate_text_tokens(json.dumps(tools, ensure_ascii=False, default=str))
-        return total
-
     def _should_compact_messages(self, tools=None):
-        used_tokens = self._estimate_messages_tokens(self.messages, tools)
-        return used_tokens >= int(self._max_context_tokens * self._COMPACT_TRIGGER_RATIO)
+        return self._ensure_token_tracker().should_compact_messages(
+            self.messages,
+            tools,
+            compact_trigger_ratio=self._COMPACT_TRIGGER_RATIO,
+        )
     
     def _find_recent_start(self):
         start = max(1, len(self.messages) - self._KEEP_RECENT)
@@ -1087,7 +1182,7 @@ class Agent:
         text = ""
         for message in messages:
             role = self._message_role(message)
-            content = self._message_text(message)
+            content = self._ensure_token_tracker().message_text(message)
             if content:
                 text += f"[{role}]: {content}\n"
         return text
@@ -1138,8 +1233,8 @@ class Agent:
             )
         finally:
             spinner.stop()
-        # 每次模型调用后更新 token 使用统计。
-        self._update_usage_from_response(summary_response)
+        # 压缩摘要调用不进入对话消息，但真实消耗需要计入当前 session。
+        self._update_and_record_response_usage(summary_response, "compaction_summary")
         summary = summary_response.choices[0].message.content
 
         self.messages = [
@@ -1212,20 +1307,39 @@ class Agent:
         self._compact_messages(active_tools)
         spinner = self._start_spinner()
         try:
-            response_stream = self.client.chat.completions.create(
-                model=self.model,
-                messages=self.messages,
-                tools=active_tools,
-                temperature=self.temperature,
-                stream=True,
-            )
+            response_stream = self._create_stream_completion(active_tools, include_usage=True)
             return self._deal_stream_response(response_stream, spinner=spinner)
         finally:
             spinner.stop()
 
+    def _create_stream_completion(self, active_tools, include_usage: bool = True):
+        request_args = {
+            "model": self.model,
+            "messages": self.messages,
+            "tools": active_tools,
+            "temperature": self.temperature,
+            "stream": True,
+        }
+        if include_usage:
+            request_args["stream_options"] = {"include_usage": True}
+        try:
+            return self.client.chat.completions.create(**request_args)
+        except Exception as error:
+            if include_usage and self._is_stream_options_unsupported_error(error):
+                return self._create_stream_completion(active_tools, include_usage=False)
+            raise
+
+    @staticmethod
+    def _is_stream_options_unsupported_error(error: Exception) -> bool:
+        text = str(error or "").lower()
+        return "stream_options" in text and any(
+            marker in text
+            for marker in ("unsupported", "not support", "unrecognized", "unknown", "extra", "invalid")
+        )
+
     def _append_assistant_response(self, message):
         tool_calls = getattr(message, "tool_calls", None)
-        self._append_message({
+        event = self._append_message({
             "role": "assistant",
             "content": message.content,
             "tool_calls": [
@@ -1240,6 +1354,8 @@ class Agent:
                 for tc in (tool_calls or [])
             ] if tool_calls else None,
         })
+        message_id = event.get("message_id") if event else None
+        self._record_response_usage(message, "assistant_response", message_id=message_id)
 
     def _append_tool_result(self, task: ToolCallTask, function_response):
         self._append_message(
@@ -1506,7 +1622,7 @@ class Agent:
             )
         except Exception:
             return "DONE"
-        self._update_usage_from_response(response)
+        self._update_and_record_response_usage(response, "task_completion_check")
         answer = response.choices[0].message.content
         return self._parse_completion_status(answer)
 
@@ -1517,6 +1633,20 @@ class Agent:
                 "content": load_prompt("task_completion_continue_user.md", task_goal=task_goal),
             },
             session_metadata={"is_task_entry": False, "task_completion_guard": True},
+        )
+
+    def _append_empty_tool_followup_prompt(self, task_goal: str | None) -> None:
+        self._append_message(
+            {
+                "role": "user",
+                "content": (
+                    "The previous model response after tool execution was empty. "
+                    "Use the tool result above to answer the user's task directly. "
+                    "Do not call another tool unless it is necessary.\n"
+                    f"User task: {task_goal or ''}"
+                ),
+            },
+            session_metadata={"is_task_entry": False, "empty_tool_followup_guard": True},
         )
 
     def _run_agent_step(self, tools, task_goal: str | None = None):
@@ -1538,6 +1668,15 @@ class Agent:
             self._append_assistant_response(message)
 
             if not message.tool_calls:
+                if guard_state.executed_tool_count > 0 and not str(getattr(message, "content", "") or "").strip():
+                    if guard_state.completion_continue_count < self._MAX_TASK_COMPLETION_CONTINUES:
+                        # 工具结果之后只收到 usage 空响应时，补一个内部继续提示，避免交互模式静默结束。
+                        guard_state.completion_continue_count += 1
+                        self._append_empty_tool_followup_prompt(task_goal)
+                        continue
+                    empty_result = "模型在工具结果后连续返回空响应，已停止重试。"
+                    self.console.print(f"[yellow]{empty_result}[/]")
+                    return empty_result
                 # 没有工具调用，可能是任务结束了，先判断然后再返回结果
                 if not self._should_check_task_complete(task_goal, message, guard_state):
                     return message.content
@@ -1643,9 +1782,18 @@ class Agent:
 
     def _consume_stream_chunk(self, chunk, state: StreamResponseState) -> None:
         # 流式响应中若包含 usage 字段，则实时更新 token 统计。
-        self._update_usage_from_response(chunk)
-        choice = chunk.choices[0]
-        delta = choice.delta
+        usage = self._update_usage_from_response(chunk)
+        if usage:
+            state.usage = usage
+        choices = getattr(chunk, "choices", None) or []
+        if not choices:
+            # include_usage 的流式尾包可能只包含 usage 且 choices 为空，这类 chunk 不再解析正文或工具调用。
+            return
+
+        choice = choices[0]
+        delta = getattr(choice, "delta", None)
+        if delta is None:
+            return
 
         content = getattr(delta, "content", None)
         if content:
@@ -1714,6 +1862,7 @@ class Agent:
         return SimpleNamespace(
             content=content if content else None,
             tool_calls=ordered_tool_calls if ordered_tool_calls else None,
+            usage=state.usage,
         )
 
     def _start_spinner(
@@ -1731,33 +1880,6 @@ class Agent:
         spinner = Spinner(self.console, messages=messages, preset=preset, **context)
         spinner.start()
         return spinner
-
-    def _update_usage_from_response(self, response):
-        """
-        从 OpenAI 响应对象中提取 usage 并更新 token 统计。
-        :param response: 非流式 response 或流式 chunk
-        :return:
-        """
-        # 统一处理标准 OpenAI usage 字段，避免各处重复解析逻辑。
-        usage = getattr(response, "usage", None)
-        if usage is None:
-            return
-        prompt_tokens = getattr(usage, "prompt_tokens", None)
-        completion_tokens = getattr(usage, "completion_tokens", None)
-        total_tokens = getattr(usage, "total_tokens", None)
-
-        # 优先使用 total_tokens；若为空则回退为 prompt+completion。
-        if isinstance(total_tokens, int):
-            self._used_token = total_tokens
-            self._total_token = total_tokens
-            return
-
-        prompt = prompt_tokens if isinstance(prompt_tokens, int) else 0
-        completion = completion_tokens if isinstance(completion_tokens, int) else 0
-        estimated_total = prompt + completion
-        if estimated_total > 0:
-            self._used_token = estimated_total
-            self._total_token = estimated_total
 
     def _sub_agent(self, role, task):
         """
@@ -1855,9 +1977,9 @@ class Agent:
                     resp = self.client.chat.completions.create(model=self.model, messages=self.messages)
                 finally:
                     spinner.stop()
-                # 每次模型调用后更新 token 使用统计。
-                self._update_usage_from_response(resp)
-                self._append_message(resp.choices[0].message)
+                event = self._append_message(resp.choices[0].message)
+                message_id = event.get("message_id") if event else None
+                self._update_and_record_response_usage(resp, "inbox_digest", message_id=message_id)
                 self.inbox.clear()
 
             # 再拼接本次任务并执行
@@ -2491,7 +2613,7 @@ class Agent:
                 missing_names = ", ".join(self._missing_model_env_vars)
                 self.console.print(f"[yellow]新模型环境变量缺失：{missing_names}[/]")
                 return
-            self._max_context_tokens = self._load_model_context_window()
+            self._refresh_token_context_window()
             self.console.print(
                 f"[green]模型已切换为：{self.model}（上下文窗口：{self._max_context_tokens}）[/]"
             )
@@ -2541,7 +2663,7 @@ class Agent:
             missing_names = ", ".join(self._missing_model_env_vars)
             self.console.print(f"[yellow]模型 {target_model} 的环境变量缺失：{missing_names}[/]")
             return True, False
-        self._max_context_tokens = self._load_model_context_window()
+        self._refresh_token_context_window()
         self.console.print(f"[green]模型已切换为：{self.model}（上下文窗口：{self._max_context_tokens}）[/]")
         self._print_runtime_status()
         return True, False
@@ -2553,17 +2675,21 @@ class Agent:
         return True, False
 
     def _handle_cmd_status(self, _confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
-        # 展示当前模型状态（模型名、已用 token、token 总量）。
-        used_tokens = self._used_token or self._estimate_messages_tokens(self.messages, self._all_tools)
-        total_tokens = self._total_token or self._max_context_tokens
+        # 展示当前模型状态，优先使用 session 中已持久化的真实 API usage。
+        tracker = self._ensure_token_tracker()
+        session_usage = self._restore_session_usage_summary()
+        if session_usage.get("has_real_usage"):
+            used_tokens = int(session_usage.get("total_tokens") or 0)
+        else:
+            # status 只展示模型 API 返回的真实 usage；还没有模型调用时消耗为 0。
+            used_tokens = 0
         # status 命令展示 token 使用柱状图，直观反馈使用率。
-        usage_ratio = self._calculate_token_usage_ratio(used_tokens, self._max_context_tokens)
-        token_bar = self._render_token_usage_bar(usage_ratio)
+        usage_ratio = tracker.calculate_usage_ratio(used_tokens, self._max_context_tokens)
+        token_bar = tracker.render_usage_bar(usage_ratio)
         self.console.print(f"[dim]模型名：{self.model}[/]")
-        self.console.print(f"[dim]已使用 Token：{used_tokens}[/]")
-        self.console.print(f"[dim]Token 总量：{total_tokens}[/]")
+        self.console.print(f"[dim]Token 用量：{used_tokens}[/]")
         self.console.print(f"[dim]上下文窗口：{self._max_context_tokens}[/]")
-        self.console.print(f"[dim]上下文使用率：{usage_ratio * 100:.2f}%[/]")
+        self.console.print(f"[dim]Token 使用率：{usage_ratio * 100:.2f}%[/]")
         # 按评审意见直接打印柱状图，不额外增加提示前缀。
         self.console.print(token_bar)
         return True, False
@@ -2639,8 +2765,8 @@ class Agent:
         else:
             messages.insert(0, {"role": "system", "content": current_system_prompt})
         self.messages = messages
-        self._used_token = self._estimate_messages_tokens(self.messages, self._all_tools)
-        self._total_token = self._used_token
+        self._ensure_token_tracker().set_estimated_usage(self.messages, self._all_tools)
+        self._restore_session_usage_summary(session_id)
 
     def _reset_messages_for_session(self, record_system_message: bool):
         """
@@ -2653,8 +2779,7 @@ class Agent:
         self._current_task_full_context = None
         self._current_task_start_index = None
         self._current_turn_id = None
-        self._used_token = 0
-        self._total_token = 0
+        self._ensure_token_tracker().reset()
         if record_system_message:
             # 新会话需要把 system prompt 作为可恢复上下文的第一条消息。
             self._record_session_message(self.messages[0], turn_id=None)
@@ -2800,8 +2925,8 @@ class Agent:
             self._current_task_full_context = None
             self._current_task_start_index = None
             self._current_turn_id = None
-            self._used_token = self._estimate_messages_tokens(self.messages, self._all_tools)
-            self._total_token = self._used_token
+            self._ensure_token_tracker().set_estimated_usage(self.messages, self._all_tools)
+            self._restore_session_usage_summary(info["session_id"])
             # 继续历史会话时不再把下一条用户消息当作“第一个任务”自动改标题。
             self._session_title_auto_started = True
             self._session_interrupted_recorded = False
@@ -2869,38 +2994,6 @@ class Agent:
         # 用户手动设置的标题优先级最高，后续异步自动标题不会覆盖它。
         self._set_session_title(title, source="user", silent=False)
         return True, False
-
-    def _calculate_token_usage_ratio(self, used_tokens: int, context_window: int) -> float:
-        """
-        计算 token 使用率。
-        :param used_tokens: 已使用 token
-        :param context_window: 上下文窗口 token 上限
-        :return:
-        """
-        # 统一处理边界情况，避免除零并将结果限制在 0~1。
-        if context_window <= 0:
-            return 0.0
-        ratio = max(0.0, used_tokens / context_window)
-        return min(ratio, 1.0)
-
-    def _render_token_usage_bar(self, usage_ratio: float, width: int = 30) -> str:
-        """
-        渲染横向 token 使用柱状图。
-        :param usage_ratio: 使用率（0~1）
-        :param width: 柱状图宽度
-        :return:
-        """
-        # 使用 Unicode 方块字符绘制柱状图，并根据阈值设置颜色。
-        ratio = min(max(usage_ratio, 0.0), 1.0)
-        filled = int(width * ratio)
-        bar = "█" * filled + "░" * (width - filled)
-        if ratio >= 0.9:
-            color = "red"
-        elif ratio >= 0.7:
-            color = "yellow"
-        else:
-            color = "green"
-        return f"[{color}]{bar}[/{color}] {ratio * 100:.2f}%"
 
 """
 Team 类管理多个Agent，
