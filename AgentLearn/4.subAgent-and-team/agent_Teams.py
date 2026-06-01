@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Thread, current_thread
@@ -2036,7 +2037,10 @@ class Agent:
                     continue
 
                 # 上面分支都没中，就是用户任务了
+                task_started_at = time.perf_counter()
                 self.chat(user_input)
+                elapsed_seconds = time.perf_counter() - task_started_at
+                self.console.print(f"[green]已完成 {self._format_elapsed_time(elapsed_seconds)}[/]")
                 self.console.print()
             except OpenAIError as error:
                 self._print_model_call_error(error)
@@ -2152,6 +2156,21 @@ class Agent:
         """
         # 每轮输入前展示当前模型，模型切换后可自动反映最新状态。
         self.console.print(f"[dim]当前模型：{self.model}[/]")
+
+    def _format_elapsed_time(self, elapsed_seconds: float) -> str:
+        """
+        格式化任务耗时。
+        :param elapsed_seconds: 耗时秒数
+        :return: 形如 1h2m30s、2m30s、30s 的文本
+        """
+        total_seconds = max(0, int(round(elapsed_seconds)))
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        if hours:
+            return f"{hours}h{minutes}m{seconds}s"
+        if minutes:
+            return f"{minutes}m{seconds}s"
+        return f"{seconds}s"
 
     def _normalize_command(self, user_input: str) -> str:
         """
