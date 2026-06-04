@@ -74,8 +74,8 @@ class TokenTracker:
 
     def set_session_usage_summary(self, summary: dict[str, Any] | None) -> None:
         """
-        恢复当前会话的真实 API usage 累计。
-        :param summary: SessionManager 计算出的 usage 汇总
+        恢复当前主会话上下文的真实 usage。
+        :param summary: SessionManager 计算出的最新 assistant_response usage
         :return:
         """
         summary = summary or {}

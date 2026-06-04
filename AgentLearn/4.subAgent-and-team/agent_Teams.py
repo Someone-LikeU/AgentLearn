@@ -1,5 +1,4 @@
 # encoding : utf-8
-# @Time    : 2026/4/19
 import atexit
 import httpx
 import json
@@ -229,15 +228,13 @@ class Agent:
             )
         finally:
             startup_spinner.stop()
-        self._local_tools = self._tool_manager.local_tools
-        self._local_functions = self._tool_manager.local_functions
         self._mcp_tools = self._tool_manager.mcp_tools
         self._available_functions = self._tool_manager.available_functions
         self._all_tools = self._tool_manager.all_tools
         self._all_tools_without_make_plan = self._build_tools_without_make_plan(self._all_tools)
         mcp_tool_count = len(self._mcp_tools) if self.mcp_client else 0
         mcp_status = f"{mcp_tool_count} MCP tools" if self.mcp_client else "MCP disabled"
-        self.console.print(f"[dim]工具加载完成：{len(self._local_tools)} local tools，{mcp_status}[/]")
+        self.console.print(f"[dim]工具加载完成：{len(self._tool_manager.local_tools)} local tools，{mcp_status}[/]")
 
         # 基础提示词，用于主 Agent。
         self._base_prompt_main_agent = load_prompt("base_main_agent.md")
@@ -319,9 +316,13 @@ class Agent:
             message_id: str | None = None,
             metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
-        usage = self._update_usage_from_response(response)
+        tracker = self._ensure_token_tracker()
+        usage = tracker.extract_usage(response)
         if not usage:
             return None
+        if response_kind == "assistant_response":
+            # 只有主会话 assistant_response 会更新当前上下文 token；独立检查请求只持久化，不覆盖状态。
+            tracker.update_from_response(usage)
         return self._record_response_usage(usage, response_kind, message_id=message_id, metadata=metadata)
 
     def _record_response_usage(
@@ -359,7 +360,7 @@ class Agent:
         if session_manager is None or not target_session_id:
             tracker.clear_session_usage()
             return tracker.session_usage_summary()
-        summary = session_manager.calculate_session_usage(target_session_id)
+        summary = session_manager.calculate_session_usage(target_session_id, include_deleted=False)
         tracker.set_session_usage_summary(summary)
         return summary
 
@@ -689,39 +690,70 @@ class Agent:
     def _schedule_memory_update(self, task, result):
         if not self._is_main_agent or self.memory_manager is None:
             return
+        session_id = self.session_manager.current_session_id if self.session_manager is not None else None
+        last_memory_checked_event_id = (
+            self.session_manager.latest_event_id(session_id)
+            if self.session_manager is not None and session_id
+            else None
+        )
         # 长期记忆摘要异步执行，避免拖慢当前任务完成。
         future = self.memory_manager.enqueue(
             task=task,
             result=result,
             context=self._current_task_full_context or [],
-            session_id=self.session_manager.current_session_id if self.session_manager is not None else None,
+            session_id=session_id,
             turn_id=self._current_turn_id,
+            last_memory_checked_event_id=last_memory_checked_event_id,
         )
         if future is None or self.session_manager is None or not self._current_turn_id:
             return
 
-        turn_id = self._current_turn_id
+        self._attach_memory_future_session_callback(future, session_id=session_id, turn_id=self._current_turn_id)
+
+    def _attach_memory_future_session_callback(self, future, session_id: str | None, turn_id: str | None):
+        if future is None or self.session_manager is None or not turn_id:
+            return
 
         def _record_memory_saved(done_future):
             try:
                 index_record = done_future.result()
                 if not index_record:
                     return
-                # 只有长期记忆真正落盘后，才把 task_id 关联到当前 turn。
-                self.session_manager.record_memory_saved(
+                memory_status = index_record.get("memory_status") or "unknown"
+                # 每个 turn 都记录记忆处理 cursor，避免继续旧 session 后重复处理旧历史。
+                self.session_manager.record_memory_checked(
                     turn_id=turn_id,
+                    last_memory_checked_event_id=index_record.get("last_memory_checked_event_id"),
+                    status=memory_status,
                     task_id=index_record.get("task_id"),
-                    full_context_path=index_record.get("full_context_path"),
+                    metadata={
+                        "skip_reason": index_record.get("skip_reason"),
+                        "memory_item_count": index_record.get("memory_item_count", 0),
+                    },
+                    session_id=session_id,
                 )
+                if memory_status == "captured":
+                    # 只有长期记忆真正沉淀为 topic item 后，才把 task_id 关联到当前 turn。
+                    self.session_manager.record_memory_saved(
+                        turn_id=turn_id,
+                        task_id=index_record.get("task_id"),
+                        full_context_path=index_record.get("full_context_path"),
+                        metadata={"memory_item_count": index_record.get("memory_item_count", 0)},
+                        session_id=session_id,
+                    )
             except Exception as error:
                 try:
-                    self.session_manager.append_event(
+                    event = (
                         {
                             "event": "memory_save_error",
                             "turn_id": turn_id,
                             "error": str(error),
                         }
                     )
+                    if session_id:
+                        self.session_manager.append_event_to_session(session_id, event)
+                    else:
+                        self.session_manager.append_event(event)
                 except Exception:
                     pass
 
@@ -885,7 +917,12 @@ class Agent:
         if not self._is_main_agent or self.memory_manager is None:
             return
         if self.memory_manager.has_pending():
-            self.console.print("[dim]还有记忆整理任务未完成，正在等待完成后退出...[/]")
+            pending_count = self.memory_manager.pending_count()
+            timeout = self.memory_manager.memory_request_timeout
+            self.console.print(
+                f"[dim]还有 {pending_count} 个记忆整理任务未完成，正在等待完成后退出"
+                f"（后台模型请求最长约 {timeout:g} 秒）...[/]"
+            )
         self.memory_manager.shutdown()
 
     def _wait_for_pending_memory_updates(self):
@@ -896,9 +933,18 @@ class Agent:
         if not self._is_main_agent or self.memory_manager is None:
             return
         if self.memory_manager.has_pending():
-            self.console.print("[dim]还有记忆整理任务未完成，正在等待完成后切换会话...[/]")
+            pending_count = self.memory_manager.pending_count()
+            timeout = self.memory_manager.memory_request_timeout
+            self.console.print(
+                f"[dim]还有 {pending_count} 个记忆整理任务未完成，正在等待完成后切换会话...[/]"
+            )
         # 切换会话前只等待后台任务归档完成，后续新任务仍需要继续写长期记忆。
         self.memory_manager.wait_for_pending()
+
+    def _enqueue_session_end_memory_compaction(self):
+        if not self._is_main_agent or self.memory_manager is None:
+            return
+        self.memory_manager.enqueue_compact_memory_index(reason="session_end")
 
     def _register_session_exit_hook(self):
         """
@@ -987,7 +1033,7 @@ class Agent:
         if self.messages:
             self._record_session_message(self.messages[0], turn_id=None)
         # 这里只在新建 session 的分支执行；已有会话会在前面的 current_session_id 分支直接返回。
-        # 清空会话级 usage 是为了避免新会话继承上一个会话的累计 API token。
+        # 清空会话级 usage 是为了避免新会话继承上一个会话的上下文 token。
         self._ensure_token_tracker().clear_session_usage()
         return session_id
 
@@ -1568,12 +1614,16 @@ class Agent:
             guard_state: ToolFailureGuardState,
     ) -> bool:
         if not task_goal:
+            print("not task goal hit")
             return False
         if guard_state.completion_continue_count >= self._MAX_TASK_COMPLETION_CONTINUES:
+            print("completion continue count >= hit")
             return False
         if self._is_trivial_task(task_goal):
+            print("trivial task hit")
             return False
         if self._looks_like_terminal_response(getattr(message, "content", None)):
+            print("looks like terminal response hit")
             return False
         # 计划步骤、工具链任务和执行型任务才需要额外判断，普通问答直接结束。
         return self.plan_mode or guard_state.executed_tool_count > 0 or self._is_execution_task(task_goal)
@@ -1680,9 +1730,11 @@ class Agent:
                     return empty_result
                 # 没有工具调用，可能是任务结束了，先判断然后再返回结果
                 if not self._should_check_task_complete(task_goal, message, guard_state):
+                    print("no tool call, and no need to check task complete")
                     return message.content
 
                 status = self._check_task_complete(task_goal, message.content)
+                print("check task complete, status is ", status)
                 # 任务没有完成，需要继续
                 if status == "CONTINUE":
                     guard_state.completion_continue_count += 1
@@ -2047,7 +2099,9 @@ class Agent:
                 self.console.print()
             except KeyboardInterrupt:
                 self._record_session_interrupted("keyboard_interrupt")
+                self._wait_for_pending_memory_updates()
                 self._end_session()
+                self._enqueue_session_end_memory_compaction()
                 try:
                     self._wait_for_memory_tasks()
                 except KeyboardInterrupt:
@@ -2072,9 +2126,9 @@ class Agent:
             ("clear", "清空当前终端窗口显示内容"),
             ("help / h", "显示帮助信息"),
             ("exit / q / quit", "退出当前 Agent 会话"),
-            ("clear session", "清空当前短期会话上下文"),
-            ("clear history", "清空当前会话上下文和长期记忆"),
-            ("clear memory", "只清空长期记忆"),
+            ("clear current_session", "清空当前会话,可选删除本会话任务记忆"),
+            ("clear sessions", "选择并删除历史会话及对应记忆"),
+            ("clear all_history", "删除全部历史会话及对应记忆"),
             ("bash approve on", "开启 Bash 命令人工确认"),
             ("bash approve off", "关闭 Bash 命令人工确认"),
             ("model_list/models", "查看可用模型配置"),
@@ -2083,6 +2137,8 @@ class Agent:
             ("model <name|编号>", "切换到指定模型"),
             ("tools", "列出当前可用工具"),
             ("compact", "压缩当前会话上下文"),
+            ("memory compact", "整理长期记忆索引"),
+            ("memory summarize sessions", "整理所有历史会话提炼长期记忆"),
             ("status", "查看当前运行状态"),
             ("history", "查看当前会话用户任务历史"),
             ("sessions", "列出最近会话"),
@@ -2109,7 +2165,7 @@ class Agent:
         :return:
         """
         tool_groups = [
-            ("本地工具", self._local_tools),
+            ("本地工具", self._tool_manager.local_tools),
             ("MCP 工具", self._mcp_tools),
         ]
         has_tools = False
@@ -2353,9 +2409,10 @@ class Agent:
             "quit": self._handle_cmd_exit,
             "help": self._handle_cmd_help,
             "h": self._handle_cmd_help,
-            "clear session": self._handle_cmd_clear_session,
-            "clear history": self._handle_cmd_clear_history,
-            "clear memory": self._handle_cmd_clear_memory,
+            "clear current_session": self._handle_cmd_clear_current_session,
+            "clear session": self._handle_cmd_clear_current_session,
+            "clear sessions": self._handle_cmd_clear_sessions,
+            "clear all_history": self._handle_cmd_clear_all_history,
             "bash approve on": self._handle_cmd_bash_approve_on,
             "bash approve off": self._handle_cmd_bash_approve_off,
             "model_list": self._handle_cmd_model_list,
@@ -2366,6 +2423,8 @@ class Agent:
             "clear": self._handle_cmd_clear_screen,
             "campact": self._handle_cmd_compact_history,
             "compact": self._handle_cmd_compact_history,
+            "memory compact": self._handle_cmd_memory_compact,
+            "memory summarize sessions": self._handle_cmd_memory_summarize_sessions,
             "status": self._handle_cmd_status,
             "history": self._handle_cmd_history,
             "sessions": self._handle_cmd_sessions,
@@ -2379,8 +2438,10 @@ class Agent:
 
     def _handle_cmd_exit(self, _confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
         # 退出命令处理。
-        self._wait_for_memory_tasks()
+        self._wait_for_pending_memory_updates()
         self._end_session()
+        self._enqueue_session_end_memory_compaction()
+        self._wait_for_memory_tasks()
         self.console.print("\n[bold red] See you next time! [/]")
         return True, True
 
@@ -2420,30 +2481,239 @@ class Agent:
         self.console.clear()
         return True, False
 
-    def _handle_cmd_clear_session(self, confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
-        # 仅清空当前会话历史，不影响长期记忆。
-        confirm_input = self.console.input("[bold cyan]是否确认清除当前会话历史？(yes/y)[/] ")
-        if self._normalize_command(confirm_input) in confirm_choice:
-            self._build_system_prompt()
-            self.console.print("[dim]当前对话历史已清空[/]")
+    def _handle_cmd_clear_current_session(self, _confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
+        # 当前会话采用追加 session_cleared 事件的逻辑清空，不硬改 session 文件。
+        session_manager = self.session_manager
+        session_id = getattr(session_manager, "current_session_id", None)
+        if not self._confirm_irreversible_delete(
+                "清空当前会话",
+                "当前会话上下文会被清空",
+        ):
+            return True, False
+
+        delete_memory = self._confirm_default_yes("[bold cyan]是否同时删除当前会话所有任务对应记忆？(Y/n，默认删除)[/] ")
+        self._wait_for_pending_memory_updates()
+        memory_result = None
+        memory_task_ids = []
+        if session_id and delete_memory:
+            active_turn_ids = [
+                task.get("turn_id")
+                for task in session_manager.list_tasks(session_id)
+                if task.get("turn_id")
+            ]
+            memory_result = self._delete_memories_for_session_turns(session_id, active_turn_ids)
+            memory_task_ids = memory_result.get("deleted_task_ids") or memory_result.get("task_ids", [])
+
+        if session_manager is not None and session_id:
+            session_manager.record_session_cleared(delete_memory=delete_memory, memory_task_ids=memory_task_ids)
+            self._reset_messages_for_session(record_system_message=True)
+            self._restore_session_usage_summary(session_id)
+        else:
+            self._reset_messages_for_session(record_system_message=False)
+
+        if memory_result:
+            self.console.print(
+                f"[dim]当前会话已清空；已删除记忆 {memory_result.get('deleted_task_count', 0)} 条，"
+                f"完整上下文文件 {memory_result.get('deleted_full_context_count', 0)} 个。[/]"
+            )
+        else:
+            self.console.print("[dim]当前会话已清空；未删除长期记忆。[/]")
         return True, False
 
-    def _handle_cmd_clear_history(self, confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
-        # 清空当前会话历史并清空历史记忆。
-        confirm_input = self.console.input("[bold cyan]是否确认清除当前会话历史和全部历史记忆？(yes/y)[/] ")
-        if self._normalize_command(confirm_input) in confirm_choice:
-            self._build_system_prompt()
-            self._clear_memory()
-            self.console.print("[dim]当前对话历史与历史记忆已清空；full_context 文件未批量删除[/]")
+    def _handle_cmd_clear_sessions(self, _confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
+        # 选择性硬删除历史 session 文件和对应长期记忆；当前会话不允许从该入口删除。
+        if self.session_manager is None:
+            self.console.print("[yellow]当前没有可管理的主会话。[/]")
+            return True, False
+        sessions = self.session_manager.list_sessions(limit=100, include_empty=True)
+        if not sessions:
+            self.console.print("[yellow]暂无可删除的历史会话。[/]")
+            return True, False
+
+        self._print_sessions_table(sessions)
+        selector = self.console.input("[bold cyan]请输入要删除的会话编号或 session_id（空格分隔，或 all）：[/] ").strip()
+        if self._normalize_command(selector) == "all":
+            return self._handle_cmd_clear_all_history(_confirm_choice)
+
+        target_session_ids = self._resolve_session_delete_targets(selector, sessions)
+        current_session_id = self.session_manager.current_session_id
+        if current_session_id in target_session_ids:
+            self.console.print("[yellow]已跳过当前会话；请使用 clear current_session 清空当前会话。[/]")
+            target_session_ids = [session_id for session_id in target_session_ids if session_id != current_session_id]
+        if not target_session_ids:
+            self.console.print("[yellow]没有可删除的目标会话。[/]")
+            return True, False
+
+        details = "\n".join(f"- {session_id}" for session_id in target_session_ids[:20])
+        if len(target_session_ids) > 20:
+            details += f"\n- ... 还有 {len(target_session_ids) - 20} 个"
+        if not self._confirm_irreversible_delete(
+                "硬删除指定会话",
+                f"将删除 {len(target_session_ids)} 个 session 文件及其对应长期记忆：\n{details}",
+        ):
+            return True, False
+
+        result = self._delete_sessions_and_memories(target_session_ids)
+        self._print_delete_sessions_result(result)
         return True, False
 
-    def _handle_cmd_clear_memory(self, confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
-        # 兼容旧命令 clear memory，行为与 clear history 一致。
-        confirm_input = self.console.input("[bold cyan]是否确认清除历史记忆？(yes/y)[/] ")
-        if self._normalize_command(confirm_input) in confirm_choice:
-            self._clear_memory()
-            self.console.print("[dim]记忆索引和汇总已清空；full_context 文件未批量删除[/]")
+    def _handle_cmd_clear_all_history(self, _confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
+        # 删除所有历史会话；若当前处于会话中，则保留当前会话和它对应的记忆。
+        if self.session_manager is None:
+            self.console.print("[yellow]当前没有可管理的主会话。[/]")
+            return True, False
+        sessions = self.session_manager.list_sessions(limit=10000, include_empty=True)
+        current_session_id = self.session_manager.current_session_id
+        target_session_ids = [
+            item.get("session_id")
+            for item in sessions
+            if item.get("session_id") and item.get("session_id") != current_session_id
+        ]
+        delete_all_memories = current_session_id is None
+        if delete_all_memories:
+            target_session_ids = [item.get("session_id") for item in sessions if item.get("session_id")]
+        if not target_session_ids and not delete_all_memories:
+            self.console.print("[yellow]没有当前会话之外的历史会话可删除。[/]")
+            return True, False
+
+        kept_text = f"\n当前会话 {current_session_id} 会被保留。" if current_session_id else "\n当前未处于会话中，所有记忆都会被删除。"
+        if not self._confirm_irreversible_delete(
+                "硬删除全部历史",
+                f"将删除 {len(target_session_ids)} 个 session 文件及其对应长期记忆。{kept_text}",
+        ):
+            return True, False
+
+        result = self._delete_sessions_and_memories(target_session_ids, delete_all_memories=delete_all_memories)
+        if current_session_id:
+            # 删除其他会话记忆后刷新当前 system prompt，避免继续携带已删除记忆视图。
+            self._reload_messages_after_turn_delete(current_session_id)
+        else:
+            self._reset_messages_for_session(record_system_message=False)
+        self._print_delete_sessions_result(result)
         return True, False
+
+    def _confirm_irreversible_delete(self, title: str, details: str) -> bool:
+        self.console.print(
+            Panel(
+                f"[bold red]{details}[/]\n\n[red]该删除操作为高危操作，执行后不可逆。[/]",
+                title=f"[bold red]{title}[/]",
+                border_style="red",
+            )
+        )
+        confirm_input = self.console.input("[bold red]输入 yes/y 确认执行删除：[/] ")
+        return self._normalize_command(confirm_input) in {"yes", "y", "是", "确认", "对"}
+
+    def _confirm_default_yes(self, prompt: str) -> bool:
+        value = self._normalize_command(self.console.input(prompt))
+        return value not in {"n", "no", "否", "不", "取消"}
+
+    def _resolve_session_delete_targets(self, selector: str, sessions: list[dict[str, Any]]) -> list[str]:
+        session_by_index = {
+            str(index): item.get("session_id")
+            for index, item in enumerate(sessions, start=1)
+            if item.get("session_id")
+        }
+        known_session_ids = {item.get("session_id") for item in sessions if item.get("session_id")}
+        target_session_ids = []
+        for token in re.split(r"[\s,]+", selector or ""):
+            if not token:
+                continue
+            session_id = session_by_index.get(token) if token.isdigit() else token
+            if not session_id:
+                self.console.print(f"[yellow]会话编号无效：{token}[/]")
+                continue
+            if session_id not in known_session_ids and not self.session_manager.load_session(session_id):
+                self.console.print(f"[yellow]未找到会话：{session_id}[/]")
+                continue
+            if session_id not in target_session_ids:
+                target_session_ids.append(session_id)
+        return target_session_ids
+
+    def _delete_memories_for_sessions(self, session_ids: list[str]) -> dict[str, Any]:
+        # 硬删除历史 session 时保留旧 memory_saved 引用作为兼容输入，同时让 MemoryManager 按 task_index 反查新结构记录。
+        refs = []
+        if self.session_manager is not None:
+            for session_id in session_ids:
+                refs.extend(self.session_manager.session_memory_refs(session_id))
+        task_ids = sorted({ref.get("task_id") for ref in refs if ref.get("task_id")})
+        full_context_paths = sorted({ref.get("full_context_path") for ref in refs if ref.get("full_context_path")})
+        if self.memory_manager is None:
+            return {
+                "task_ids": task_ids,
+                "deleted_task_count": 0,
+                "deleted_full_context_count": 0,
+                "missing_full_context_count": 0,
+            }
+        result = self.memory_manager.delete_memories(
+            task_ids=task_ids,
+            session_ids=session_ids,
+            full_context_paths=full_context_paths,
+        )
+        result["task_ids"] = result.get("deleted_task_ids") or task_ids
+        return result
+
+    def _delete_memories_for_session_turns(self, session_id: str, turn_ids: list[str]) -> dict[str, Any]:
+        # 当前会话逻辑清空只处理最近一次 session_cleared 之后的可见任务，避免误删早先已保留的记忆。
+        normalized_turn_ids = [turn_id for turn_id in turn_ids if turn_id]
+        if self.memory_manager is None or not normalized_turn_ids:
+            return {
+                "task_ids": [],
+                "deleted_task_ids": [],
+                "deleted_task_count": 0,
+                "deleted_full_context_count": 0,
+                "missing_full_context_count": 0,
+            }
+        result = self.memory_manager.delete_memories(
+            session_ids=[session_id],
+            turn_ids=normalized_turn_ids,
+        )
+        result["task_ids"] = result.get("deleted_task_ids") or []
+        return result
+
+    def _delete_sessions_and_memories(
+            self,
+            session_ids: list[str],
+            delete_all_memories: bool = False,
+    ) -> dict[str, Any]:
+        self._wait_for_pending_memory_updates()
+        if self.memory_manager is not None:
+            memory_result = (
+                self.memory_manager.delete_all_memories()
+                if delete_all_memories
+                else self._delete_memories_for_sessions(session_ids)
+            )
+        else:
+            memory_result = {"deleted_task_count": 0, "deleted_full_context_count": 0}
+
+        deleted_sessions = []
+        failed_sessions = []
+        if self.session_manager is not None:
+            for session_id in session_ids:
+                result = self.session_manager.delete_session_file(session_id)
+                if result.get("deleted"):
+                    deleted_sessions.append(result)
+                else:
+                    failed_sessions.append(result)
+        return {
+            "memory": memory_result,
+            "deleted_sessions": deleted_sessions,
+            "failed_sessions": failed_sessions,
+        }
+
+    def _print_delete_sessions_result(self, result: dict[str, Any]) -> None:
+        memory_result = result.get("memory") or {}
+        deleted_sessions = result.get("deleted_sessions") or []
+        failed_sessions = result.get("failed_sessions") or []
+        self.console.print(
+            "[dim]"
+            f"已删除 session {len(deleted_sessions)} 个；"
+            f"已删除记忆 {memory_result.get('deleted_task_count', 0)} 条；"
+            f"已删除完整上下文文件 {memory_result.get('deleted_full_context_count', 0)} 个。"
+            "[/]"
+        )
+        if failed_sessions:
+            failed_text = ", ".join(item.get("session_id") or "-" for item in failed_sessions)
+            self.console.print(f"[yellow]以下 session 删除失败或不存在：{failed_text}[/]")
 
     def _handle_cmd_bash_approve_on(self, _confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
         # 开启 Bash 自动确认。
@@ -2693,8 +2963,87 @@ class Agent:
         self.console.print("[dim]已执行会话压缩检查（达到阈值时会执行压缩）。[/]")
         return True, False
 
+    def _handle_cmd_memory_compact(self, _confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
+        if self.memory_manager is None:
+            self.console.print("[yellow]当前没有可整理的长期记忆。[/]")
+            return True, False
+        result = self.memory_manager.compact_memory_index(force=True, reason="manual")
+        if result.get("status") == "compacted":
+            self.console.print(f"[dim]MEMORY.md 已整理：{result.get('memory_index_path')}[/]")
+        else:
+            self.console.print("[dim]当前没有值得整理的新长期记忆。[/]")
+        return True, False
+
+    def _handle_cmd_memory_summarize_sessions(self, _confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
+        if self.session_manager is None or self.memory_manager is None:
+            self.console.print("[yellow]当前没有可整理的历史 session 或长期记忆管理器。[/]")
+            return True, False
+        self._wait_for_pending_memory_updates()
+        sessions = self.session_manager.list_sessions(limit=10000, include_empty=False)
+        candidates = self._collect_unchecked_session_tasks(sessions)
+        if not candidates:
+            self.console.print("[dim]没有发现需要纳入新记忆系统的历史任务。[/]")
+            return True, False
+
+        self.console.print(f"[dim]发现 {len(candidates)} 个未经过新记忆系统检查的历史任务。[/]")
+        if not self._confirm_default_yes("[bold cyan]是否开始整理这些历史任务？(Y/n，默认开始)[/] "):
+            return True, False
+
+        scheduled = 0
+        for item in candidates:
+            future = self.memory_manager.enqueue(
+                task=item["task"],
+                result=item["result"],
+                context=[
+                    {"role": "user", "content": item["task"]},
+                    {"role": "assistant", "content": item["result"]},
+                ],
+                session_id=item["session_id"],
+                turn_id=item["turn_id"],
+                last_memory_checked_event_id=item["last_event_id"],
+            )
+            if future is not None:
+                scheduled += 1
+                self._attach_memory_future_session_callback(
+                    future,
+                    session_id=item["session_id"],
+                    turn_id=item["turn_id"],
+                )
+        self._wait_for_pending_memory_updates()
+        self.console.print(f"[dim]历史任务整理完成：已检查 {scheduled} 个任务。[/]")
+        return True, False
+
+    def _collect_unchecked_session_tasks(self, sessions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        candidates = []
+        for session in sessions:
+            session_id = session.get("session_id")
+            if not session_id:
+                continue
+            events = self.session_manager.load_session(session_id)
+            checked_turn_ids = {
+                event.get("turn_id")
+                for event in events
+                if event.get("event") == "memory_checked" and event.get("turn_id")
+            }
+            tasks = self.session_manager.list_tasks(session_id)
+            last_event_id = self.session_manager.latest_event_id(session_id)
+            for task in tasks:
+                turn_id = task.get("turn_id")
+                if not turn_id or turn_id in checked_turn_ids:
+                    continue
+                candidates.append(
+                    {
+                        "session_id": session_id,
+                        "turn_id": turn_id,
+                        "task": task.get("content") or "",
+                        "result": task.get("final_output") or "",
+                        "last_event_id": last_event_id,
+                    }
+                )
+        return candidates
+
     def _handle_cmd_status(self, _confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
-        # 展示当前模型状态，优先使用 session 中已持久化的真实 API usage。
+        # 展示当前模型状态，优先使用 session 中最新 assistant_response 的真实 usage。
         tracker = self._ensure_token_tracker()
         session_usage = self._restore_session_usage_summary()
         if session_usage.get("has_real_usage"):
@@ -2706,9 +3055,11 @@ class Agent:
         usage_ratio = tracker.calculate_usage_ratio(used_tokens, self._max_context_tokens)
         token_bar = tracker.render_usage_bar(usage_ratio)
         self.console.print(f"[dim]模型名：{self.model}[/]")
-        self.console.print(f"[dim]Token 用量：{used_tokens}[/]")
+        self.console.print(f"[dim]已使用上下文 Token：{used_tokens}[/]")
         self.console.print(f"[dim]上下文窗口：{self._max_context_tokens}[/]")
-        self.console.print(f"[dim]Token 使用率：{usage_ratio * 100:.2f}%[/]")
+        self.console.print(f"[dim]上下文使用率：{usage_ratio * 100:.2f}%[/]")
+        if session_usage.get("is_stale"):
+            self.console.print("[yellow]Token 用量已因删除中间任务失效，下一个问题后会用真实 usage 更新。[/]")
         # 按评审意见直接打印柱状图，不额外增加提示前缀。
         self.console.print(token_bar)
         return True, False
@@ -2749,15 +3100,58 @@ class Agent:
             return False
 
         session_id = self.session_manager.current_session_id
-        memory_task_ids = [task_id for task_id in (task.get("memory_task_ids") or []) if task_id]
+        self._wait_for_pending_memory_updates()
+        tasks = self.session_manager.list_tasks()
+        selected_index = next((index for index, item in enumerate(tasks) if item.get("turn_id") == turn_id), None)
+        if selected_index is None:
+            self.console.print("[yellow]无法删除：任务已经不存在或当前会话已被清空。[/]")
+            return False
+
+        following_tasks = tasks[selected_index + 1:]
+        delete_following = False
+        if following_tasks:
+            self.console.print(
+                f"[yellow]任务 {task.get('index')} 之后还有 {len(following_tasks)} 个任务，"
+                "这些任务可能依赖被删除任务的上下文，推荐一并删除。[/]"
+            )
+            delete_following = self._confirm_default_yes(
+                "[bold cyan]是否同时删除该任务之后的所有任务？(Y/n，默认删除)[/] "
+            )
+        tasks_to_delete = tasks[selected_index:] if delete_following else [tasks[selected_index]]
+        delete_memory = self._confirm_default_yes(
+            "[bold cyan]是否同时硬删除这些任务对应的长期记忆？(Y/n，默认删除)[/] "
+        )
+        memory_task_ids = self._history_task_memory_ids(tasks_to_delete)
+        turn_ids_to_delete = [
+            item.get("turn_id")
+            for item in tasks_to_delete
+            if item.get("turn_id")
+        ]
         try:
-            # 删除采用追加式软删除事件，不物理删除 session 文件或长期记忆上下文文件。
-            self.session_manager.mark_turn_deleted(turn_id=turn_id, task_ids=memory_task_ids)
-            if self.memory_manager is not None:
-                self.memory_manager.record_deleted_task(
-                    session_id=session_id,
-                    turn_id=turn_id,
+            memory_result = None
+            deleted_memory_task_ids = memory_task_ids
+            deleted_task_ids_by_turn = {}
+            if delete_memory and self.memory_manager is not None:
+                # 新记忆系统里 skipped 任务没有 memory_saved 事件，因此必须按 turn_id 反查 task_index。
+                memory_result = self.memory_manager.delete_memories(
                     task_ids=memory_task_ids,
+                    session_ids=[session_id] if session_id else None,
+                    turn_ids=turn_ids_to_delete,
+                )
+                deleted_memory_task_ids = memory_result.get("deleted_task_ids") or memory_task_ids
+                deleted_task_ids_by_turn = memory_result.get("deleted_task_ids_by_turn") or {}
+            for item in tasks_to_delete:
+                item_turn_id = item.get("turn_id")
+                if not item_turn_id:
+                    continue
+                item_task_ids = deleted_task_ids_by_turn.get(item_turn_id) or [
+                    task_id
+                    for task_id in (item.get("memory_task_ids") or [])
+                    if task_id in deleted_memory_task_ids
+                ]
+                self.session_manager.mark_turn_deleted(
+                    turn_id=item_turn_id,
+                    task_ids=item_task_ids,
                 )
             if session_id:
                 self._reload_messages_after_turn_delete(session_id)
@@ -2765,8 +3159,32 @@ class Agent:
             self.console.print(f"[yellow]删除任务失败：{error}[/]")
             return False
 
-        self.console.print(f"[dim]已删除任务 {task.get('index')}（turn_id: {turn_id}）[/]")
+        deleted_indexes = ", ".join(str(item.get("index")) for item in tasks_to_delete)
+        self.console.print(f"[dim]已删除任务 {deleted_indexes}。[/]")
+        if memory_result is not None:
+            self.console.print(
+                f"[dim]已硬删除长期记忆 {memory_result.get('deleted_task_count', 0)} 条，"
+                f"完整上下文文件 {memory_result.get('deleted_full_context_count', 0)} 个。[/]"
+            )
+        elif delete_memory:
+            self.console.print("[dim]未找到需要硬删除的长期记忆。[/]")
+        if following_tasks and not delete_following:
+            self.console.print("[yellow]已保留后续任务；当前 token 用量记录已失效，下一个问题后会用真实 usage 更新。[/]")
         return True
+
+    @staticmethod
+    def _history_task_memory_ids(tasks: list[dict[str, Any]]) -> list[str]:
+        """
+        提取 history 任务关联的长期记忆 task_id。
+        :param tasks: 待删除的 history 任务
+        :return: 去重后的 task_id 列表
+        """
+        memory_task_ids = []
+        for task in tasks:
+            for task_id in task.get("memory_task_ids") or []:
+                if task_id and task_id not in memory_task_ids:
+                    memory_task_ids.append(task_id)
+        return memory_task_ids
 
     def _reload_messages_after_turn_delete(self, session_id: str) -> None:
         """
@@ -2812,10 +3230,13 @@ class Agent:
         if self.session_manager is None:
             return []
         messages = self.session_manager.rebuild_messages(session_id)
+        system_prompt = self._build_system_prompt()
         if not messages or messages[0].get("role") != "system":
             # 老会话缺少 system message 时，只在内存中补齐，不反向改写历史文件。
-            system_prompt = self._cached_system_prompt or self._build_system_prompt()
             messages.insert(0, {"role": "system", "content": system_prompt})
+        else:
+            # 长期记忆可能已被清理，恢复会话时用最新 system prompt 替换历史快照。
+            messages[0] = {"role": "system", "content": system_prompt}
         return messages
 
     def _format_session_time(self, value: Any) -> str:
@@ -2887,6 +3308,7 @@ class Agent:
             return True, False
         self._wait_for_pending_memory_updates()
         self._end_session()
+        self._enqueue_session_end_memory_compaction()
         self.session_manager.detach_current_session()
         self._session_title_auto_started = False
         self._session_interrupted_recorded = False
@@ -2940,6 +3362,13 @@ class Agent:
             if current_session_id and current_session_id != target_session_id:
                 self._end_session()
             info = self.session_manager.switch_session(target_session_id)
+            if info.get("resume_event_id"):
+                self.session_manager.record_memory_checked(
+                    turn_id=None,
+                    last_memory_checked_event_id=info.get("resume_event_id"),
+                    status="cursor_only",
+                    metadata={"reason": "session_resumed"},
+                )
             self.messages = self._load_messages_from_session(info["session_id"])
             self._current_task_full_context = None
             self._current_task_start_index = None

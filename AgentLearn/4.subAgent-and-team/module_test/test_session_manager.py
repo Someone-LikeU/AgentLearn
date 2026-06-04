@@ -7,6 +7,7 @@ from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SESSION_TEST_TEMP_DIR = PROJECT_ROOT / "module_test" / "session_test_temp"
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -92,7 +93,48 @@ class SessionManagerTest(unittest.TestCase):
             self.assertEqual(manager.list_tasks(session_id), [])
             self.assertEqual(manager.rebuild_messages(session_id), [{"role": "system", "content": "system prompt"}])
 
-    def test_response_usage_is_recorded_and_summarized(self):
+    def test_session_cleared_filters_prior_context_tasks_and_usage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = SessionManager(project_root=tmp)
+            session_id = manager.start_session("test-model")
+            old_turn_id = manager.create_turn_id()
+            new_turn_id = manager.create_turn_id()
+
+            manager.append_message({"role": "system", "content": "old system"})
+            manager.append_message(
+                {"role": "user", "content": "旧任务"},
+                turn_id=old_turn_id,
+                metadata={"is_task_entry": True},
+            )
+            manager.append_message({"role": "assistant", "content": "旧结果"}, turn_id=old_turn_id)
+            manager.record_response_usage(
+                turn_id=old_turn_id,
+                usage={"prompt_tokens": 10, "completion_tokens": 1, "total_tokens": 11},
+                response_kind="assistant_response",
+            )
+            manager.record_session_cleared(delete_memory=True, memory_task_ids=["task_20260519_120000_abcdef"])
+            manager.append_message({"role": "system", "content": "new system"})
+            manager.append_message(
+                {"role": "user", "content": "新任务"},
+                turn_id=new_turn_id,
+                metadata={"is_task_entry": True},
+            )
+            manager.record_response_usage(
+                turn_id=new_turn_id,
+                usage={"prompt_tokens": 20, "completion_tokens": 2, "total_tokens": 22},
+                response_kind="assistant_response",
+            )
+
+            messages = manager.rebuild_messages(session_id)
+            tasks = manager.list_tasks(session_id)
+            usage = manager.calculate_session_usage(session_id)
+
+            self.assertEqual(messages, [{"role": "system", "content": "new system"}, {"role": "user", "content": "新任务"}])
+            self.assertEqual([task["content"] for task in tasks], ["新任务"])
+            self.assertEqual(usage["prompt_tokens"], 20)
+            self.assertEqual(usage["total_tokens"], 22)
+
+    def test_response_usage_uses_latest_assistant_response_for_context(self):
         with tempfile.TemporaryDirectory() as tmp:
             manager = SessionManager(project_root=tmp)
             session_id = manager.start_session("test-model")
@@ -107,7 +149,14 @@ class SessionManagerTest(unittest.TestCase):
             )
             manager.record_response_usage(
                 turn_id=turn_id,
-                usage={"prompt_tokens": 7, "completion_tokens": 3},
+                usage={"prompt_tokens": 20, "completion_tokens": 2, "total_tokens": 22},
+                response_kind="assistant_response",
+                model="test-model",
+                message_id="msg_2",
+            )
+            manager.record_response_usage(
+                turn_id=turn_id,
+                usage={"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
                 response_kind="task_completion_check",
                 model="test-model",
             )
@@ -116,13 +165,13 @@ class SessionManagerTest(unittest.TestCase):
 
             self.assertEqual(event["event"], "response_usage")
             self.assertEqual(event["usage"]["total_tokens"], 15)
-            self.assertEqual(summary["prompt_tokens"], 17)
-            self.assertEqual(summary["completion_tokens"], 8)
-            self.assertEqual(summary["total_tokens"], 25)
+            self.assertEqual(summary["prompt_tokens"], 20)
+            self.assertEqual(summary["completion_tokens"], 2)
+            self.assertEqual(summary["total_tokens"], 22)
             self.assertEqual(summary["response_count"], 2)
             self.assertTrue(summary["has_real_usage"])
 
-    def test_response_usage_keeps_deleted_turns_by_default(self):
+    def test_response_usage_excludes_deleted_turns_by_default(self):
         with tempfile.TemporaryDirectory() as tmp:
             manager = SessionManager(project_root=tmp)
             session_id = manager.start_session("test-model")
@@ -136,12 +185,128 @@ class SessionManagerTest(unittest.TestCase):
             manager.mark_turn_deleted(turn_id)
 
             default_summary = manager.calculate_session_usage(session_id)
-            filtered_summary = manager.calculate_session_usage(session_id, include_deleted=False)
+            included_summary = manager.calculate_session_usage(session_id, include_deleted=True)
 
-            self.assertEqual(default_summary["total_tokens"], 15)
-            self.assertEqual(default_summary["response_count"], 1)
-            self.assertEqual(filtered_summary["total_tokens"], 0)
-            self.assertFalse(filtered_summary["has_real_usage"])
+            self.assertEqual(default_summary["total_tokens"], 0)
+            self.assertFalse(default_summary["has_real_usage"])
+            self.assertEqual(included_summary["total_tokens"], 15)
+            self.assertEqual(included_summary["response_count"], 1)
+
+    def test_turn_delete_invalidates_earlier_context_usage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = SessionManager(project_root=tmp)
+            session_id = manager.start_session("test-model")
+            first_turn_id = manager.create_turn_id()
+            second_turn_id = manager.create_turn_id()
+            third_turn_id = manager.create_turn_id()
+
+            manager.record_response_usage(
+                turn_id=first_turn_id,
+                usage={"prompt_tokens": 10, "completion_tokens": 1, "total_tokens": 11},
+                response_kind="assistant_response",
+            )
+            manager.record_response_usage(
+                turn_id=second_turn_id,
+                usage={"prompt_tokens": 20, "completion_tokens": 1, "total_tokens": 21},
+                response_kind="assistant_response",
+            )
+            manager.record_response_usage(
+                turn_id=third_turn_id,
+                usage={"prompt_tokens": 30, "completion_tokens": 1, "total_tokens": 31},
+                response_kind="assistant_response",
+            )
+            manager.mark_turn_deleted(second_turn_id)
+
+            stale_summary = manager.calculate_session_usage(session_id)
+            included_summary = manager.calculate_session_usage(session_id, include_deleted=True)
+
+            self.assertEqual(stale_summary["total_tokens"], 0)
+            self.assertFalse(stale_summary["has_real_usage"])
+            self.assertEqual(included_summary["total_tokens"], 31)
+
+            manager.record_response_usage(
+                turn_id=third_turn_id,
+                usage={"prompt_tokens": 25, "completion_tokens": 1, "total_tokens": 26},
+                response_kind="assistant_response",
+            )
+            refreshed_summary = manager.calculate_session_usage(session_id)
+
+            self.assertEqual(refreshed_summary["prompt_tokens"], 25)
+            self.assertEqual(refreshed_summary["total_tokens"], 26)
+            self.assertTrue(refreshed_summary["has_real_usage"])
+
+    def test_delete_last_task_restores_previous_task_usage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = SessionManager(project_root=tmp)
+            session_id = manager.start_session("test-model")
+            turn_ids = [manager.create_turn_id() for _ in range(3)]
+            for index, turn_id in enumerate(turn_ids, start=1):
+                manager.append_message(
+                    {"role": "user", "content": f"任务 {index}"},
+                    turn_id=turn_id,
+                    metadata={"is_task_entry": True},
+                )
+                manager.record_response_usage(
+                    turn_id=turn_id,
+                    usage={"prompt_tokens": index * 10, "completion_tokens": index, "total_tokens": index * 11},
+                    response_kind="assistant_response",
+                )
+
+            manager.mark_turn_deleted(turn_ids[-1])
+            summary = manager.calculate_session_usage(session_id)
+
+            self.assertEqual(summary["prompt_tokens"], 20)
+            self.assertEqual(summary["total_tokens"], 22)
+            self.assertTrue(summary["has_real_usage"])
+
+    def test_delete_middle_task_suffix_restores_prefix_usage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = SessionManager(project_root=tmp)
+            session_id = manager.start_session("test-model")
+            turn_ids = [manager.create_turn_id() for _ in range(3)]
+            for index, turn_id in enumerate(turn_ids, start=1):
+                manager.append_message(
+                    {"role": "user", "content": f"任务 {index}"},
+                    turn_id=turn_id,
+                    metadata={"is_task_entry": True},
+                )
+                manager.record_response_usage(
+                    turn_id=turn_id,
+                    usage={"prompt_tokens": index * 10, "completion_tokens": index, "total_tokens": index * 11},
+                    response_kind="assistant_response",
+                )
+
+            manager.mark_turn_deleted(turn_ids[1])
+            manager.mark_turn_deleted(turn_ids[2])
+            summary = manager.calculate_session_usage(session_id)
+
+            self.assertEqual(summary["prompt_tokens"], 10)
+            self.assertEqual(summary["total_tokens"], 11)
+            self.assertTrue(summary["has_real_usage"])
+
+    def test_delete_middle_task_kept_following_marks_usage_stale(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = SessionManager(project_root=tmp)
+            session_id = manager.start_session("test-model")
+            turn_ids = [manager.create_turn_id() for _ in range(3)]
+            for index, turn_id in enumerate(turn_ids, start=1):
+                manager.append_message(
+                    {"role": "user", "content": f"任务 {index}"},
+                    turn_id=turn_id,
+                    metadata={"is_task_entry": True},
+                )
+                manager.record_response_usage(
+                    turn_id=turn_id,
+                    usage={"prompt_tokens": index * 10, "completion_tokens": index, "total_tokens": index * 11},
+                    response_kind="assistant_response",
+                )
+
+            manager.mark_turn_deleted(turn_ids[1])
+            summary = manager.calculate_session_usage(session_id)
+
+            self.assertEqual(summary["total_tokens"], 0)
+            self.assertFalse(summary["has_real_usage"])
+            self.assertTrue(summary["is_stale"])
 
     def test_list_sessions_uses_index(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -244,6 +409,30 @@ class SessionManagerTest(unittest.TestCase):
                 ["system", "user"],
             )
 
+    def test_memory_checked_cursor_can_be_recorded_for_loaded_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = SessionManager(project_root=tmp)
+            first = manager.start_session("model-a")
+            turn_id = manager.create_turn_id()
+            manager.append_message(
+                {"role": "user", "content": "历史任务"},
+                turn_id=turn_id,
+                metadata={"is_task_entry": True},
+            )
+            manager.end_session()
+
+            manager.start_session("model-b")
+            info = manager.switch_session(first)
+            cursor = manager.record_memory_checked(
+                turn_id=None,
+                last_memory_checked_event_id=info["resume_event_id"],
+                status="cursor_only",
+                metadata={"reason": "session_resumed"},
+            )
+
+            self.assertEqual(cursor["event"], "memory_checked")
+            self.assertEqual(manager.latest_memory_checked_event_id(first), info["resume_event_id"])
+
     def test_record_session_interrupted_before_end(self):
         with tempfile.TemporaryDirectory() as tmp:
             manager = SessionManager(project_root=tmp)
@@ -286,16 +475,20 @@ class SessionManagerTest(unittest.TestCase):
             self.assertTrue(non_empty_sessions[0]["has_user_task"])
 
     def test_agent_session_management_commands_step_by_step(self):
-        target_session_file = "sessions/2026/05/20/session_20260520_172245_a9f43c.jsonl"
+        target_session_file = "sessions/2026/06/01/session_20260601_150405_7cd055.jsonl"
         target_session_path = Path(target_session_file)
         if not target_session_path.is_absolute():
             target_session_path = PROJECT_ROOT / target_session_path
         target_session_id = target_session_path.stem
-        output_dir = PROJECT_ROOT / "module_test" / "session_test"
+        output_dir = SESSION_TEST_TEMP_DIR / "session_management_commands"
+        copied_session_path = output_dir / f"{target_session_id}.jsonl"
         output_path = output_dir / f"{target_session_id}_context.json"
-        manager = SessionManager(project_root=PROJECT_ROOT)
 
         self.assertTrue(target_session_path.exists(), f"target session file not found: {target_session_path}")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        # 集成式 session 命令测试只读取真实历史会话，所有写入都落到 session_test_temp。
+        copied_session_path.write_text(target_session_path.read_text(encoding="utf-8"), encoding="utf-8")
+        manager = SessionManager(project_root=PROJECT_ROOT, sessions_dir=output_dir)
 
         print("\n$ session new")
         new_session_id = manager.start_session(
@@ -324,6 +517,7 @@ class SessionManagerTest(unittest.TestCase):
         context = {
             "session": current_info,
             "source_session_file": str(target_session_path),
+            "copied_session_file": str(copied_session_path),
             "created_test_session_id": new_session_id,
             "event_count": len(events),
             "message_count": len(messages),
@@ -332,7 +526,6 @@ class SessionManagerTest(unittest.TestCase):
         }
 
         # 将事件日志和还原后的 messages 一起落盘，便于人工核对完整上下文。
-        output_dir.mkdir(parents=True, exist_ok=True)
         output_path.write_text(json.dumps(context, ensure_ascii=False, indent=2), encoding="utf-8")
         print("\n$ rebuild messages")
         print(json.dumps({"message_count": len(messages), "output_path": str(output_path)}, ensure_ascii=False, indent=2))

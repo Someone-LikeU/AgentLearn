@@ -108,6 +108,21 @@ class SessionManager:
         self._append_jsonl(self.current_session_path, record)
         return record
 
+    def append_event_to_session(self, session_id: str, event: dict[str, Any]) -> dict[str, Any]:
+        """
+        向指定历史会话追加事件，不改变当前会话指针。
+        """
+        target_session_id = str(session_id or "").strip()
+        path = self._resolve_session_path(target_session_id)
+        if path is None or not path.exists():
+            raise FileNotFoundError(f"Session not found: {target_session_id}")
+        record = self._json_safe(dict(event))
+        record.setdefault("event_id", self._new_event_id())
+        record.setdefault("session_id", target_session_id)
+        record.setdefault("timestamp", self._now())
+        self._append_jsonl(path, record)
+        return record
+
     def append_message(
         self,
         message: Any,
@@ -203,42 +218,43 @@ class SessionManager:
             event["metadata"] = metadata
         return self.append_event(event)
 
-    def calculate_session_usage(self, session_id: str | None = None, include_deleted: bool = True) -> dict[str, Any]:
+    def calculate_session_usage(self, session_id: str | None = None, include_deleted: bool = False) -> dict[str, Any]:
         """
-        汇总 session 中已持久化的真实模型 usage。
+        读取当前主会话上下文的真实模型 usage。
         :param session_id: 会话 id，默认当前会话
-        :param include_deleted: 是否包含已软删除 turn 的真实消耗
-        :return: usage 汇总
+        :param include_deleted: 是否允许已软删除 turn 的 assistant_response 参与恢复
+        :return: 最新 assistant_response 的 usage
         """
         target_session_id = session_id or self.current_session_id
-        summary = {
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "total_tokens": 0,
-            "response_count": 0,
-            "has_real_usage": False,
-        }
+        summary = self._empty_usage_summary()
         if not target_session_id:
             return summary
-        events = self.load_session(target_session_id)
-        deleted_turn_ids = self._deleted_turn_ids(events) if not include_deleted else set()
-        for event in events:
-            if event.get("event") != "response_usage":
-                continue
-            if not include_deleted and event.get("turn_id") in deleted_turn_ids:
-                continue
-            usage = self._normalize_usage(event.get("usage"))
-            if not usage:
-                continue
-            prompt_tokens = usage.get("prompt_tokens", 0)
-            completion_tokens = usage.get("completion_tokens", 0)
-            total_tokens = usage.get("total_tokens", prompt_tokens + completion_tokens)
-            summary["prompt_tokens"] += prompt_tokens
-            summary["completion_tokens"] += completion_tokens
-            summary["total_tokens"] += total_tokens
-            summary["response_count"] += 1
-            summary["has_real_usage"] = True
-        return summary
+        events = self._events_after_latest_session_clear(self.load_session(target_session_id))
+        if include_deleted:
+            return self._assistant_usage_summary(events)
+
+        deleted_turn_ids = self._deleted_turn_ids(events)
+        latest_delete_index = self._latest_turn_deleted_index(events)
+        if latest_delete_index < 0:
+            return self._assistant_usage_summary(events, deleted_turn_ids=deleted_turn_ids)
+
+        # 删除后如果已经发生新的主模型响应，该 usage 才代表当前重建后的上下文。
+        post_delete_summary = self._assistant_usage_summary(
+            events[latest_delete_index + 1:],
+            deleted_turn_ids=deleted_turn_ids,
+        )
+        if post_delete_summary.get("has_real_usage"):
+            return post_delete_summary
+
+        task_turn_ids = self._task_entry_turn_ids(events)
+        active_turn_ids = [turn_id for turn_id in task_turn_ids if turn_id not in deleted_turn_ids]
+        if not active_turn_ids:
+            return summary
+        if task_turn_ids[:len(active_turn_ids)] != active_turn_ids:
+            # 删除中间任务但保留后续任务时，旧 usage 对当前上下文不再可信。
+            summary["is_stale"] = True
+            return summary
+        return self._assistant_usage_summary(events, allowed_turn_ids=set(active_turn_ids))
 
     def record_memory_saved(
         self,
@@ -246,6 +262,7 @@ class SessionManager:
         task_id: str,
         full_context_path: str,
         metadata: dict[str, Any] | None = None,
+        session_id: str | None = None,
     ) -> dict[str, Any]:
         """
         记录长期记忆保存结果。
@@ -263,7 +280,123 @@ class SessionManager:
         }
         if metadata:
             event["metadata"] = metadata
+        if session_id:
+            return self.append_event_to_session(session_id, event)
         return self.append_event(event)
+
+    def record_memory_checked(
+        self,
+        turn_id: str | None,
+        last_memory_checked_event_id: str | None,
+        status: str,
+        task_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        记录长期记忆处理游标，避免继续旧 session 时重复扫描旧历史。
+        """
+        event = {
+            "event": "memory_checked",
+            "turn_id": turn_id,
+            "last_memory_checked_event_id": last_memory_checked_event_id,
+            "status": status or "unknown",
+        }
+        if task_id:
+            event["task_id"] = task_id
+        if metadata:
+            event["metadata"] = metadata
+        if session_id:
+            return self.append_event_to_session(session_id, event)
+        return self.append_event(event)
+
+    def record_session_cleared(
+            self,
+            delete_memory: bool = True,
+            memory_task_ids: list[str] | None = None,
+            reason: str = "user_clear_current_session",
+    ) -> dict[str, Any]:
+        """
+        记录当前会话被逻辑清空。
+        :param delete_memory: 是否同步删除本会话关联的长期记忆
+        :param memory_task_ids: 已处理的长期记忆 task_id
+        :param reason: 清空原因
+        :return: 实际写入的事件
+        """
+        if self.current_session_path is None or self.current_session_id is None:
+            raise RuntimeError("Session has not been started.")
+        cleared_at = self._now()
+        event = {
+            "event": "session_cleared",
+            "cleared_at": cleared_at,
+            "reason": reason,
+            "delete_memory": bool(delete_memory),
+        }
+        normalized_task_ids = [task_id for task_id in (memory_task_ids or []) if task_id]
+        if normalized_task_ids:
+            event["memory_task_ids"] = normalized_task_ids
+        record = self.append_event(event)
+        # 逻辑清空后当前 session 仍然存在，但后续 history/continue 应只看清空后的任务。
+        self._append_session_index_update(
+            {
+                "updated_at": cleared_at,
+                "status": "active",
+                "has_user_task": False,
+            }
+        )
+        return record
+
+    def session_memory_refs(self, session_id: str) -> list[dict[str, Any]]:
+        """
+        读取指定 session 已关联的长期记忆引用。
+        :param session_id: 会话 id
+        :return: 记忆引用列表
+        """
+        refs = []
+        for event in self.load_session(session_id):
+            if event.get("event") != "memory_saved":
+                continue
+            refs.append(
+                {
+                    "session_id": event.get("session_id") or session_id,
+                    "turn_id": event.get("turn_id"),
+                    "task_id": event.get("task_id"),
+                    "full_context_path": event.get("full_context_path"),
+                }
+            )
+        return refs
+
+    def delete_session_file(self, session_id: str) -> dict[str, Any]:
+        """
+        硬删除一个明确 session 文件。
+        :param session_id: 会话 id
+        :return: 删除结果
+        """
+        target_session_id = str(session_id or "").strip()
+        if not target_session_id:
+            return {"session_id": target_session_id, "deleted": False, "error": "empty_session_id"}
+        path = self._resolve_session_path(target_session_id)
+        if path is None or not path.exists():
+            return {"session_id": target_session_id, "deleted": False, "error": "session_not_found"}
+
+        # 每次只删除一个明确路径的 session 文件，符合项目禁止批量删除的约束。
+        path.unlink()
+        deleted_at = self._now()
+        if self.current_session_id == target_session_id:
+            self.detach_current_session()
+        self._append_jsonl(
+            self.index_file,
+            {
+                "event": "session_index_update",
+                "session_id": target_session_id,
+                "updated_at": deleted_at,
+                "deleted_at": deleted_at,
+                "status": "deleted",
+                "path": str(path),
+                "has_user_task": False,
+            },
+        )
+        return {"session_id": target_session_id, "deleted": True, "path": str(path)}
 
     def record_session_interrupted(self, reason: str, turn_id: str | None = None) -> dict[str, Any]:
         """
@@ -373,7 +506,7 @@ class SessionManager:
         self._session_closed = False
 
         # 加载动作不作为模型上下文消息，但需要写入事件流，标记后续消息属于恢复后的继续对话。
-        self.append_event({"event": "session_resumed", "resumed_at": resumed_at})
+        resume_event = self.append_event({"event": "session_resumed", "resumed_at": resumed_at})
         self._append_session_index_update(
             {
                 "updated_at": resumed_at,
@@ -385,7 +518,9 @@ class SessionManager:
                 "created_at": self.current_session_created_at,
             }
         )
-        return self.get_current_session_info()
+        info = self.get_current_session_info()
+        info["resume_event_id"] = resume_event.get("event_id")
+        return info
 
     def mark_turn_deleted(
         self,
@@ -498,13 +633,40 @@ class SessionManager:
             return []
         return self._read_jsonl(path)
 
+    def latest_event_id(self, session_id: str | None = None) -> str | None:
+        """
+        返回指定 session 当前最后一条事件的 event_id。
+        """
+        target_session_id = session_id or self.current_session_id
+        if not target_session_id:
+            return None
+        events = self.load_session(target_session_id)
+        for event in reversed(events):
+            event_id = event.get("event_id")
+            if event_id:
+                return str(event_id)
+        return None
+
+    def latest_memory_checked_event_id(self, session_id: str | None = None) -> str | None:
+        """
+        返回最新长期记忆处理游标。
+        """
+        target_session_id = session_id or self.current_session_id
+        if not target_session_id:
+            return None
+        events = self.load_session(target_session_id)
+        for event in reversed(events):
+            if event.get("event") == "memory_checked" and event.get("last_memory_checked_event_id"):
+                return str(event.get("last_memory_checked_event_id"))
+        return None
+
     def rebuild_messages(self, session_id: str) -> list[dict[str, Any]]:
         """
         从 session 事件重建可发送给模型的 messages。
         :param session_id: 会话 id
         :return: OpenAI messages
         """
-        events = self.load_session(session_id)
+        events = self._events_after_latest_session_clear(self.load_session(session_id))
         deleted_turn_ids = self._deleted_turn_ids(events)
         messages: list[dict[str, Any]] = []
         for event in events:
@@ -544,7 +706,7 @@ class SessionManager:
         target_session_id = session_id or self.current_session_id
         if not target_session_id:
             return []
-        events = self.load_session(target_session_id)
+        events = self._events_after_latest_session_clear(self.load_session(target_session_id))
         # history 以用户任务为粒度展示，但统计信息需要从同 turn 的全部事件聚合。
         deleted_turn_ids = self._deleted_turn_ids(events)
         stats = self._build_turn_stats(events)
@@ -723,6 +885,99 @@ class SessionManager:
             if event.get("event") == "turn_deleted" and event.get("turn_id")
         }
 
+    @staticmethod
+    def _empty_usage_summary() -> dict[str, Any]:
+        return {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "response_count": 0,
+            "has_real_usage": False,
+            "is_stale": False,
+        }
+
+    def _assistant_usage_summary(
+            self,
+            events: list[dict[str, Any]],
+            allowed_turn_ids: set[str] | None = None,
+            deleted_turn_ids: set[str] | None = None,
+    ) -> dict[str, Any]:
+        """
+        从事件列表中恢复最后一次主会话 assistant_response usage。
+        :param events: 已按 session_cleared 截断后的事件
+        :param allowed_turn_ids: 只允许参与恢复的 turn_id
+        :param deleted_turn_ids: 需要排除的软删除 turn_id
+        :return: usage 汇总
+        """
+        summary = self._empty_usage_summary()
+        latest_usage = None
+        assistant_response_count = 0
+        deleted_turn_ids = deleted_turn_ids or set()
+        for event in events:
+            if event.get("event") != "response_usage":
+                continue
+            # 当前上下文 token 只来自主会话 assistant_response；completion check 等独立请求不参与 status。
+            if event.get("response_kind") != "assistant_response":
+                continue
+            turn_id = event.get("turn_id")
+            if allowed_turn_ids is not None and turn_id not in allowed_turn_ids:
+                continue
+            if turn_id in deleted_turn_ids:
+                continue
+            usage = self._normalize_usage(event.get("usage"))
+            if not usage:
+                continue
+            latest_usage = usage
+            assistant_response_count += 1
+        if latest_usage:
+            prompt_tokens = latest_usage.get("prompt_tokens", 0)
+            completion_tokens = latest_usage.get("completion_tokens", 0)
+            summary["prompt_tokens"] = prompt_tokens
+            summary["completion_tokens"] = completion_tokens
+            summary["total_tokens"] = latest_usage.get("total_tokens", prompt_tokens + completion_tokens)
+            summary["response_count"] = assistant_response_count
+            summary["has_real_usage"] = True
+        return summary
+
+    @staticmethod
+    def _task_entry_turn_ids(events: list[dict[str, Any]]) -> list[str]:
+        turn_ids = []
+        seen_turn_ids = set()
+        for event in events:
+            if event.get("event") != "message" or event.get("role") != "user":
+                continue
+            turn_id = event.get("turn_id")
+            if not turn_id or turn_id in seen_turn_ids:
+                continue
+            metadata = event.get("metadata") or {}
+            if metadata.get("is_task_entry", True) is not True:
+                continue
+            seen_turn_ids.add(turn_id)
+            turn_ids.append(turn_id)
+        return turn_ids
+
+    @staticmethod
+    def _latest_turn_deleted_index(events: list[dict[str, Any]]) -> int:
+        latest_index = -1
+        for index, event in enumerate(events):
+            if event.get("event") == "turn_deleted":
+                latest_index = index
+        return latest_index
+
+    @staticmethod
+    def _latest_session_cleared_index(events: list[dict[str, Any]]) -> int:
+        latest_index = -1
+        for index, event in enumerate(events):
+            if event.get("event") == "session_cleared":
+                latest_index = index
+        return latest_index
+
+    def _events_after_latest_session_clear(self, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        latest_clear_index = self._latest_session_cleared_index(events)
+        if latest_clear_index < 0:
+            return events
+        return events[latest_clear_index + 1:]
+
     def _build_turn_stats(self, events: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
         # 统计信息用于 history 详情页，避免 UI 层反复扫描事件。
         stats: dict[str, dict[str, Any]] = {}
@@ -770,6 +1025,7 @@ class SessionManager:
 
     def _events_have_user_task(self, events: list[dict[str, Any]]) -> bool:
         # 空会话只包含 session_start/system/session_end，不应被 continue 当作上次会话。
+        events = self._events_after_latest_session_clear(events)
         deleted_turn_ids = self._deleted_turn_ids(events)
         for event in events:
             if event.get("event") != "message" or event.get("role") != "user":

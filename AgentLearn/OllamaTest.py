@@ -12,18 +12,36 @@ client = OpenAI(
     http_client=httpx.Client(trust_env=False),
 )
 
+def chat(task: str, use_model: str):
+    chat_completion = client.chat.completions.create(
+        messages = [
+            {
+                'role'   : 'user',
+                'content': task,
+            }
+        ],
+        model = use_model,
+    )
+    print(chat_completion.choices[0].message.content)
+
+
 if __name__ == '__main__':
     try:
-        chat_completion = client.chat.completions.create(
-            messages=[
-                {
-                    'role': 'user',
-                    'content': 'Say "this is a test", do not do anything else.',
-                }
-            ],
-            model='deepseek-r1:14b',
-        )
-        print(chat_completion)
+        # chat_completion = client.chat.completions.create(
+        #     messages=[
+        #         {
+        #             'role': 'user',
+        #             'content': '你是谁？',
+        #         }
+        #     ],
+        #     model=,
+        # )
+        # print(chat_completion.choices[0].message.content)
+        #
+        chat("你是谁？", 'qwen3.5:9b')
+        # chat("你是谁？", 'deepseek-r1:14b')
+        # chat("你是谁？", 'gemma4:e4b')
+        
     except Exception as error:
         print(error)
     finally:
