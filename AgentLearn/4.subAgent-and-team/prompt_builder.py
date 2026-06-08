@@ -18,19 +18,21 @@ def build_system_prompt(base_prompt: List, rules, skills, memory=None):
 	if rules:
 		base_prompt.append(f"\n{rules}\n")
 	# 拼接技能
-	skill_prompt = None
-	try:
-		skill_prompt = load_prompt("skill_prompt_part.md")
-		available_skills = {
-			"available_skills": [
-				{"name": skill["name"], "description": skill.get("description", "")}
-				for skill in skills
-			]
-		}
-		skills_json = json.dumps(available_skills, ensure_ascii=False, indent=2)
-		skill_prompt = f"\n{skill_prompt}\n```JSON\n{skills_json}\n```"
-		base_prompt.append(skill_prompt)
-	except FileNotFoundError as e:
-		print("Error: File not found ", e)
+	if skills:
+		# 只有确实暴露 skill 时才拼接技能说明，轻量 Agent 可完全省掉这段 token。
+		skill_prompt = None
+		try:
+			skill_prompt = load_prompt("skill_prompt_part.md")
+			available_skills = {
+				"available_skills": [
+					{"name": skill["name"], "description": skill.get("description", "")}
+					for skill in skills
+				]
+			}
+			skills_json = json.dumps(available_skills, ensure_ascii=False, indent=2)
+			skill_prompt = f"\n{skill_prompt}\n```JSON\n{skills_json}\n```"
+			base_prompt.append(skill_prompt)
+		except FileNotFoundError as e:
+			print("Error: File not found ", e)
 
 	return "\n".join(base_prompt)

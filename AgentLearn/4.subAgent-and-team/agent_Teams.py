@@ -95,6 +95,22 @@ class PendingModelConfig:
     max_model_context_token: int
 
 
+@dataclass
+class AgentRuntimeConfig:
+    """控制 Agent 启动时加载哪些上下文和工具。"""
+
+    base_prompt_file: str | None = None
+    base_prompt_text: str | None = None
+    prompt_variables: dict[str, Any] = field(default_factory=dict)
+    extra_prompt_files: list[str] = field(default_factory=list)
+    include_rules: bool = True
+    include_skills: bool = True
+    include_memory: bool = True
+    enable_local_tools: bool = True
+    enable_mcp_tools: bool = True
+    allowed_tool_names: set[str] | None = None
+
+
 class Agent:
     
     _DEFAULT_CONTEXT_WINDOW = 32768
@@ -103,6 +119,7 @@ class Agent:
     _KEEP_RECENT = 10
     _MAX_CONSECUTIVE_TOOL_FAILURES = 2
     _MAX_TASK_COMPLETION_CONTINUES = 2
+    _MEMORY_WAIT_POLL_SECONDS = 5
 
     def __init__(self, model="qwen3.5:9b",
                  temperature: float = 0.1,
@@ -111,7 +128,8 @@ class Agent:
                  mcp_client=None,
                  is_main_agent: bool = True,
                  role: str = "Main Agent",
-                 name: str = None):
+                 name: str = None,
+                 runtime_config: AgentRuntimeConfig | dict[str, Any] | None = None):
         """
         初始化Agent对象
         :param model: 使用模型
@@ -130,17 +148,19 @@ class Agent:
         # 通信信道
         self.inbox = []
 
+        # 通过运行配置裁剪 prompt、记忆和工具，桌游/模拟类 Agent 可避免加载工程规则与工具 schema。
+        self.runtime_config = self._normalize_runtime_config(runtime_config)
+
         # base_url
         explicit_model_connection = base_url is not None or api_key is not None
-        self._base_url = os.environ.get("OPENAI_BASE_URL") if base_url is None else base_url
+        self._base_url = base_url if explicit_model_connection else None
 
         # api_key
-        self._api_key = os.environ.get("OPENAI_API_KEY") if api_key is None else api_key
+        self._api_key = api_key if explicit_model_connection else None
 
         # OpenAI 请求客户端
         self._model_client_bypass_proxy = False
         self._missing_model_env_vars = []
-        self.client = self._create_openai_client(self._base_url, self._api_key)
 
         # 是否是主 Agent，False 表示由 Agent 创建的子 Agent，默认为 True。
         self._is_main_agent = is_main_agent
@@ -154,7 +174,16 @@ class Agent:
         if explicit_model_connection:
             self._missing_model_env_vars = []
         else:
-            self._apply_model_config_by_name(self.model)
+            model_config_applied = self._apply_model_config_by_name(self.model)
+            if not model_config_applied and self._missing_model_env_vars:
+                missing_names = ", ".join(self._missing_model_env_vars)
+                raise ValueError(f"模型 {self.model} 配置存在，但缺少环境变量：{missing_names}")
+            if not model_config_applied:
+                self._base_url = os.environ.get("OPENAI_BASE_URL")
+                self._api_key = os.environ.get("OPENAI_API_KEY")
+                self.client = self._create_openai_client(self._base_url, self._api_key)
+        if explicit_model_connection:
+            self.client = self._create_openai_client(self._base_url, self._api_key)
         self._max_context_tokens = self._load_model_context_window()
         self._token_tracker = TokenTracker(
             max_context_tokens=self._max_context_tokens,
@@ -172,7 +201,7 @@ class Agent:
                 model=self.model,
                 temperature=self.temperature,
             )
-            if self._is_main_agent
+            if self._is_main_agent and self.runtime_config.include_memory
             else None
         )
 
@@ -191,7 +220,7 @@ class Agent:
         self._skills_cache = {}
 
         # MCP 客户端（由外部传入，不在 Agent 内部创建）。
-        self.mcp_client = mcp_client
+        self.mcp_client = mcp_client if self.runtime_config.enable_mcp_tools else None
         self.console = Console()
         mcp_mode = getattr(self.mcp_client, "mode", "none") if self.mcp_client else "none"
         if self.mcp_client:
@@ -228,19 +257,25 @@ class Agent:
             )
         finally:
             startup_spinner.stop()
-        self._mcp_tools = self._tool_manager.mcp_tools
-        self._available_functions = self._tool_manager.available_functions
-        self._all_tools = self._tool_manager.all_tools
+        self._local_tools = self._filter_tools_for_runtime(self._tool_manager.local_tools, is_mcp=False)
+        self._mcp_tools = self._filter_tools_for_runtime(self._tool_manager.mcp_tools, is_mcp=True)
+        self._all_tools = self._local_tools + self._mcp_tools
+        enabled_tool_names = self._tool_names_from_tools(self._all_tools)
+        self._available_functions = {
+            name: function
+            for name, function in self._tool_manager.available_functions.items()
+            if name in enabled_tool_names
+        }
         self._all_tools_without_make_plan = self._build_tools_without_make_plan(self._all_tools)
         mcp_tool_count = len(self._mcp_tools) if self.mcp_client else 0
         mcp_status = f"{mcp_tool_count} MCP tools" if self.mcp_client else "MCP disabled"
-        self.console.print(f"[dim]工具加载完成：{len(self._tool_manager.local_tools)} local tools，{mcp_status}[/]")
+        self.console.print(f"[dim]工具加载完成：{len(self._local_tools)} local tools，{mcp_status}[/]")
 
         # 基础提示词，用于主 Agent。
-        self._base_prompt_main_agent = load_prompt("base_main_agent.md")
+        self._base_prompt_main_agent = self._resolve_base_prompt("base_main_agent.md")
 
         # 子 Agent 提示词。
-        self._base_prompt_sub_agent = load_prompt("base_sub_agent.md", role=role)
+        self._base_prompt_sub_agent = self._resolve_base_prompt("base_sub_agent.md")
 
         # 缓存系统提示词,后续记忆压缩的时候可能会用到
         self._cached_system_prompt = self._build_system_prompt()
@@ -674,6 +709,73 @@ class Agent:
     def _agent_file_path(self, relative_path):
         return os.path.join(os.path.dirname(__file__), relative_path)
 
+    def _normalize_runtime_config(self, runtime_config):
+        if runtime_config is None:
+            return AgentRuntimeConfig()
+        if isinstance(runtime_config, AgentRuntimeConfig):
+            config = runtime_config
+        elif isinstance(runtime_config, dict):
+            config = AgentRuntimeConfig(**runtime_config)
+        else:
+            raise TypeError("runtime_config must be AgentRuntimeConfig, dict or None")
+
+        # 统一把可迭代配置转成稳定的 list/set，后续过滤 prompt 和工具时不再分支判断。
+        if config.extra_prompt_files is None:
+            config.extra_prompt_files = []
+        elif isinstance(config.extra_prompt_files, str):
+            config.extra_prompt_files = [config.extra_prompt_files]
+        else:
+            config.extra_prompt_files = list(config.extra_prompt_files)
+
+        if config.allowed_tool_names is not None:
+            config.allowed_tool_names = set(config.allowed_tool_names)
+        if config.prompt_variables is None:
+            config.prompt_variables = {}
+        else:
+            config.prompt_variables = dict(config.prompt_variables)
+        return config
+
+    def _render_prompt_variables(self, content: str) -> str:
+        # 先注入默认变量，再叠加领域运行时变量，支持桌游规则等动态上下文。
+        variables = {
+            "role": self.role or "",
+            "name": self.name or self.role or "",
+        }
+        variables.update(self.runtime_config.prompt_variables)
+        for key, value in variables.items():
+            content = content.replace(f"<{key}>", str(value))
+        return content
+
+    def _load_prompt_file(self, prompt_file: str) -> str:
+        prompt_path = Path(prompt_file)
+        if prompt_path.is_absolute():
+            candidates = [prompt_path]
+        else:
+            project_root = Path(os.path.dirname(__file__))
+            candidates = [
+                project_root / prompt_path,
+                project_root / self.prompts_dir / prompt_path,
+            ]
+
+        for candidate in candidates:
+            if candidate.exists():
+                return self._render_prompt_variables(candidate.read_text(encoding="utf-8").strip())
+        raise FileNotFoundError(f"Prompt file not found: {prompt_file}")
+
+    def _resolve_base_prompt(self, default_prompt_name: str) -> str:
+        if self.runtime_config.base_prompt_text:
+            return self._render_prompt_variables(self.runtime_config.base_prompt_text.strip())
+        if self.runtime_config.base_prompt_file:
+            return self._load_prompt_file(self.runtime_config.base_prompt_file)
+        return self._render_prompt_variables(load_prompt(default_prompt_name, role=self.role))
+
+    def _extra_system_prompt_parts(self) -> list[str]:
+        # 额外 prompt 按传入顺序拼接，桌游规则这类动态上下文放在基础人设之后。
+        return [
+            self._load_prompt_file(prompt_file)
+            for prompt_file in self.runtime_config.extra_prompt_files
+        ]
+
     def _load_model_context_window(self):
         config_path = Path(self._agent_file_path("agent/config/model_config.json"))
         try:
@@ -936,10 +1038,15 @@ class Agent:
             pending_count = self.memory_manager.pending_count()
             timeout = self.memory_manager.memory_request_timeout
             self.console.print(
-                f"[dim]还有 {pending_count} 个记忆整理任务未完成，正在等待完成后切换会话...[/]"
+                f"[dim]还有 {pending_count} 个记忆整理任务未完成，正在等待完成"
+                f"（后台模型请求最长约 {timeout:g} 秒/个）...[/]"
             )
         # 切换会话前只等待后台任务归档完成，后续新任务仍需要继续写长期记忆。
-        self.memory_manager.wait_for_pending()
+        while self.memory_manager.has_pending():
+            if self.memory_manager.wait_for_pending(timeout=self._MEMORY_WAIT_POLL_SECONDS):
+                break
+            pending_count = self.memory_manager.pending_count()
+            self.console.print(f"[dim]记忆整理仍在进行：剩余 {pending_count} 个任务...[/]")
 
     def _enqueue_session_end_memory_compaction(self):
         if not self._is_main_agent or self.memory_manager is None:
@@ -1330,6 +1437,38 @@ class Agent:
         ]
 
     @staticmethod
+    def _tool_name_from_schema(tool: dict[str, Any]) -> str | None:
+        if not isinstance(tool, dict):
+            return None
+        function_schema = tool.get("function", {})
+        return function_schema.get("name") or tool.get("name")
+
+    @classmethod
+    def _tool_names_from_tools(cls, tools: list[dict[str, Any]]) -> set[str]:
+        return {
+            tool_name
+            for tool_name in (cls._tool_name_from_schema(tool) for tool in tools)
+            if tool_name
+        }
+
+    def _filter_tools_for_runtime(self, tools: list[dict[str, Any]], *, is_mcp: bool) -> list[dict[str, Any]]:
+        if is_mcp and not self.runtime_config.enable_mcp_tools:
+            return []
+        if not is_mcp and not self.runtime_config.enable_local_tools:
+            return []
+
+        allowed_tool_names = self.runtime_config.allowed_tool_names
+        if allowed_tool_names is None:
+            return list(tools)
+
+        # 白名单只作用于最终暴露给模型的工具 schema，不影响 ToolManager 内部能力初始化。
+        return [
+            tool
+            for tool in tools
+            if self._tool_name_from_schema(tool) in allowed_tool_names
+        ]
+
+    @staticmethod
     def _build_tools_without_make_plan(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """生成去除 MAKE_PLAN 后的工具列表，供计划步骤递归调用复用。"""
         return [
@@ -1363,10 +1502,11 @@ class Agent:
         request_args = {
             "model": self.model,
             "messages": self.messages,
-            "tools": active_tools,
             "temperature": self.temperature,
             "stream": True,
         }
+        if active_tools:
+            request_args["tools"] = active_tools
         if include_usage:
             request_args["stream_options"] = {"include_usage": True}
         try:
@@ -1388,7 +1528,7 @@ class Agent:
         tool_calls = getattr(message, "tool_calls", None)
         event = self._append_message({
             "role": "assistant",
-            "content": message.content,
+            "content": getattr(message, "content", None) or "",
             "tool_calls": [
                 {
                     "id": tc.id,
@@ -1614,16 +1754,12 @@ class Agent:
             guard_state: ToolFailureGuardState,
     ) -> bool:
         if not task_goal:
-            print("not task goal hit")
             return False
         if guard_state.completion_continue_count >= self._MAX_TASK_COMPLETION_CONTINUES:
-            print("completion continue count >= hit")
             return False
         if self._is_trivial_task(task_goal):
-            print("trivial task hit")
             return False
         if self._looks_like_terminal_response(getattr(message, "content", None)):
-            print("looks like terminal response hit")
             return False
         # 计划步骤、工具链任务和执行型任务才需要额外判断，普通问答直接结束。
         return self.plan_mode or guard_state.executed_tool_count > 0 or self._is_execution_task(task_goal)
@@ -1730,11 +1866,9 @@ class Agent:
                     return empty_result
                 # 没有工具调用，可能是任务结束了，先判断然后再返回结果
                 if not self._should_check_task_complete(task_goal, message, guard_state):
-                    print("no tool call, and no need to check task complete")
                     return message.content
 
                 status = self._check_task_complete(task_goal, message.content)
-                print("check task complete, status is ", status)
                 # 任务没有完成，需要继续
                 if status == "CONTINUE":
                     guard_state.completion_continue_count += 1
@@ -1799,11 +1933,16 @@ class Agent:
         from prompt_builder import build_system_prompt
         # 置空当前提示词。
         self._cached_system_prompt = None
-        memory = self._load_memory_view()
-        rules = self._load_rules(memory)
-        skills = self._load_skill_meta_infos()
+        memory = self._load_memory_view() if self.runtime_config.include_memory else ""
+        rules = self._load_rules(memory) if self.runtime_config.include_rules else []
+        if self.runtime_config.include_skills:
+            skills = self._load_skill_meta_infos()
+        else:
+            self._skills_cache.clear()
+            skills = []
         base_prompt = [
             self._base_prompt_main_agent if self._is_main_agent else self._base_prompt_sub_agent,
+            *self._extra_system_prompt_parts(),
         ]
         self._cached_system_prompt = build_system_prompt(base_prompt, rules, skills, memory)
         return self._cached_system_prompt
@@ -1913,7 +2052,7 @@ class Agent:
             )
         content = state.content
         return SimpleNamespace(
-            content=content if content else None,
+            content=content or "",
             tool_calls=ordered_tool_calls if ordered_tool_calls else None,
             usage=state.usage,
         )
@@ -1950,9 +2089,10 @@ class Agent:
                           base_url=self._base_url,
                           api_key=self._api_key,
                           role=role,
-                          is_main_agent=False
+                          is_main_agent=False,
+                          runtime_config=self.runtime_config
                           )
-        final_result, _ = sub_agent.chat(task)
+        final_result = sub_agent.chat(task)
         return final_result
 
     def _clear_memory(self):
@@ -2165,7 +2305,7 @@ class Agent:
         :return:
         """
         tool_groups = [
-            ("本地工具", self._tool_manager.local_tools),
+            ("本地工具", self._local_tools),
             ("MCP 工具", self._mcp_tools),
         ]
         has_tools = False
@@ -3243,6 +3383,16 @@ class Agent:
         # 会话列表只做轻量展示，缺失时间用短横线占位。
         return str(value or "-").replace("T", " ")
 
+    def _format_session_label(self, session: dict[str, Any]) -> str:
+        """
+        格式化会话名称，便于提示中展示。
+        :param session: 会话索引记录
+        :return: 标题和 session_id
+        """
+        title = session.get("title") or "未命名会话"
+        session_id = session.get("session_id") or "-"
+        return f"{title}（{session_id}）"
+
     def _print_sessions_table(self, sessions: list[dict[str, Any]]) -> None:
         """
         打印会话列表。
@@ -3268,6 +3418,32 @@ class Agent:
                 item.get("session_id") or "",
             )
         self.console.print(table)
+
+    def _print_continue_skipped_empty_sessions(self, target_session_id: str | None) -> None:
+        """
+        打印 continue 命令因空会话过滤而跳过的最近会话。
+        :param target_session_id: 最终要加载的 session_id
+        :return:
+        """
+        if self.session_manager is None or not target_session_id:
+            return
+        recent_sessions = self.session_manager.list_sessions(limit=100, include_empty=True)
+        skipped_sessions = []
+        for session in recent_sessions:
+            session_id = session.get("session_id")
+            if session_id == target_session_id:
+                break
+            skipped_sessions.append(session)
+        else:
+            return
+        if not skipped_sessions:
+            return
+
+        visible_skipped = skipped_sessions[:3]
+        skipped_text = "；".join(self._format_session_label(session) for session in visible_skipped)
+        if len(skipped_sessions) > len(visible_skipped):
+            skipped_text += f"；还有 {len(skipped_sessions) - len(visible_skipped)} 个"
+        self.console.print(f"[dim]continue 已跳过最近空会话：{skipped_text}[/]")
 
     def _handle_cmd_sessions(self, _confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
         # 列出最近会话，序号可直接用于 session load。
@@ -3419,7 +3595,9 @@ class Agent:
         if not sessions:
             self.console.print("[yellow]没有可继续的历史会话。[/]")
             return True, False
-        self._load_session_by_id(sessions[0].get("session_id"))
+        target_session_id = sessions[0].get("session_id")
+        self._print_continue_skipped_empty_sessions(target_session_id)
+        self._load_session_by_id(target_session_id)
         return True, False
 
     def _handle_cmd_session_title_show(self, _confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
@@ -3447,147 +3625,14 @@ class Agent:
 Team 类管理多个Agent，
 """
 
-class Team:
-    def __init__(self, agent_factory=None):
-        self.agents = {}  # 名称到 Agent 的映射。
-        self.agent_factory = agent_factory or (lambda name, role: Agent(role=role, name=name))
-
-    def hire(self, name, role):
-        """招募：创建一个持久 Agent"""
-        agent = self.agent_factory(name, role)
-        self.agents[name] = agent
-        return agent
-
-    def send(self, from_name, to_name, message):
-        """Agent 之间的通信通道"""
-        if to_name not in self.agents:
-            return f"Error: {to_name} not found"
-        self.agents[to_name].receive(from_name, message)
-        print(f"  [communication] from {from_name} to {to_name}: {message[:60]}...")
-
-    def broadcast(self, from_name, message):
-        """广播：给团队所有其他人发消息"""
-        for name, agent in self.agents.items():
-            if name != from_name:
-                agent.receive(from_name, message)
-        print(f"  [broadcast] from {from_name} to all teammates: {message[:60]}...")
-
-    def disband(self):
-        """解散：所有 Agent 生命周期结束"""
-        names = list(self.agents.keys())
-        self.agents.clear()
-        print(f"  [dismiss] The team are dismissed ({', '.join(names)})")
-
-"""
-团队编排
-"""
-class TeamOrchestrator:
-    def __init__(self, model="qwen3.5:9b", temperature: float = 0.1,
-                 base_url: str = None, api_key: str = None,
-                 client=None, mcp_client=None):
-        self.model = model
-        self.temperature = temperature
-        self._base_url = os.environ.get("OPENAI_BASE_URL") if base_url is None else base_url
-        self._api_key = os.environ.get("OPENAI_API_KEY") if api_key is None else api_key
-        self.client = client or OpenAI(base_url=self._base_url, api_key=self._api_key)
-        self.mcp_client = mcp_client
-
-    def _create_agent(self, name, role):
-        return Agent(
-            model=self.model,
-            temperature=self.temperature,
-            base_url=self._base_url,
-            api_key=self._api_key,
-            mcp_client=self.mcp_client,
-            role=role,
-            name=name,
-        )
-
-    def plan_team(self, task):
-        """让 LLM 根据任务规划团队成员"""
-        print(f"\n[PM] 分析任务，组建团队...")
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": load_prompt("team_planning_system.md")},
-                {"role": "user", "content": load_prompt("team_planning_user.md", task=task)}
-            ],
-            response_format={"type": "json_object"}
-        )
-        try:
-            return json.loads(response.choices[0].message.content).get("team", [])
-        except Exception:
-            return [{"name": "dev", "role": "developer", "task": task}]
-
-    def run(self, task):
-        """
-        完整的团队协作流程，展示三个核心能力:
-
-        1. 持久记忆 —— 同一个 Agent 被多次 chat()，记得之前做过什么
-        2. 身份生命周期 —— hire() 创建 → 多次交互 → disband() 解散
-        3. 通信通道 —— Agent 之间通过 send()/broadcast() 传递信息
-        """
-        team = Team(agent_factory=self._create_agent)
-
-        members = self.plan_team(task)
-        print(f"\n[团队] {len(members)} 人")
-        for i, member in enumerate(members, 1):
-            print(f"  {i}. {member['name']} - {member['role']} -> {member['task']}")
-
-        print(f"\n{'='*60}")
-        print("  阶段 1: 招募团队")
-        print(f"{'='*60}")
-        for member in members:
-            team.hire(member["name"], member["role"])
-
-        print(f"\n{'='*60}")
-        print("  阶段 2: 协作开发")
-        print(f"{'='*60}")
-
-        results = {}
-        for i, member in enumerate(members):
-            print(f"\n{'-'*60}")
-            print(f"  [{i+1}/{len(members)}] {member['name']} 开始工作")
-            print(f"{'-'*60}")
-
-            agent = team.agents[member["name"]]
-            result = agent.chat(member["task"])
-            results[member["name"]] = result
-            team.broadcast(member["name"], f"我完成了任务。摘要: {result[:200]}")
-
-        if members:
-            last = members[-1]
-            reviewer = team.agents[last["name"]]
-
-            print(f"\n{'='*60}")
-            print(f"  阶段 3: {last['name']} 做最终审查")
-            print(f"{'='*60}")
-
-            review = reviewer.chat("请根据你收到的所有团队成果，做一个最终的总结和审查。如果有问题请指出。")
-            results["final_review"] = review
-
-        print(f"\n{'='*60}")
-        print("  阶段 4: 解散团队")
-        print(f"{'='*60}")
-        team.disband()
-
-        print(f"\n{'='*60}")
-        print("  最终成果")
-        print(f"{'='*60}\n")
-        for name, result in results.items():
-            print(f"[{name}]")
-            print(f"  {result[:300]}\n")
-
-        return results
-
-
-def plan_team(task):
-    return TeamOrchestrator().plan_team(task)
-
-
-def run_team(task):
-    return TeamOrchestrator().run(task)
-
+from multi_agent import (
+    Team,
+    TeamOrchestrator,
+    build_table_game_runtime_config,
+    create_table_game_orchestrator,
+    plan_team,
+    run_team,
+)
 
 if __name__ == "__main__":
     from agent_run import AgentRunner

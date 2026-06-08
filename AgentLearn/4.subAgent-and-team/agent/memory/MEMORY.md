@@ -1,20 +1,60 @@
 # MEMORY
 
-## User Profile
-- 用户位于上海，对价格敏感，关注机票性价比
-- 用户对F1方程式赛车感兴趣，关注赛事积分榜、赛季结果、赛程安排、中国大奖赛及中国车手（如周冠宇）
+以下内容由本地兜底整理生成，建议后续手动检查。
 
-## F1 Key Facts
-- 2024赛季：车手冠军维斯塔潘（红牛，四连冠）；车队冠军迈凯伦（时隔26年）
-- 2025赛季：迈凯伦包揽双料冠军，诺里斯423分，维斯塔潘421分，皮亚斯特里410分；车队前五：迈凯伦832、梅赛德斯469、红牛454、法拉利398、威廉姆斯137；汉密尔顿加盟法拉利积156分无分站冠军
-- 2026赛季：24场分站赛，新混合动力单元规则，摩纳哥GP移至6月，加拿大GP取代伊莫拉；中国大奖赛（上海）为第二站（3月13–15日），首次使用冲刺赛格式；周冠宇担任凯迪拉克车队储备车手；中国大奖赛冠军为安东内利（梅赛德斯），最年轻杆位与冠军双料得主；加拿大站安东内利四连冠创历史纪录；拉塞尔在加拿大站后宣布退役
-
-## Open Items
-- 2024赛季F1详细积分榜数据尚未获取，后续可重试
-- 代码库中8个实际TODO项（3个文件）：高优先级包括工具不可用问题（天气/机票预订）、记忆系统优化；中优先级包括MCP客户端TCP模式支持；低优先级包括压缩方案、系统提示优化
-- 用户计划上海→广州出行（2026年5月下旬），尚未确认具体日期；已知5月26日和30日票价260元最低，5月23/25/27/28日为269元
-
-## References
-- 官方2026赛季赛程：https://www.formula1.com/en/racing/2026
-- F1官方信息渠道：formula1.com、F1 Boxbox
-- 代码库TODO汇总文档：所有TODO-521.md（8个实际TODO，分布在agent_subAgent_test.py、agent_Teams.py、Agent_test.py）
+## decisions
+- 2026-06-04 15:18:51 | decision | Cheapest flight dates identified: May 26 and May 30, 2026 at 260 yuan; May 23, 25, 27, 28 at 269 yuan. (confidence: medium; source: task_20260604_151851_a8b3ae)
+## learnings
+- 2026-06-04 15:16:21 | learning | 2026 F1 season features 24 races, new hybrid power unit regulations, Monaco GP moved to June (first time since 2003), Canada GP replaces Imola. (confidence: medium; source: task_20260604_151621_6e2e4a)
+## open_items
+- 2026-06-04 15:15:32 | todo | 完整的2024赛季F1详细积分榜数据尚未获取，网络搜索功能不可用，后续可重试获取详细积分榜 (confidence: medium; source: task_20260604_151532_813057)
+- 2026-06-04 15:18:00 | todo | 42 TODO items remain unresolved across the codebase. High priority: error handling, core features, performance optimization. Medium: UX, auxiliary features. Low: advanced feature extensions. (confidence: high; source: task_20260604_151800_7419bf)
+- 2026-06-04 15:18:51 | todo | User has not yet confirmed a travel date; assistant offered to provide more detailed flight info once a date is chosen. (confidence: high; source: task_20260604_151851_a8b3ae)
+- 2026-06-04 15:19:04 | todo | 用户尚未决定最终出行目的地，待进一步确认 (confidence: high; source: task_20260604_151904_3c07af)
+## projects
+- 2026-06-04 15:15:32 | fact | 2024年F1车手总冠军为马克斯·维斯塔潘（红牛车队），实现职业生涯四连冠，F1历史上第四位达成此成就的车手 (confidence: high; source: task_20260604_151532_813057)
+- 2026-06-04 15:15:32 | fact | 2024年F1车队总冠军为迈凯伦车队，时隔26年（自1998年以来）再次赢得制造商冠军 (confidence: high; source: task_20260604_151532_813057)
+- 2026-06-04 15:16:38 | fact | 2026 F1 Chinese Grand Prix (officially: 2026 F1 Heineken Chinese Grand Prix) held at Shanghai International Circuit, Shanghai, from March 13–15, 2026 (Fri–Sun). It is Round 2 of the 2026 F1 World Championship and China's only F1 round. (confidence: high; source: task_20260604_151638_b38ef5)
+- 2026-06-04 15:16:38 | fact | 2026 Chinese GP schedule: Fri Mar 13 – Sprint Qualifying; Sat Mar 14 – Sprint Race + Qualifying; Sun Mar 15 – Main Race. This marks the third consecutive year the sprint format is used at the Chinese GP and is the first sprint event of the 2026 season globally. (confidence: high; source: task_20260604_151638_b38ef5)
+- 2026-06-04 15:16:38 | fact | Chinese driver Zhou Guanyu will serve as reserve driver for the Cadillac F1 team in the 2026 season. A new generation of female drivers is also expected to appear at the Chinese round. (confidence: high; source: task_20260604_151638_b38ef5)
+- 2026-06-04 15:16:38 | fact | Ticket prices were announced Dec 5, 2025; tickets went on sale Dec 11, 2025 at 11:00 via official channels. (confidence: high; source: task_20260604_151638_b38ef5)
+- 2026-06-04 15:17:16 | fact | 2026年F1赛季共24站大奖赛，赛季于2026年3月6日至8日开始，中国站为第二站（3月13日至15日） (confidence: medium; source: task_20260604_151716_954159)
+- 2026-06-04 15:17:16 | fact | 2026年中国大奖赛冠军为基米·安东内利（梅赛德斯车队），成为最年轻杆位与冠军双料得主 (confidence: medium; source: task_20260604_151716_954159)
+- 2026-06-04 15:17:16 | fact | 2026年F1赛季引入全新动力单元设计、重大空气动力学规则调整，配合2030年净零碳排放目标 (confidence: medium; source: task_20260604_151716_954159)
+- 2026-06-04 15:18:00 | fact | The current project contains 42 Python files with 42 TODO items spread across 14 files, categorized into performance optimization (15), feature implementation (12), error handling (8), and UX (7). (confidence: high; source: task_20260604_151800_7419bf)
+- 2026-06-04 15:18:09 | fact | The codebase has a TODO summary document named '所有TODO-521.md' that tracks TODO items found across source files. (confidence: high; source: task_20260604_151809_49e022)
+- 2026-06-04 15:18:09 | fact | Actual TODO count in the codebase is 8 items across 3 files: agent_subAgent_test.py (lines 38-39), agent_Teams.py (lines 1859-1870), Agent_test.py (lines 38-39). Previous count of 42 was inflated by preset TODO text patterns. (confidence: high; source: task_20260604_151809_49e022)
+- 2026-06-04 15:18:09 | fact | High priority TODOs: tool unavailability issues (weather/flight booking tools), memory system optimization (short-term memory loading, context snapshots). Medium: TCP mode support for MCP client, loading method optimization. Low: compression scheme, system prompt optimization. (confidence: high; source: task_20260604_151809_49e022)
+- 2026-06-04 15:18:09 | fact | The project uses Python test files (agent_subAgent_test.py, Agent_test.py) and a main agent module (agent_Teams.py) as core components. (confidence: high; source: task_20260604_151809_49e022)
+- 2026-06-04 15:18:40 | project_state | 存在一个名为'所有TODO-521.md'的汇总文档，用于追踪项目中的TODO项。该文档已更新，包含8个实际TODO项，分布在3个Python文件中（agent_subAgent_test.py、agent_Teams.py、Agent_test.py），每个TODO标注了文件路径、行号及优先级（高/中/低）。 (confidence: high; source: task_20260604_151840_0a2573)
+- 2026-06-04 15:18:40 | fact | 项目中实际TODO数量为8个（非预设的42个），涉及3个Python文件。 (confidence: high; source: task_20260604_151840_0a2573)
+- 2026-06-04 15:18:51 | project_state | User is planning a flight trip from Shanghai to Guangzhou, looking for cheap tickets in late May 2026. (confidence: medium; source: task_20260604_151851_a8b3ae)
+- 2026-06-04 15:19:11 | fact | Project has a structured agent system with memory management (full_context), configuration, tools, skills (local-semantic-search), and caching layers. (confidence: medium; source: task_20260604_151911_3976c5)
+- 2026-06-04 15:19:38 | fact | 当前项目共有42个Python文件，主要分布在根目录(15个)、module_test/(5个)、tools/(6个)、agent/skills/local-semantic-search/scripts/(5个)、agent/skills/pptx/scripts/(10个)、agent/skills/pptx/scripts/office/(8个) (confidence: high; source: task_20260604_151938_c98eb1)
+- 2026-06-04 15:19:38 | fact | 项目功能模块包括：任务管理、会话管理、工具管理、MCP客户端/服务器、PPT处理、本地搜索等 (confidence: high; source: task_20260604_151938_c98eb1)
+## references
+- 2026-06-04 15:15:19 | fact | 2025赛季F1车手前三：1.诺里斯(迈凯伦)423分，2.维斯塔潘(红牛)421分，3.皮亚斯特里(迈凯伦)410分 (confidence: high; source: task_20260604_151519_e87f5d)
+- 2026-06-04 15:15:19 | fact | 2025赛季F1车队前五：1.迈凯伦832分，2.梅赛德斯469分，3.红牛454分，4.法拉利398分，5.威廉姆斯137分 (confidence: high; source: task_20260604_151519_e87f5d)
+- 2026-06-04 15:15:19 | fact | 2025赛季F1亮点：迈凯伦包揽双料冠军，诺里斯终结红牛五年垄断，汉密尔顿加盟法拉利积156分排名第六无分站冠军 (confidence: high; source: task_20260604_151519_e87f5d)
+- 2026-06-04 15:16:21 | reference | Official F1 2026 season calendar: https://www.formula1.com/en/racing/2026 (confidence: high; source: task_20260604_151621_6e2e4a)
+- 2026-06-04 15:16:59 | fact | 2024 F1 Drivers' Champion: Max Verstappen (4th consecutive title, clinched at Las Vegas GP with 5th place finish). 2024 F1 Constructors' Champion: McLaren (first since 1998, confirmed at Abu Dhabi GP). (confidence: high; source: task_20260604_151659_8009ff)
+- 2026-06-04 15:17:16 | reference | F1官方信息渠道：https://www.formula1.com、F1 Boxbox (confidence: high; source: task_20260604_151716_954159)
+- 2026-06-04 15:17:36 | fact | F1最多车手冠军纪录保持者：刘易斯·汉密尔顿（英国）和迈克尔·舒马赫（德国）并列第一，各7次冠军。汉密尔顿冠军年份：2008, 2014, 2015, 2017, 2018, 2019, 2020；舒马赫冠军年份：1994, 1995, 2000, 2001, 2002, 2003, 2004。 (confidence: high; source: task_20260604_151736_2d01a5)
+- 2026-06-04 15:17:43 | fact | 2026年F1加拿大站于2026年5月22日至24日在蒙特利尔吉尔·维伦纽夫赛道举行，为2026赛季第6站 (confidence: high; source: task_20260604_151743_6d2d18)
+- 2026-06-04 15:17:43 | fact | 基米·安东内利（梅赛德斯）赢得2026年加拿大站冠军，实现职业生涯前四场分站赛四连冠，创F1历史纪录 (confidence: high; source: task_20260604_151743_6d2d18)
+- 2026-06-04 15:17:43 | fact | 刘易斯·汉密尔顿（法拉利）获得2026年加拿大站亚军 (confidence: high; source: task_20260604_151743_6d2d18)
+- 2026-06-04 15:17:43 | fact | 乔治·拉塞尔在2026年加拿大站后宣布退役，此前连续三年在该站夺得杆位，队内竞争激烈是退役原因之一 (confidence: high; source: task_20260604_151743_6d2d18)
+- 2026-06-04 15:18:00 | reference | A consolidated TODO document '所有TODO-521.md' has been created in the current working directory, summarizing all TODO items found in the codebase with priority recommendations. (confidence: high; source: task_20260604_151800_7419bf)
+- 2026-06-04 15:19:11 | fact | The project contains 26 JSON files distributed across: agent/memory/full_context/ (21 task context files), module_test/session_test/ (2), agent/config/ (2), tools/ (2), agent/skills/local-semantic-search/ (1), cache/ (1). (confidence: high; source: task_20260604_151911_3976c5)
+- 2026-06-04 23:21:54 | reference | Moderate-intensity exercise: 50–70% max heart rate (max HR ≈ 220 − age); can talk but not sing; slight sweating. Examples: brisk walking (5–6 km/h), leisure cycling, slow swimming, yoga, housework. (confidence: high; source: task_20260604_232154_8df348)
+- 2026-06-04 23:21:54 | reference | High-intensity exercise: 70–85%+ max heart rate; can only say short phrases; heavy sweating, muscle fatigue. Examples: running (8+ km/h), HIIT, fast cycling, competitive sports, fast stair climbing. (confidence: high; source: task_20260604_232154_8df348)
+- 2026-06-04 23:21:54 | reference | Quick self-test for exercise intensity: talk test (full sentences vs. few words), sing test (can vs. cannot), sweat level, recovery time. Example for age 30: max HR ≈ 190, moderate zone 95–133 bpm, high intensity ≥133 bpm. (confidence: high; source: task_20260604_232154_8df348)
+## user_profile
+- 2026-06-04 15:14:59 | fact | 用户可能位于上海或关注上海天气 (confidence: medium; source: task_20260604_151459_3c243e)
+- 2026-06-04 15:15:19 | preference | 用户对F1方程式赛车感兴趣，关注赛事积分榜和赛季结果 (confidence: medium; source: task_20260604_151519_e87f5d)
+- 2026-06-04 15:16:21 | preference | User is interested in Formula 1 (F1) racing, specifically race schedules and season information. (confidence: medium; source: task_20260604_151621_6e2e4a)
+- 2026-06-04 15:16:38 | preference | User is interested in Formula 1, particularly the Chinese Grand Prix and Chinese drivers (e.g., Zhou Guanyu). (confidence: medium; source: task_20260604_151638_b38ef5)
+- 2026-06-04 15:16:59 | preference | User is interested in Formula 1 racing and may request F1-related information or searches. (confidence: medium; source: task_20260604_151659_8009ff)
+- 2026-06-04 15:17:43 | preference | 用户对F1赛车感兴趣，关注2026赛季赛事 (confidence: medium; source: task_20260604_151743_6d2d18)
+- 2026-06-04 15:19:04 | fact | 用户位于上海（出发城市） (confidence: high; source: task_20260604_151904_3c07af)
+- 2026-06-04 15:19:04 | preference | 用户对价格敏感，关注机票性价比 (confidence: medium; source: task_20260604_151904_3c07af)

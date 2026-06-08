@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, wait
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
+from threading import Lock, RLock
 from typing import Any
 from prompt_loader import load_prompt
 
@@ -36,6 +37,7 @@ class MemoryManager:
         memory_max_retries: int = 0,
         topic_compact_threshold: int = 10,
         memory_index_line_limit: int = 200,
+        memory_worker_count: int = 5,
     ):
         self.project_root = Path(project_root)
         self.prompts_dir = self.project_root / "agent" / "prompts"
@@ -50,6 +52,7 @@ class MemoryManager:
         self.memory_max_retries = memory_max_retries
         self.topic_compact_threshold = topic_compact_threshold
         self.memory_index_line_limit = memory_index_line_limit
+        self.memory_worker_count = max(1, int(memory_worker_count or 1))
 
         self.memory_dir = self.project_root / "agent" / "memory"
         self.full_context_dir = self.memory_dir / "full_context"
@@ -63,8 +66,11 @@ class MemoryManager:
         self.deleted_tasks_file = self.memory_dir / "deleted_tasks.jsonl"
         self.error_log_file = self.memory_dir / "memory_errors.log"
 
-        # 只使用一个后台线程，保证 jsonl 追加和 MEMORY.md 整理的顺序稳定。
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="memory-manager")
+        # 模型摘要可并发执行；文件写入和 MEMORY.md 压缩由锁保证一致性。
+        self._storage_lock = RLock()
+        self._futures_lock = RLock()
+        self._compaction_lock = Lock()
+        self._executor = ThreadPoolExecutor(max_workers=self.memory_worker_count, thread_name_prefix="memory-manager")
         self._futures = []
         self._shutdown = False
         self._ensure_memory_files()
@@ -109,28 +115,34 @@ class MemoryManager:
             "last_memory_checked_event_id": last_memory_checked_event_id,
         }
         future = self._executor.submit(self._process_memory_update, task, result, context_snapshot, metadata)
-        self._futures.append(future)
+        with self._futures_lock:
+            self._futures.append(future)
         self._cleanup_finished_futures()
         return future
 
     def has_pending(self) -> bool:
         self._cleanup_finished_futures()
-        return any(not future.done() for future in self._futures)
+        with self._futures_lock:
+            return any(not future.done() for future in self._futures)
 
     def pending_count(self) -> int:
         self._cleanup_finished_futures()
-        return sum(1 for future in self._futures if not future.done())
+        with self._futures_lock:
+            return sum(1 for future in self._futures if not future.done())
 
     def wait_for_pending(self, timeout: float | None = None) -> bool:
         # Agent 退出前调用这里，等待用户无感的后台记忆整理任务完成。
         self._cleanup_finished_futures()
-        if not self._futures:
+        with self._futures_lock:
+            futures = list(self._futures)
+        if not futures:
             return True
-        done, not_done = wait(self._futures, timeout=timeout)
+        done, not_done = wait(futures, timeout=timeout)
         for future in done:
             self._log_future_exception(future)
-        self._futures = list(not_done)
-        return not not_done
+        with self._futures_lock:
+            self._futures = [future for future in self._futures if not future.done()]
+            return not any(not future.done() for future in self._futures)
 
     def shutdown(self):
         if self._shutdown:
@@ -145,7 +157,8 @@ class MemoryManager:
     def _load_prompt_memory_view(self) -> str:
         # system prompt 只注入 MEMORY.md 短索引和最近任务索引，详细 topic/full_context 按需读取。
         self._ensure_memory_files()
-        memory_index = self.memory_index_file.read_text(encoding="utf-8").strip()
+        with self._storage_lock:
+            memory_index = self.memory_index_file.read_text(encoding="utf-8").strip()
         recent_tasks = self._load_recent_tasks()
 
         recent_task_lines = []
@@ -451,7 +464,8 @@ class MemoryManager:
             "messages": context,
             "metadata": metadata or {},
         }
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        with self._storage_lock:
+            path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         return str(path)
 
     def _assess_memory_value(self, task: str, result: str, context: list[dict[str, Any]]) -> dict[str, Any]:
@@ -578,14 +592,15 @@ class MemoryManager:
             self._append_jsonl(self.memory_items_file, item)
 
     def _append_topic_items(self, items: list[dict[str, Any]]) -> None:
-        for item in items:
-            topic_path = self._topic_file(item["topic"])
-            line = (
-                f"- {item['timestamp']} | {item['type']} | {item['content']} "
-                f"(confidence: {item['confidence']}; source: {item['task_id']})"
-            )
-            with topic_path.open("a", encoding="utf-8") as file:
-                file.write(line + "\n")
+        with self._storage_lock:
+            for item in items:
+                topic_path = self._topic_file(item["topic"])
+                line = (
+                    f"- {item['timestamp']} | {item['type']} | {item['content']} "
+                    f"(confidence: {item['confidence']}; source: {item['task_id']})"
+                )
+                with topic_path.open("a", encoding="utf-8") as file:
+                    file.write(line + "\n")
 
     def _normalize_topic(self, topic: Any) -> str:
         normalized = re.sub(r"[^0-9a-zA-Z_\-]+", "_", str(topic or "").strip().lower()).strip("_")
@@ -727,76 +742,83 @@ class MemoryManager:
         if self._shutdown:
             return None
         future = self._executor.submit(self._compact_memory_index_if_needed, reason, False)
-        self._futures.append(future)
+        with self._futures_lock:
+            self._futures.append(future)
         self._cleanup_finished_futures()
         return future
 
     def _compact_memory_index_if_needed(self, reason: str, force: bool = False) -> dict[str, Any]:
-        self._ensure_memory_files()
-        state = self._read_memory_state()
-        dirty_count = int(state.get("dirty_topic_item_count") or 0)
-        line_count = self._memory_index_line_count()
-        should_compact = (
-            line_count > self.memory_index_line_limit
-            or dirty_count >= self.topic_compact_threshold
-            or (reason == "session_end" and dirty_count > 0)
-            or (force and (dirty_count > 0 or line_count > self.memory_index_line_limit))
-        )
-        if not should_compact:
+        with self._compaction_lock:
+            self._ensure_memory_files()
+            with self._storage_lock:
+                state = self._read_memory_state()
+                dirty_count = int(state.get("dirty_topic_item_count") or 0)
+                line_count = self._memory_index_line_count()
+                should_compact = (
+                    line_count > self.memory_index_line_limit
+                    or dirty_count >= self.topic_compact_threshold
+                    or (reason == "session_end" and dirty_count > 0)
+                    or (force and (dirty_count > 0 or line_count > self.memory_index_line_limit))
+                )
+                current_memory = self._limit_text(self.memory_index_file.read_text(encoding="utf-8"), 10000)
+                topics_text = self._collect_topic_text()
+
+            if not should_compact:
+                result = {
+                    "status": "skipped",
+                    "reason": "no_worthy_memory",
+                    "dirty_topic_item_count": dirty_count,
+                    "memory_index_line_count": line_count,
+                }
+                if force or reason == "session_end":
+                    self._log_maintenance("memory_compact_skipped", result)
+                return result
+
+            try:
+                response = self._create_memory_completion(
+                    model=self.model,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": load_prompt("memory_index_compaction_system.md", prompts_dir=self.prompts_dir),
+                        },
+                        {
+                            "role": "user",
+                            "content": json.dumps(
+                                {
+                                    "reason": reason,
+                                    "current_memory_md": current_memory,
+                                    "topic_memory": topics_text,
+                                },
+                                ensure_ascii=False,
+                                indent=2,
+                            ),
+                        },
+                    ],
+                    temperature=self.temperature,
+                )
+                updated_memory = response.choices[0].message.content.strip()
+            except Exception:
+                self._log_error("memory index compaction model call failed", traceback.format_exc())
+                updated_memory = self._fallback_memory_index(topics_text)
+
+            with self._storage_lock:
+                self.memory_index_file.write_text(updated_memory, encoding="utf-8")
+                state = self._read_memory_state()
+                current_dirty_count = int(state.get("dirty_topic_item_count") or 0)
+                state["dirty_topic_item_count"] = max(0, current_dirty_count - dirty_count)
+                state["last_compacted_at"] = datetime.now().isoformat(timespec="seconds")
+                state["last_compact_reason"] = reason
+                self._write_memory_state(state)
             result = {
-                "status": "skipped",
-                "reason": "no_worthy_memory",
+                "status": "compacted",
+                "reason": reason,
                 "dirty_topic_item_count": dirty_count,
                 "memory_index_line_count": line_count,
+                "memory_index_path": str(self.memory_index_file),
             }
-            if force or reason == "session_end":
-                self._log_maintenance("memory_compact_skipped", result)
+            self._log_maintenance("memory_compacted", result)
             return result
-
-        current_memory = self._limit_text(self.memory_index_file.read_text(encoding="utf-8"), 10000)
-        topics_text = self._collect_topic_text()
-        try:
-            response = self._create_memory_completion(
-                model=self.model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": load_prompt("memory_index_compaction_system.md", prompts_dir=self.prompts_dir),
-                    },
-                    {
-                        "role": "user",
-                        "content": json.dumps(
-                            {
-                                "reason": reason,
-                                "current_memory_md": current_memory,
-                                "topic_memory": topics_text,
-                            },
-                            ensure_ascii=False,
-                            indent=2,
-                        ),
-                    },
-                ],
-                temperature=self.temperature,
-            )
-            updated_memory = response.choices[0].message.content.strip()
-        except Exception:
-            self._log_error("memory index compaction model call failed", traceback.format_exc())
-            updated_memory = self._fallback_memory_index(topics_text)
-
-        self.memory_index_file.write_text(updated_memory, encoding="utf-8")
-        state["dirty_topic_item_count"] = 0
-        state["last_compacted_at"] = datetime.now().isoformat(timespec="seconds")
-        state["last_compact_reason"] = reason
-        self._write_memory_state(state)
-        result = {
-            "status": "compacted",
-            "reason": reason,
-            "dirty_topic_item_count": dirty_count,
-            "memory_index_line_count": line_count,
-            "memory_index_path": str(self.memory_index_file),
-        }
-        self._log_maintenance("memory_compacted", result)
-        return result
 
     def _rebuild_memory_index_from_topics(self, reason: str = "memory_rebuild") -> dict[str, Any]:
         """
@@ -836,12 +858,13 @@ class MemoryManager:
                 self._log_error("memory index rebuild model call failed", traceback.format_exc())
                 updated_memory = self._fallback_memory_index(topics_text)
 
-        self.memory_index_file.write_text(updated_memory, encoding="utf-8")
-        state = self._read_memory_state()
-        state["dirty_topic_item_count"] = 0
-        state["last_compacted_at"] = datetime.now().isoformat(timespec="seconds")
-        state["last_compact_reason"] = reason
-        self._write_memory_state(state)
+        with self._storage_lock:
+            self.memory_index_file.write_text(updated_memory, encoding="utf-8")
+            state = self._read_memory_state()
+            state["dirty_topic_item_count"] = 0
+            state["last_compacted_at"] = datetime.now().isoformat(timespec="seconds")
+            state["last_compact_reason"] = reason
+            self._write_memory_state(state)
         result = {
             "status": "rebuilt",
             "reason": reason,
@@ -852,12 +875,13 @@ class MemoryManager:
 
     def _collect_topic_text(self, max_chars: int = 24000) -> str:
         chunks = []
-        for topic in sorted(self.DEFAULT_TOPICS):
-            path = self._topic_file(topic)
-            text = path.read_text(encoding="utf-8").strip() if path.exists() else ""
-            if not text or text == f"# {topic}":
-                continue
-            chunks.append(f"\n\n## {topic}\n{text}")
+        with self._storage_lock:
+            for topic in sorted(self.DEFAULT_TOPICS):
+                path = self._topic_file(topic)
+                text = path.read_text(encoding="utf-8").strip() if path.exists() else ""
+                if not text or text == f"# {topic}":
+                    continue
+                chunks.append(f"\n\n## {topic}\n{text}")
         return self._limit_text("".join(chunks).strip(), max_chars)
 
     def _fallback_memory_index(self, topics_text: str) -> str:
@@ -878,15 +902,17 @@ class MemoryManager:
     def _increase_dirty_topic_count(self, count: int) -> None:
         if count <= 0:
             return
-        state = self._read_memory_state()
-        state["dirty_topic_item_count"] = int(state.get("dirty_topic_item_count") or 0) + count
-        state["last_topic_item_added_at"] = datetime.now().isoformat(timespec="seconds")
-        self._write_memory_state(state)
+        with self._storage_lock:
+            state = self._read_memory_state()
+            state["dirty_topic_item_count"] = int(state.get("dirty_topic_item_count") or 0) + count
+            state["last_topic_item_added_at"] = datetime.now().isoformat(timespec="seconds")
+            self._write_memory_state(state)
 
     def _memory_index_line_count(self) -> int:
-        if not self.memory_index_file.exists():
-            return 0
-        text = self.memory_index_file.read_text(encoding="utf-8")
+        with self._storage_lock:
+            if not self.memory_index_file.exists():
+                return 0
+            text = self.memory_index_file.read_text(encoding="utf-8")
         return len(text.splitlines())
 
     def _default_memory_state(self) -> dict[str, Any]:
@@ -899,7 +925,8 @@ class MemoryManager:
 
     def _read_memory_state(self) -> dict[str, Any]:
         try:
-            state = json.loads(self.memory_state_file.read_text(encoding="utf-8"))
+            with self._storage_lock:
+                state = json.loads(self.memory_state_file.read_text(encoding="utf-8"))
         except Exception:
             return self._default_memory_state()
         if not isinstance(state, dict):
@@ -909,8 +936,9 @@ class MemoryManager:
         return default
 
     def _write_memory_state(self, state: dict[str, Any]) -> None:
-        self.memory_state_file.parent.mkdir(parents=True, exist_ok=True)
-        self.memory_state_file.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        with self._storage_lock:
+            self.memory_state_file.parent.mkdir(parents=True, exist_ok=True)
+            self.memory_state_file.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def _log_maintenance(self, action: str, payload: dict[str, Any]) -> None:
         record = {
@@ -1011,25 +1039,27 @@ class MemoryManager:
         return (session_id, str(turn_id)) in deleted_turn_refs or (None, str(turn_id)) in deleted_turn_refs
 
     def _read_jsonl_records(self, path: Path) -> list[dict[str, Any]]:
-        if not path.exists():
-            return []
-        records = []
-        for line in path.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(record, dict):
-                records.append(record)
+        with self._storage_lock:
+            if not path.exists():
+                return []
+            records = []
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(record, dict):
+                    records.append(record)
         return records
 
     def _write_jsonl_records(self, path: Path, records: list[dict[str, Any]]) -> None:
         content = "\n".join(json.dumps(record, ensure_ascii=False) for record in records)
         if content:
             content += "\n"
-        path.write_text(content, encoding="utf-8")
+        with self._storage_lock:
+            path.write_text(content, encoding="utf-8")
 
     @staticmethod
     def _normalize_task_ids(task_ids: list[str] | set[str]) -> set[str]:
@@ -1072,22 +1102,23 @@ class MemoryManager:
         if not task_ids:
             return 0
         removed_count = 0
-        for topic in self.DEFAULT_TOPICS:
-            topic_path = self._topic_file(topic)
-            if not topic_path.exists():
-                continue
-            lines = topic_path.read_text(encoding="utf-8").splitlines()
-            original_count = len(lines)
-            kept_lines = [
-                line
-                for line in lines
-                if not any(f"source: {task_id}" in line for task_id in task_ids)
-            ]
-            removed_count += original_count - len(kept_lines)
-            if kept_lines:
-                topic_path.write_text("\n".join(kept_lines) + "\n", encoding="utf-8")
-            else:
-                topic_path.write_text(f"# {topic}\n", encoding="utf-8")
+        with self._storage_lock:
+            for topic in self.DEFAULT_TOPICS:
+                topic_path = self._topic_file(topic)
+                if not topic_path.exists():
+                    continue
+                lines = topic_path.read_text(encoding="utf-8").splitlines()
+                original_count = len(lines)
+                kept_lines = [
+                    line
+                    for line in lines
+                    if not any(f"source: {task_id}" in line for task_id in task_ids)
+                ]
+                removed_count += original_count - len(kept_lines)
+                if kept_lines:
+                    topic_path.write_text("\n".join(kept_lines) + "\n", encoding="utf-8")
+                else:
+                    topic_path.write_text(f"# {topic}\n", encoding="utf-8")
         return removed_count
 
     def _safe_full_context_path(self, path_value: str) -> Path | None:
@@ -1111,18 +1142,23 @@ class MemoryManager:
         self._append_jsonl(self.task_summaries_file, summary)
 
     def _append_jsonl(self, path: Path, record: dict[str, Any]) -> None:
-        with path.open("a", encoding="utf-8") as file:
-            file.write(json.dumps(record, ensure_ascii=False) + "\n")
+        with self._storage_lock:
+            with path.open("a", encoding="utf-8") as file:
+                file.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     def _cleanup_finished_futures(self):
         # 清理已完成的后台任务，避免 future 列表无限增长；异常统一写入 memory_errors.log。
+        finished = []
         remaining = []
-        for future in self._futures:
-            if future.done():
-                self._log_future_exception(future)
-            else:
-                remaining.append(future)
-        self._futures = remaining
+        with self._futures_lock:
+            for future in self._futures:
+                if future.done():
+                    finished.append(future)
+                else:
+                    remaining.append(future)
+            self._futures = remaining
+        for future in finished:
+            self._log_future_exception(future)
 
     def _log_future_exception(self, future):
         try:
@@ -1132,8 +1168,9 @@ class MemoryManager:
 
     def _log_error(self, title: str, detail: str):
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        with self.error_log_file.open("a", encoding="utf-8") as file:
-            file.write(f"\n## {timestamp} {title}\n{detail}\n")
+        with self._storage_lock:
+            with self.error_log_file.open("a", encoding="utf-8") as file:
+                file.write(f"\n## {timestamp} {title}\n{detail}\n")
 
     def _limit_text(self, text: str, limit: int) -> str:
         text = text or ""
