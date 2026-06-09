@@ -1,0 +1,6 @@
+{% for widget in widget.subwidgets %}
+<label style="display: inline-flex; align-items: center; gap: 4px; margin-right: 15px; cursor: pointer; font-weight: normal;">
+    <input type="{{ widget.type }}" name="{{ widget.name }}" value="{{ widget.value }}"{% if widget.attrs.checked %} checked{% endif %}>
+    {{ widget.label }}
+</label>
+{% endfor %}

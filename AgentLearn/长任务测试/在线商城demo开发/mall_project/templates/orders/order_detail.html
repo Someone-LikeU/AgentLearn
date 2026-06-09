@@ -1,0 +1,42 @@
+{% extends 'base.html' %}
+
+{% block title %}订单详情 - 在线商城{% endblock %}
+
+{% block content %}
+<div class="card">
+    <h2 style="margin-bottom: 20px;">订单详情 #{{ order.pk }}</h2>
+    <p><strong>订单状态：</strong>
+        {% if order.status == 'completed' %}
+        <span style="color: green;">已完成</span>
+        {% elif order.status == 'pending' %}
+        <span style="color: orange;">待支付</span>
+        {% else %}
+        <span style="color: red;">已取消</span>
+        {% endif %}
+    </p>
+    <p><strong>创建时间：</strong>{{ order.created_at|date:"Y-m-d H:i:s" }}</p>
+    <p><strong>总金额：</strong><span style="color: #e74c3c; font-size: 20px;">{{ order.total_amount }} 软妹币</span></p>
+
+    <h3 style="margin: 20px 0 10px;">商品明细</h3>
+    <table>
+        <thead>
+            <tr>
+                <th>商品</th>
+                <th>单价</th>
+                <th>数量</th>
+                <th>小计</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for item in order.items.all %}
+            <tr>
+                <td>{{ item.product.name|default:"已删除商品" }}</td>
+                <td>{{ item.price }} 软妹币</td>
+                <td>{{ item.quantity }}</td>
+                <td>{{ item.get_subtotal }} 软妹币</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endblock %}

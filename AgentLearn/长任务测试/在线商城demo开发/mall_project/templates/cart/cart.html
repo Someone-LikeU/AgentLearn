@@ -1,0 +1,58 @@
+{% extends 'base.html' %}
+
+{% block title %}购物车 - 在线商城{% endblock %}
+
+{% block content %}
+<div class="card">
+    <h2 style="margin-bottom: 20px;">购物车</h2>
+    {% if cart_items %}
+    <table>
+        <thead>
+            <tr>
+                <th>商品</th>
+                <th>单价</th>
+                <th>数量</th>
+                <th>小计</th>
+                <th>操作</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for item in cart_items %}
+            <tr>
+                <td>{{ item.product.name }}</td>
+                <td>{{ item.product.price }} 软妹币</td>
+                <td>
+                    <form method="post" action="{% url 'cart:update_cart' item.pk %}" style="display: flex; align-items: center; gap: 10px;">
+                        {% csrf_token %}
+                        <input type="number" name="quantity" value="{{ item.quantity }}" min="0" max="{{ item.product.stock }}" style="width: 60px; padding: 5px;">
+                        <button type="submit" class="btn btn-secondary" style="padding: 5px 10px; font-size: 12px;">更新</button>
+                    </form>
+                </td>
+                <td>{{ item.get_total_price }} 软妹币</td>
+                <td>
+                    <form method="post" action="{% url 'cart:remove_from_cart' item.pk %}">
+                        {% csrf_token %}
+                        <button type="submit" class="btn btn-danger" style="padding: 5px 10px; font-size: 12px;">删除</button>
+                    </form>
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+        <tfoot>
+            <tr>
+                <td colspan="3" class="text-right"><strong>总计:</strong></td>
+                <td colspan="2"><strong style="color: #e74c3c; font-size: 18px;">{{ total }} 软妹币</strong></td>
+            </tr>
+        </tfoot>
+    </table>
+    <div style="margin-top: 20px; text-align: right;">
+        <form method="post" action="{% url 'orders:checkout' %}">
+            {% csrf_token %}
+            <button type="submit" class="btn btn-primary">结算购物车</button>
+        </form>
+    </div>
+    {% else %}
+    <p class="text-center">购物车是空的，<a href="{% url 'products:product_list' %}">去购物</a></p>
+    {% endif %}
+</div>
+{% endblock %}

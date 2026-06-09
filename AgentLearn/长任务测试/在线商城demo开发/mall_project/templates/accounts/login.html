@@ -1,0 +1,33 @@
+{% extends 'base.html' %}
+
+{% block title %}用户登录 - 在线商城{% endblock %}
+
+{% block content %}
+<div class="card" style="max-width: 400px; margin: 0 auto;">
+    <h2 style="margin-bottom: 20px;">用户登录</h2>
+    <form method="post">
+        {% csrf_token %}
+        {% for field in form %}
+        <div class="form-group">
+            <label for="{{ field.id_for_label }}">{{ field.label }}</label>
+            {{ field }}
+            {% if field.errors %}
+            <small style="color: red;">{{ field.errors.0 }}</small>
+            {% endif %}
+        </div>
+        {% endfor %}
+        {% if login_error %}
+        <div class="form-group">
+            <p style="color: red; margin: 5px 0;">{{ login_error }}</p>
+            {% if remaining_attempts is not None and remaining_attempts > 0 %}
+            <p style="color: red; margin: 5px 0;">剩余可尝试次数：{{ remaining_attempts }} 次</p>
+            {% endif %}
+        </div>
+        {% endif %}
+        <button type="submit" class="btn btn-primary" style="width: 100%;">登录</button>
+    </form>
+    <p style="margin-top: 15px; text-align: center;">
+        没有账号？<a href="{% url 'accounts:register' %}">立即注册</a>
+    </p>
+</div>
+{% endblock %}

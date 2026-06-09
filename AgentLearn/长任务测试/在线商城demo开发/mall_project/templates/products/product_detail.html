@@ -1,0 +1,41 @@
+{% extends 'base.html' %}
+
+{% block title %}{{ product.name }} - 在线商城{% endblock %}
+
+{% block content %}
+<div class="card">
+    <div style="display: flex; gap: 30px;">
+        <div style="width: 400px; height: 400px; background: #eee; display: flex; align-items: center; justify-content: center; color: #999; border-radius: 8px;">
+            商品图片
+        </div>
+        <div style="flex: 1;">
+            <h2>{{ product.name }}</h2>
+            <p style="color: #666; margin: 15px 0;">{{ product.description }}</p>
+            <p class="price" style="font-size: 28px;">{{ product.price }} 软妹币</p>
+            <p>库存: {{ product.stock }}</p>
+            <p>商家: {{ product.seller.username }}</p>
+            <p>上架时间: {{ product.created_at|date:"Y-m-d H:i" }}</p>
+
+            {% if user.is_authenticated and user.is_customer and product.is_in_stock %}
+            <div style="margin-top: 20px;">
+                <form method="post" action="{% url 'orders:buy_now' product.pk %}" style="margin-bottom: 10px;">
+                    {% csrf_token %}
+                    <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 10px;">
+                        <label>数量:</label>
+                        <input type="number" name="quantity" value="1" min="1" max="{{ product.stock }}" style="width: 80px; padding: 8px; border: 1px solid #ddd; border-radius: 4px;">
+                    </div>
+                    <button type="submit" class="btn btn-primary">立即购买</button>
+                </form>
+                <form method="post" action="{% url 'cart:add_to_cart' product.pk %}">
+                    {% csrf_token %}
+                    <input type="hidden" name="quantity" value="1">
+                    <button type="submit" class="btn btn-secondary">加入购物车</button>
+                </form>
+            </div>
+            {% elif not product.is_in_stock %}
+            <p style="color: #e74c3c; margin-top: 20px;">商品已售罄</p>
+            {% endif %}
+        </div>
+    </div>
+</div>
+{% endblock %}

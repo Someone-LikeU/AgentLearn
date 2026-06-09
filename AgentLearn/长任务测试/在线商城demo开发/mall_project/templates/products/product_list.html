@@ -1,0 +1,31 @@
+{% extends 'base.html' %}
+
+{% block title %}商品列表 - 在线商城{% endblock %}
+
+{% block content %}
+<h2 style="margin-bottom: 20px;">商品列表</h2>
+<div class="product-grid">
+    {% for product in products %}
+    <div class="product-card">
+        <div style="height: 200px; background: #eee; display: flex; align-items: center; justify-content: center; color: #999;">
+            商品图片
+        </div>
+        <div class="info">
+            <h3><a href="{% url 'products:product_detail' product.pk %}" style="text-decoration: none; color: #333;">{{ product.name }}</a></h3>
+            <p style="color: #666; font-size: 14px; margin: 5px 0;">{{ product.description|truncatechars:50 }}</p>
+            <p class="price">{{ product.price }} 软妹币</p>
+            <p style="font-size: 12px; color: #999;">库存: {{ product.stock }} | 商家: {{ product.seller.username }}</p>
+            {% if user.is_authenticated and user.is_customer %}
+            <form method="post" action="{% url 'cart:add_to_cart' product.pk %}" style="margin-top: 10px;">
+                {% csrf_token %}
+                <input type="hidden" name="quantity" value="1">
+                <button type="submit" class="btn btn-primary" style="width: 100%;">加入购物车</button>
+            </form>
+            {% endif %}
+        </div>
+    </div>
+    {% empty %}
+    <p>暂无商品</p>
+    {% endfor %}
+</div>
+{% endblock %}

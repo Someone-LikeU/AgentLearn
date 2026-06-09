@@ -1,0 +1,72 @@
+{% extends 'base.html' %}
+
+{% block title %}管理员后台 - 在线商城{% endblock %}
+
+{% block content %}
+<h2 style="margin-bottom: 20px;">管理员后台</h2>
+
+<div class="card" style="margin-bottom: 20px;">
+    <h3 style="margin-bottom: 15px;">商家列表</h3>
+    {% for seller in seller_data %}
+    <div style="margin-bottom: 20px; padding: 15px; border: 1px solid #eee; border-radius: 4px;">
+        <h4 style="margin-bottom: 10px;">商家：{{ seller.username }}</h4>
+        {% if seller.products %}
+        <table style="width: 100%; border-collapse: collapse;">
+            <thead>
+                <tr>
+                    <th style="padding: 8px; text-align: left; border-bottom: 1px solid #ddd;">商品名称</th>
+                    <th style="padding: 8px; text-align: right; border-bottom: 1px solid #ddd;">价格</th>
+                    <th style="padding: 8px; text-align: right; border-bottom: 1px solid #ddd;">销量</th>
+                    <th style="padding: 8px; text-align: right; border-bottom: 1px solid #ddd;">已收手续费</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for product in seller.products %}
+                <tr>
+                    <td style="padding: 8px; border-bottom: 1px solid #eee;">{{ product.name }}</td>
+                    <td style="padding: 8px; text-align: right; border-bottom: 1px solid #eee;">{{ product.price }} 软妹币</td>
+                    <td style="padding: 8px; text-align: right; border-bottom: 1px solid #eee;">{{ product.sold_quantity }}</td>
+                    <td style="padding: 8px; text-align: right; border-bottom: 1px solid #eee;">{{ product.fee }} 软妹币</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+            <tfoot>
+                <tr>
+                    <td colspan="3" style="padding: 8px; text-align: right; font-weight: bold;">合计手续费：</td>
+                    <td style="padding: 8px; text-align: right; font-weight: bold; color: #e74c3c;">{{ seller.total_fee }} 软妹币</td>
+                </tr>
+            </tfoot>
+        </table>
+        {% else %}
+        <p style="color: #999;">暂无商品</p>
+        {% endif %}
+    </div>
+    {% empty %}
+    <p style="color: #999;">暂无商家</p>
+    {% endfor %}
+</div>
+
+<div class="card">
+    <h3 style="margin-bottom: 15px;">客户列表</h3>
+    {% if customer_data %}
+    <table style="width: 100%; border-collapse: collapse;">
+        <thead>
+            <tr>
+                <th style="padding: 8px; text-align: left; border-bottom: 1px solid #ddd;">用户名</th>
+                <th style="padding: 8px; text-align: right; border-bottom: 1px solid #ddd;">余额</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for customer in customer_data %}
+            <tr>
+                <td style="padding: 8px; border-bottom: 1px solid #eee;">{{ customer.username }}</td>
+                <td style="padding: 8px; text-align: right; border-bottom: 1px solid #eee;">{{ customer.balance }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p style="color: #999;">暂无客户</p>
+    {% endif %}
+</div>
+{% endblock %}

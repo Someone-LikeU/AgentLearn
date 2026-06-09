@@ -1958,7 +1958,7 @@ class Agent:
                     self._append_task_completion_continue_prompt(task_goal)
                     continue
                 return message.content
-            print(f"[Iter {i}]: message is: {message}")
+            # print(f"[Iter {i}]: message is: {message}")
             stop_reason = self._handle_tool_calls(message.tool_calls, guard_state)
             if stop_reason:
                 return stop_reason

@@ -1,0 +1,25 @@
+{% extends 'base.html' %}
+
+{% block title %}用户注册 - 在线商城{% endblock %}
+
+{% block content %}
+<div class="card" style="max-width: 500px; margin: 0 auto;">
+    <h2 style="margin-bottom: 20px;">用户注册</h2>
+    <form method="post">
+        {% csrf_token %}
+        {% for field in form %}
+        <div class="form-group">
+            <label for="{{ field.id_for_label }}">{{ field.label }}</label>
+            {{ field }}
+            {% if field.errors %}
+            <small style="color: red;">{{ field.errors.0 }}</small>
+            {% endif %}
+        </div>
+        {% endfor %}
+        <button type="submit" class="btn btn-primary" style="width: 100%;">注册</button>
+    </form>
+    <p style="margin-top: 15px; text-align: center;">
+        已有账号？<a href="{% url 'accounts:login' %}">立即登录</a>
+    </p>
+</div>
+{% endblock %}
