@@ -1958,7 +1958,6 @@ class Agent:
                     self._append_task_completion_continue_prompt(task_goal)
                     continue
                 return message.content
-            # print(f"[Iter {i}]: message is: {message}")
             stop_reason = self._handle_tool_calls(message.tool_calls, guard_state)
             if stop_reason:
                 return stop_reason
@@ -2005,8 +2004,6 @@ class Agent:
             finally:
                 if spinner is not None:
                     spinner.stop()
-            # if task.function_name == ToolNameConstant.WEB_SEARCH:
-            #     self._print_network_search_results()
             return result
         except Exception as error:
             return self._format_tool_failure_response(
