@@ -11,7 +11,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
 	sys.path.insert(0, str(PROJECT_ROOT))
 
-from agent_Teams import Agent
+from agent_Teams import Agent, ToolFailureGuardState
+from tools.tool_scheduler import ToolCallTask
 
 
 class AgentStreamResponseTest(unittest.TestCase):
@@ -112,6 +113,78 @@ class AgentStreamResponseTest(unittest.TestCase):
 		self.assertEqual(continue_prompts, ["今天是星期几？"])
 		self.assertEqual(appended_messages, [tool_call_message, empty_message, final_message])
 
+	def test_repeated_success_tool_call_blocks_exact_next_call(self):
+		agent = self._agent()
+		appended_messages = []
+		agent._append_message = lambda message, **kwargs: appended_messages.append((message, kwargs)) or {}
+		guard_state = ToolFailureGuardState(active_tools=[], disabled_tools=set())
+		task_1 = ToolCallTask(
+			tool_call_id="call_1",
+			function_name="EXECUTE_BASH",
+			raw_arguments='{"command":"dir x"}',
+			function_args={"command": "dir x"},
+		)
+		task_2 = ToolCallTask(
+			tool_call_id="call_2",
+			function_name="EXECUTE_BASH",
+			raw_arguments='{"command":"dir x"}',
+			function_args={"command": "dir x"},
+		)
+
+		agent._append_tool_result_and_check_guard(task_1, "same result", guard_state)
+		agent._append_tool_result_and_check_guard(task_2, "same result", guard_state)
+
+		self.assertIn(agent._tool_call_repeat_key(task_2), guard_state.blocked_duplicate_call_keys)
+		self.assertEqual(guard_state.consecutive_success_duplicate_count, 2)
+		self.assertTrue(any(
+			kwargs.get("session_metadata", {}).get("tool_repeat_guard")
+			for _, kwargs in appended_messages
+		))
+
+		different_task = ToolCallTask(
+			tool_call_id="call_3",
+			function_name="EDIT",
+			raw_arguments='{"path":"a.txt"}',
+			function_args={"path": "a.txt"},
+		)
+		agent._append_tool_result_and_check_guard(different_task, "edited", guard_state)
+
+		self.assertEqual(guard_state.blocked_duplicate_call_keys, set())
+
+	def test_blocked_repeated_tool_call_is_not_executed(self):
+		agent = self._agent()
+		appended_messages = []
+		executed_calls = []
+		agent._append_message = lambda message, **kwargs: appended_messages.append((message, kwargs)) or {}
+		agent._available_functions = {
+			"EXECUTE_BASH": lambda **kwargs: executed_calls.append(kwargs) or "should not run"
+		}
+		agent._tool_manager = SimpleNamespace(
+			get_tool_runtime_profile=lambda _tool_name: {
+				"is_read_only": False,
+				"is_concurrency_safe": False,
+				"side_effect_scope": "system",
+			}
+		)
+		guard_state = ToolFailureGuardState(active_tools=[], disabled_tools=set())
+		task = ToolCallTask(
+			tool_call_id="call_1",
+			function_name="EXECUTE_BASH",
+			raw_arguments='{"command":"dir x"}',
+			function_args={"command": "dir x"},
+		)
+		guard_state.blocked_duplicate_call_keys.add(agent._tool_call_repeat_key(task))
+		tool_call = SimpleNamespace(
+			id="call_1",
+			function=SimpleNamespace(name="EXECUTE_BASH", arguments='{"command":"dir x"}'),
+		)
+
+		stop_reason = agent._handle_tool_calls([tool_call], guard_state)
+
+		self.assertEqual(executed_calls, [])
+		self.assertIn("重复请求", stop_reason)
+		self.assertIn("repeated_identical_call", appended_messages[-1][0]["content"])
+
 	def test_tool_call_chunks_are_merged_in_order(self):
 		agent = self._agent()
 		stream = [
@@ -121,7 +194,7 @@ class AgentStreamResponseTest(unittest.TestCase):
 
 		message = agent._deal_stream_response(stream)
 
-		self.assertIsNone(message.content)
+		self.assertEqual(message.content, "")
 		self.assertEqual(len(message.tool_calls), 1)
 		self.assertEqual(message.tool_calls[0].id, "call_1")
 		self.assertEqual(message.tool_calls[0].function.name, "WRITE_FILE")

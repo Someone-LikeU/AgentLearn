@@ -114,16 +114,122 @@
     "type": "function",
     "function": {
       "name": "EXECUTE_BASH",
-      "description": "Run shell command",
+      "description": "Run a shell command that is expected to finish. For long-running services such as Django runserver, use START_BACKGROUND_COMMAND instead.",
       "parameters": {
         "type": "object",
         "properties": {
           "command": {
             "type": "string"
+          },
+          "working_dir": {
+            "type": "string",
+            "description": "Working directory for this command. Defaults to ./runtime_output under the Agent project directory."
+          },
+          "cwd": {
+            "type": "string",
+            "description": "Alias of working_dir."
           }
         },
         "required": [
           "command"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "START_BACKGROUND_COMMAND",
+      "description": "Start a long-running shell command in the background and return a service_id for later checks, output reads, and stop.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "command": {
+            "type": "string"
+          },
+          "working_dir": {
+            "type": "string",
+            "description": "Working directory for this background command. Defaults to ./runtime_output under the Agent project directory."
+          },
+          "cwd": {
+            "type": "string",
+            "description": "Alias of working_dir."
+          },
+          "service_id": {
+            "type": "string",
+            "description": "Optional stable id. If omitted, the tool generates one."
+          },
+          "startup_wait_seconds": {
+            "type": "number",
+            "description": "Seconds to wait before returning initial status/output.",
+            "default": 2,
+            "minimum": 0,
+            "maximum": 10
+          }
+        },
+        "required": [
+          "command"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "CHECK_BACKGROUND_COMMAND",
+      "description": "Check whether a background command is still running and return its status.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "service_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "service_id"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "READ_BACKGROUND_COMMAND_OUTPUT",
+      "description": "Read recent output captured from a background command.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "service_id": {
+            "type": "string"
+          },
+          "tail_chars": {
+            "type": "integer",
+            "description": "Maximum number of trailing output characters to return.",
+            "default": 4000,
+            "minimum": 1,
+            "maximum": 20000
+          }
+        },
+        "required": [
+          "service_id"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "STOP_BACKGROUND_COMMAND",
+      "description": "Stop a background command by service_id and return final status/output.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "service_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "service_id"
         ]
       }
     }

@@ -1,5 +1,19 @@
-from agent_Teams import Agent
 import os
+import sys
+
+
+def configure_stdio_encoding():
+	# 统一当前进程和子 Python 进程的文本编码，避免 UTF-8 中文被 Windows 代码页误解码。
+	os.environ.setdefault("PYTHONUTF8", "1")
+	os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+	for stream in (sys.stdin, sys.stdout, sys.stderr):
+		if hasattr(stream, "reconfigure"):
+			stream.reconfigure(encoding="utf-8", errors="replace")
+
+
+configure_stdio_encoding()
+
+from agent_Teams import Agent
 
 from mcp_client import create_tcp_mcp_client
 

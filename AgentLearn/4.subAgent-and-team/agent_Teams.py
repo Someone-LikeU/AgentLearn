@@ -1,5 +1,6 @@
 # encoding : utf-8
 import atexit
+import hashlib
 import httpx
 import json
 import os
@@ -37,6 +38,9 @@ class ToolFailureGuardState:
     tools_without_make_plan: list[dict[str, Any]] | None = None
     last_failure_key: tuple[str, str] | None = None
     consecutive_failure_count: int = 0
+    last_success_result_key: tuple[str, str, str] | None = None
+    consecutive_success_duplicate_count: int = 0
+    blocked_duplicate_call_keys: set[tuple[str, str]] = field(default_factory=set)
     executed_tool_count: int = 0
     completion_continue_count: int = 0
 
@@ -118,8 +122,17 @@ class Agent:
     _MIDDLE_COMPACT_RATIO = 0.3
     _KEEP_RECENT = 10
     _MAX_CONSECUTIVE_TOOL_FAILURES = 2
+    _MAX_CONSECUTIVE_IDENTICAL_TOOL_RESULTS = 2
     _MAX_TASK_COMPLETION_CONTINUES = 2
     _MEMORY_WAIT_POLL_SECONDS = 5
+    _TOOLS_WITH_OWN_PROGRESS_OUTPUT = {
+        ToolNameConstant.WEB_SEARCH,
+        ToolNameConstant.EXECUTE_BASH,
+        ToolNameConstant.START_BACKGROUND_COMMAND,
+        ToolNameConstant.CHECK_BACKGROUND_COMMAND,
+        ToolNameConstant.READ_BACKGROUND_COMMAND_OUTPUT,
+        ToolNameConstant.STOP_BACKGROUND_COMMAND,
+    }
 
     def __init__(self, model="qwen3.5:9b",
                  temperature: float = 0.1,
@@ -1413,6 +1426,19 @@ class Agent:
             normalized_args = task.raw_arguments
         return task.function_name, normalized_args
 
+    def _tool_call_repeat_key(self, task: ToolCallTask) -> tuple[str, str]:
+        """生成工具调用去重 key，用于识别相同工具和相同参数。"""
+        return self._tool_call_failure_key(task)
+
+    def _tool_result_fingerprint(self, function_response) -> str:
+        """生成工具结果指纹，用于识别成功但没有新信息的重复调用。"""
+        try:
+            result_text = json.dumps(function_response, ensure_ascii=False, sort_keys=True, default=str)
+        except TypeError:
+            result_text = str(function_response)
+        normalized_text = " ".join(str(result_text or "").split())
+        return hashlib.sha256(normalized_text.encode("utf-8", errors="replace")).hexdigest()
+
     def _is_tool_call_failure(self, function_response) -> bool:
         """判断工具结果是否表示失败。"""
         if isinstance(function_response, dict):
@@ -1553,6 +1579,46 @@ class Agent:
             }
         )
 
+    def _check_repeated_success_tool_call(
+            self,
+            task: ToolCallTask,
+            function_response,
+            guard_state: ToolFailureGuardState,
+    ):
+        call_key = self._tool_call_repeat_key(task)
+        result_key = (*call_key, self._tool_result_fingerprint(function_response))
+        if result_key == guard_state.last_success_result_key:
+            guard_state.consecutive_success_duplicate_count += 1
+        else:
+            previous_call_key = guard_state.last_success_result_key[:2] if guard_state.last_success_result_key else None
+            if previous_call_key is not None and call_key != previous_call_key:
+                # 模型已经尝试了不同动作，允许后续重新验证之前被拦截的精确调用。
+                guard_state.blocked_duplicate_call_keys.clear()
+            guard_state.last_success_result_key = result_key
+            guard_state.consecutive_success_duplicate_count = 1
+
+        if guard_state.consecutive_success_duplicate_count < self._MAX_CONSECUTIVE_IDENTICAL_TOOL_RESULTS:
+            return None
+
+        guard_state.blocked_duplicate_call_keys.add(call_key)
+        self._append_message(
+            {
+                "role": "user",
+                "content": (
+                    f"Tool {task.function_name} returned the same result for the same arguments "
+                    f"{guard_state.consecutive_success_duplicate_count} consecutive times. "
+                    "Do not repeat this exact tool call. Use the existing result to continue, "
+                    "try a meaningfully different action, or explain why no further progress is possible."
+                ),
+            },
+            session_metadata={"is_task_entry": False, "tool_repeat_guard": True},
+        )
+        return None
+
+    def _reset_success_repeat_guard(self, guard_state: ToolFailureGuardState) -> None:
+        guard_state.last_success_result_key = None
+        guard_state.consecutive_success_duplicate_count = 0
+
     def _append_tool_result_and_check_guard(
             self,
             task: ToolCallTask,
@@ -1564,8 +1630,9 @@ class Agent:
         if not self._is_tool_call_failure(function_response):
             guard_state.last_failure_key = None
             guard_state.consecutive_failure_count = 0
-            return None
+            return self._check_repeated_success_tool_call(task, function_response, guard_state)
 
+        self._reset_success_repeat_guard(guard_state)
         failure_key = self._tool_call_failure_key(task)
         if failure_key == guard_state.last_failure_key:
             guard_state.consecutive_failure_count += 1
@@ -1626,6 +1693,19 @@ class Agent:
         )
         self._append_tool_result(task, function_response)
         return f"工具 {task.function_name} 已因连续失败被禁用，但模型再次请求该工具，已结束当前任务。"
+
+    def _append_repeated_tool_call_response(self, task: ToolCallTask):
+        function_response = self._format_tool_failure_response(
+            task,
+            "repeated_identical_call",
+            (
+                f"Tool {task.function_name} already returned the same result for the same arguments. "
+                "This exact repeated call was blocked to prevent a tool loop."
+            ),
+            retryable=False,
+        )
+        self._append_tool_result(task, function_response)
+        return f"工具 {task.function_name} 使用相同参数连续返回相同结果，模型仍重复请求，已结束当前任务。"
 
     def _execute_pending_tool_tasks(
             self,
@@ -1697,6 +1777,9 @@ class Agent:
 
             if current_task.function_name in guard_state.disabled_tools:
                 return self._append_disabled_tool_call_response(current_task)
+
+            if self._tool_call_repeat_key(current_task) in guard_state.blocked_duplicate_call_keys:
+                return self._append_repeated_tool_call_response(current_task)
 
             if current_task.function_name == ToolNameConstant.MAKE_PLAN:
                 stop_reason = self._execute_pending_tool_tasks(scheduler, pending_tasks, guard_state)
@@ -1885,6 +1968,10 @@ class Agent:
         # 并发工具在工作线程中执行，避免多个 Live 动画同时刷新控制台。
         return current_thread().name == "MainThread"
 
+    def _should_wrap_tool_with_spinner(self, tool_name: str) -> bool:
+        # 有些工具内部会分阶段显示进度或实时打印输出，外层不再叠加 Rich Live 动画。
+        return self._should_show_tool_spinner() and tool_name not in self._TOOLS_WITH_OWN_PROGRESS_OUTPUT
+
     def _print_network_search_results(self):
         search_results = getattr(self._tool_manager, "last_web_search_results", None)
         if not search_results:
@@ -1912,7 +1999,7 @@ class Agent:
         try:
             print(f"[Tool call] tool name: {task.function_name}, tool arguments: {task.raw_arguments}")
             spinner = self._start_spinner(preset=Spinner.TOOL, tool_name=task.function_name) \
-                if self._should_show_tool_spinner() and task.function_name != ToolNameConstant.WEB_SEARCH else None
+                if self._should_wrap_tool_with_spinner(task.function_name) else None
             try:
                 result = function_impl(**task.function_args)
             finally:

@@ -107,6 +107,70 @@ class ToolManagerLocalToolsTest(unittest.TestCase):
         out = self.tm.execute_bash("echo hello")
         self.assertIn("hello", out)
 
+    def test_execute_bash_default_working_dir_is_runtime_output(self):
+        command = f'"{sys.executable}" -c "import os; print(os.getcwd())"'
+        out = self.tm.execute_bash(command)
+        expected = str(self.project_root / "runtime_output")
+        self.assertIn(expected, out.strip())
+
+    def test_execute_bash_uses_explicit_working_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            command = f'"{sys.executable}" -c "import os; print(os.getcwd())"'
+            out = self.tm.execute_bash(command, working_dir=tmp)
+        self.assertIn(str(Path(tmp).resolve()), out.strip())
+
+    def test_execute_bash_timeout(self):
+        self.tm._BASH_TIMEOUT_SECONDS = 1
+        command = (
+            f'"{sys.executable}" -c '
+            '"import time; print(\'start\', flush=True); time.sleep(10); print(\'end\')"'
+        )
+        start = time.perf_counter()
+        out = self.tm.execute_bash(command)
+
+        # 超时命令必须快速回到模型，不能继续等待常驻或长耗时进程结束。
+        self.assertLess(time.perf_counter() - start, 7)
+        self.assertIn("start", out)
+        self.assertIn("timed out after 1 seconds", out)
+        self.assertNotIn("end", out)
+
+    def test_execute_bash_decodes_gbk_output(self):
+        command = (
+            f'"{sys.executable}" -c '
+            '"import sys; sys.stdout.buffer.write(\'中文输出\'.encode(\'gbk\'))"'
+        )
+        out = self.tm.execute_bash(command)
+        self.assertIn("中文输出", out)
+
+    def test_background_command_lifecycle(self):
+        command = (
+            f'"{sys.executable}" -c '
+            '"import time; print(\'服务启动\', flush=True); time.sleep(10)"'
+        )
+        started = json.loads(
+            self.tm.start_background_command(
+                command,
+                service_id="unit_test_service",
+                startup_wait_seconds=0.5,
+            )
+        )
+        self.assertTrue(started["ok"])
+        self.assertEqual(started["service_id"], "unit_test_service")
+        self.assertEqual(started["status"], "running")
+        self.assertEqual(started["working_dir"], str(self.project_root / "runtime_output"))
+        self.assertIn("服务启动", started["output_tail"])
+
+        checked = json.loads(self.tm.check_background_command("unit_test_service"))
+        self.assertTrue(checked["ok"])
+        self.assertEqual(checked["status"], "running")
+
+        output = json.loads(self.tm.read_background_command_output("unit_test_service"))
+        self.assertIn("服务启动", output["output_tail"])
+
+        stopped = json.loads(self.tm.stop_background_command("unit_test_service"))
+        self.assertTrue(stopped["ok"])
+        self.assertEqual(stopped["status"], "exited")
+
     def test_execute_bash_dangerous(self):
         out = self.tm.execute_bash("rm -rf /")
         self.assertIn("dangerous", out)

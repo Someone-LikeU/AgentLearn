@@ -475,7 +475,7 @@ class SessionManagerTest(unittest.TestCase):
             self.assertTrue(non_empty_sessions[0]["has_user_task"])
 
     def test_agent_session_management_commands_step_by_step(self):
-        target_session_file = "sessions/2026/06/01/session_20260601_150405_7cd055.jsonl"
+        target_session_file = "sessions/2026/06/08/session_20260608_224848_23587a.jsonl"
         target_session_path = Path(target_session_file)
         if not target_session_path.is_absolute():
             target_session_path = PROJECT_ROOT / target_session_path
@@ -535,7 +535,7 @@ class SessionManagerTest(unittest.TestCase):
         self.assertTrue(output_path.exists())
 
     def test_rebuild_messages_from_session_copy(self):
-        target_session_file = "sessions/2026/05/26/session_20260526_104514_c21d0a.jsonl"
+        target_session_file = "sessions/2026/06/08/session_20260608_224848_23587a.jsonl"
         target_session_path = Path(target_session_file)
         if not target_session_path.is_absolute():
             target_session_path = PROJECT_ROOT / target_session_path

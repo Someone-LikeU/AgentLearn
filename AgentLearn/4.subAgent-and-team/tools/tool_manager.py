@@ -1,14 +1,18 @@
+import atexit
 import glob as glob_module
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import threading
+import time
+import uuid
 from pathlib import Path
 from subprocess import CompletedProcess
 from typing import Any, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -52,6 +56,17 @@ class AgentToolHandlers:
     sub_agent_handler: Callable[..., Any] | None = None
 
 
+@dataclass
+class BackgroundCommandInfo:
+    service_id: str
+    command: str
+    working_dir: Path
+    process: subprocess.Popen
+    started_at: float
+    output_chunks: list[str] = field(default_factory=list)
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+
 class ToolManager:
     """统一管理本地工具、MCP工具以及工具调用分发。"""
 
@@ -81,6 +96,12 @@ class ToolManager:
     _BASH_AUTO_APPROVE = True
     # 目前默认不启用输出截断，保留给后续控制超长输出时使用。
     _BASH_MAX_OUTPUT_LENGTH = 5000
+    # Bash 命令可能启动常驻服务，超过该时间就终止并把已收集输出返回给模型。
+    _BASH_TIMEOUT_SECONDS = 60
+    # 终止后只短暂等待读流线程收尾，避免工具再次卡在清理阶段。
+    _BASH_TERMINATE_GRACE_SECONDS = 5
+    # 后台服务输出只保留尾部，避免常驻服务长时间运行撑爆内存。
+    _BACKGROUND_MAX_OUTPUT_LENGTH = 20000
     # 并发安全工具集合：允许并发执行，且不会产生状态冲突。
     _CONCURRENCY_SAFE_TOOLS = {
         ToolNameConstant.GET_TIME,
@@ -89,6 +110,8 @@ class ToolManager:
         ToolNameConstant.GREP,
         ToolNameConstant.READ_FILE,
         ToolNameConstant.LIST_DIR,
+        ToolNameConstant.CHECK_BACKGROUND_COMMAND,
+        ToolNameConstant.READ_BACKGROUND_COMMAND_OUTPUT,
     }
     # 只读工具集合：不修改外部状态，可用于批处理并发判定。
     _READ_ONLY_TOOLS = {
@@ -100,12 +123,16 @@ class ToolManager:
         ToolNameConstant.LIST_DIR,
         ToolNameConstant.LOAD_SKILL_DETAIL_BY_NAME,
         ToolNameConstant.LOAD_FULL_MEMORY_CONTEXT,
+        ToolNameConstant.CHECK_BACKGROUND_COMMAND,
+        ToolNameConstant.READ_BACKGROUND_COMMAND_OUTPUT,
     }
     # 破坏性工具集合：存在写入、覆盖、执行高风险命令等副作用。
     _DESTRUCTIVE_TOOLS = {
         ToolNameConstant.WRITE_FILE,
         ToolNameConstant.EDIT,
         ToolNameConstant.EXECUTE_BASH,
+        ToolNameConstant.START_BACKGROUND_COMMAND,
+        ToolNameConstant.STOP_BACKGROUND_COMMAND,
     }
     # 工具副作用作用域：V2 调度按作用域做批次隔离。
     _TOOL_SIDE_EFFECT_SCOPE = {
@@ -118,6 +145,10 @@ class ToolManager:
         ToolNameConstant.WEB_SEARCH: "network",
         ToolNameConstant.GET_TIME: "runtime",
         ToolNameConstant.EXECUTE_BASH: "system",
+        ToolNameConstant.START_BACKGROUND_COMMAND: "system",
+        ToolNameConstant.CHECK_BACKGROUND_COMMAND: "system",
+        ToolNameConstant.READ_BACKGROUND_COMMAND_OUTPUT: "system",
+        ToolNameConstant.STOP_BACKGROUND_COMMAND: "system",
         ToolNameConstant.LOAD_SKILL_DETAIL_BY_NAME: "memory",
         ToolNameConstant.LOAD_FULL_MEMORY_CONTEXT: "memory",
         ToolNameConstant.MAKE_PLAN: "runtime",
@@ -173,11 +204,18 @@ class ToolManager:
         self.available_functions = self._build_available_functions()
         self.all_tools = self.local_tools + self.mcp_tools
         self.last_web_search_results: dict[str, Any] | None = None
+        self._background_commands: dict[str, BackgroundCommandInfo] = {}
+        self._background_lock = threading.RLock()
+        atexit.register(self.stop_all_background_commands)
 
     def _build_local_functions(self) -> None:
         # 本地基础工具：文件、bash、检索、时间、联网搜索。
         functions = {
             ToolNameConstant.EXECUTE_BASH: self.execute_bash,
+            ToolNameConstant.START_BACKGROUND_COMMAND: self.start_background_command,
+            ToolNameConstant.CHECK_BACKGROUND_COMMAND: self.check_background_command,
+            ToolNameConstant.READ_BACKGROUND_COMMAND_OUTPUT: self.read_background_command_output,
+            ToolNameConstant.STOP_BACKGROUND_COMMAND: self.stop_background_command,
             ToolNameConstant.READ_FILE: self.read_file,
             ToolNameConstant.WRITE_FILE: self.write_file,
             ToolNameConstant.EDIT: self.edit,
@@ -322,9 +360,130 @@ class ToolManager:
 
         return _executor
 
-    def execute_bash(self, command):
+    def execute_bash(self, command, working_dir=None, cwd=None):
         # 对外入口保持简单，安全检查和日志由 hook 管道负责。
-        return self._execute_bash_with_hooks(command)
+        return self._execute_bash_with_hooks(command, working_dir=working_dir, cwd=cwd)
+
+    def start_background_command(self, command, service_id=None, startup_wait_seconds=2, working_dir=None, cwd=None):
+        blocked = self._run_background_before_hooks(
+            command,
+            ToolNameConstant.START_BACKGROUND_COMMAND,
+        )
+        if blocked:
+            return blocked
+        try:
+            resolved_working_dir = self._resolve_working_dir(working_dir=working_dir, cwd=cwd)
+        except ValueError as error:
+            return self._json_tool_result(
+                {
+                    "ok": False,
+                    "status": "invalid_working_dir",
+                    "error": str(error),
+                }
+            )
+        normalized_service_id = self._normalize_background_service_id(service_id)
+        with self._background_lock:
+            existing = self._background_commands.get(normalized_service_id)
+            if existing and self._background_status(existing) == "running":
+                return self._json_tool_result(
+                    {
+                        "ok": False,
+                        "service_id": normalized_service_id,
+                        "status": "running",
+                        "error": "service_id_already_running",
+                    }
+                )
+        try:
+            process = self._open_shell_process(command, working_dir=resolved_working_dir)
+        except Exception as error:
+            return self._json_tool_result(
+                {
+                    "ok": False,
+                    "service_id": normalized_service_id,
+                    "status": "failed_to_start",
+                    "error_type": type(error).__name__,
+                    "error": str(error),
+                }
+            )
+        info = BackgroundCommandInfo(
+            service_id=normalized_service_id,
+            command=command,
+            working_dir=resolved_working_dir,
+            process=process,
+            started_at=time.time(),
+        )
+        with self._background_lock:
+            self._background_commands[normalized_service_id] = info
+        self._start_background_output_readers(info)
+        wait_seconds = self._clamp_float(startup_wait_seconds, 0, 10, default=2)
+        if wait_seconds:
+            time.sleep(wait_seconds)
+        snapshot = self._background_snapshot(info, tail_chars=4000)
+        snapshot["ok"] = True
+        print(f"[Tool after] {ToolNameConstant.START_BACKGROUND_COMMAND}: {normalized_service_id} {snapshot['status']}")
+        return self._json_tool_result(snapshot)
+
+    def check_background_command(self, service_id):
+        info = self._get_background_command(service_id)
+        if info is None:
+            return self._json_tool_result(
+                {
+                    "ok": False,
+                    "service_id": service_id,
+                    "status": "not_found",
+                    "error": "Background command not found.",
+                }
+            )
+        snapshot = self._background_snapshot(info, tail_chars=1000)
+        snapshot["ok"] = True
+        return self._json_tool_result(snapshot)
+
+    def read_background_command_output(self, service_id, tail_chars=4000):
+        info = self._get_background_command(service_id)
+        if info is None:
+            return self._json_tool_result(
+                {
+                    "ok": False,
+                    "service_id": service_id,
+                    "status": "not_found",
+                    "error": "Background command not found.",
+                }
+            )
+        snapshot = self._background_snapshot(
+            info,
+            tail_chars=self._clamp_int(tail_chars, 1, self._BACKGROUND_MAX_OUTPUT_LENGTH, default=4000),
+        )
+        snapshot["ok"] = True
+        return self._json_tool_result(snapshot)
+
+    def stop_background_command(self, service_id):
+        info = self._get_background_command(service_id)
+        if info is None:
+            return self._json_tool_result(
+                {
+                    "ok": False,
+                    "service_id": service_id,
+                    "status": "not_found",
+                    "error": "Background command not found.",
+                }
+            )
+        if self._background_status(info) == "running":
+            self._terminate_bash_process_tree(info.process)
+            self._close_bash_streams(info.process)
+            time.sleep(0.1)
+        snapshot = self._background_snapshot(info, tail_chars=4000)
+        snapshot["ok"] = True
+        print(f"[Tool after] {ToolNameConstant.STOP_BACKGROUND_COMMAND}: {info.service_id} {snapshot['status']}")
+        return self._json_tool_result(snapshot)
+
+    def stop_all_background_commands(self) -> None:
+        with self._background_lock:
+            infos = list(self._background_commands.values())
+        for info in infos:
+            if self._background_status(info) != "running":
+                continue
+            self._terminate_bash_process_tree(info.process)
+            self._close_bash_streams(info.process)
 
     def set_bash_auto_approve(self, enabled: bool) -> None:
         """
@@ -344,19 +503,132 @@ class ToolManager:
             return "自动确认（无需手动确认）"
         return "手动确认（每次需确认）"
 
-    def _run_bash_command(self, command):
+    def _resolve_working_dir(self, working_dir: Any = None, cwd: Any = None) -> Path:
+        raw_dir = working_dir if working_dir not in (None, "") else cwd
+        if raw_dir in (None, ""):
+            default_dir = Path(self.project_root) / "runtime_output"
+            default_dir.mkdir(parents=True, exist_ok=True)
+            return default_dir
+        path = Path(str(raw_dir)).expanduser()
+        if not path.is_absolute():
+            path = Path(self.project_root) / path
+        path = path.resolve()
+        if not path.exists():
+            raise ValueError(f"Working directory does not exist: {path}")
+        if not path.is_dir():
+            raise ValueError(f"Working directory is not a directory: {path}")
+        return path
+
+    def _open_shell_process(self, command: str, working_dir: Path | None = None) -> subprocess.Popen:
+        env = os.environ.copy()
+        env.setdefault("PYTHONUTF8", "1")
+        env.setdefault("PYTHONIOENCODING", "utf-8")
+        resolved_working_dir = working_dir or self._resolve_working_dir()
+        popen_kwargs = {
+            "shell": True,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "bufsize": 0,
+            "start_new_session": os.name != "nt",
+            "env": env,
+            "cwd": str(resolved_working_dir),
+        }
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        return subprocess.Popen(command, **popen_kwargs)
+
+    def _decode_output_bytes(self, data: bytes) -> str:
+        # Windows shell 输出可能是 GBK/GB18030，Python 子进程和现代工具多为 UTF-8。
+        for enc in ("utf-8", "gb18030", "gbk"):
+            try:
+                return data.decode(enc)
+            except UnicodeDecodeError:
+                continue
+        return data.decode("utf-8", errors="replace")
+
+    def _run_background_before_hooks(self, command: str, tool_name: str) -> str | None:
+        args = {"command": command}
+        for hook in (self._bash_check_dangerous_command, self._bash_ask_user_confirmation):
+            blocked, message = hook(args)
+            if blocked:
+                return message or "Background command was blocked."
+        print(f"[Tool before] {tool_name}: {command}")
+        return None
+
+    def _normalize_background_service_id(self, service_id: Any = None) -> str:
+        raw = str(service_id or "").strip()
+        if not raw:
+            raw = f"svc_{uuid.uuid4().hex[:8]}"
+        normalized = re.sub(r"[^a-zA-Z0-9_.-]+", "_", raw).strip("._-")
+        return normalized or f"svc_{uuid.uuid4().hex[:8]}"
+
+    def _get_background_command(self, service_id: Any) -> BackgroundCommandInfo | None:
+        normalized_service_id = self._normalize_background_service_id(service_id)
+        with self._background_lock:
+            return self._background_commands.get(normalized_service_id)
+
+    def _start_background_output_readers(self, info: BackgroundCommandInfo) -> None:
+        def _consume_stream(stream):
+            if stream is None:
+                return
+            try:
+                for raw_line in iter(stream.readline, b""):
+                    self._append_background_output(info, self._decode_output_bytes(raw_line))
+            except (OSError, ValueError):
+                pass
+            finally:
+                stream.close()
+
+        threading.Thread(target=_consume_stream, args=(info.process.stdout,), daemon=True).start()
+        threading.Thread(target=_consume_stream, args=(info.process.stderr,), daemon=True).start()
+
+    def _append_background_output(self, info: BackgroundCommandInfo, text: str) -> None:
+        with info.lock:
+            info.output_chunks.append(text)
+            joined = "".join(info.output_chunks)
+            if len(joined) > self._BACKGROUND_MAX_OUTPUT_LENGTH:
+                info.output_chunks = [joined[-self._BACKGROUND_MAX_OUTPUT_LENGTH:]]
+
+    def _background_status(self, info: BackgroundCommandInfo) -> str:
+        return "running" if info.process.poll() is None else "exited"
+
+    def _background_snapshot(self, info: BackgroundCommandInfo, tail_chars: int = 4000) -> dict[str, Any]:
+        with info.lock:
+            output = "".join(info.output_chunks)
+        tail = output[-tail_chars:] if tail_chars else ""
+        status = self._background_status(info)
+        return {
+            "service_id": info.service_id,
+            "command": info.command,
+            "working_dir": str(info.working_dir),
+            "pid": info.process.pid,
+            "status": status,
+            "returncode": info.process.poll(),
+            "elapsed_seconds": round(time.time() - info.started_at, 3),
+            "output_tail": tail,
+        }
+
+    def _clamp_float(self, value: Any, minimum: float, maximum: float, default: float) -> float:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            number = default
+        return max(minimum, min(maximum, number))
+
+    def _clamp_int(self, value: Any, minimum: int, maximum: int, default: int) -> int:
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            number = default
+        return max(minimum, min(maximum, number))
+
+    def _json_tool_result(self, payload: dict[str, Any]) -> str:
+        return json.dumps(payload, ensure_ascii=False, default=str)
+
+    def _run_bash_command(self, command, working_dir: Path):
         # 只负责执行与解码；是否可执行由 before hook 决定。
         # 这里改为流式读取子进程输出，避免长命令执行期间控制台长时间无反馈。
-        process = subprocess.Popen(
-            command,
-            shell=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-        )
+        process = self._open_shell_process(command, working_dir=working_dir)
         output_chunks: list[str] = []
         stream_lock = threading.Lock()
 
@@ -364,33 +636,101 @@ class ToolManager:
             # 按行读取子进程输出并实时打印，同时把内容收集到结果中返回给模型。
             if stream is None:
                 return
-            for line in iter(stream.readline, ""):
-                with stream_lock:
-                    if is_error:
-                        print(line, end="", file=sys.stderr, flush=True)
-                    else:
-                        print(line, end="", flush=True)
-                    output_chunks.append(line)
-            stream.close()
+            try:
+                for raw_line in iter(stream.readline, b""):
+                    line = self._decode_output_bytes(raw_line)
+                    with stream_lock:
+                        if is_error:
+                            print(line, end="", file=sys.stderr, flush=True)
+                        else:
+                            print(line, end="", flush=True)
+                        output_chunks.append(line)
+            except (OSError, ValueError):
+                # 主线程超时终止后会关闭管道，读流线程遇到关闭就直接退出。
+                pass
+            finally:
+                stream.close()
 
         # stdout/stderr 并发消费，避免其中一侧缓冲区写满导致命令阻塞。
         stdout_thread = threading.Thread(target=_consume_stream, args=(process.stdout, False), daemon=True)
         stderr_thread = threading.Thread(target=_consume_stream, args=(process.stderr, True), daemon=True)
         stdout_thread.start()
         stderr_thread.start()
-        stdout_thread.join()
-        stderr_thread.join()
-        process.wait()
+        timed_out = False
+        try:
+            process.wait(timeout=self._BASH_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            self._terminate_bash_process_tree(process)
+            self._close_bash_streams(process)
+
+        stdout_thread.join(timeout=self._BASH_TERMINATE_GRACE_SECONDS)
+        stderr_thread.join(timeout=self._BASH_TERMINATE_GRACE_SECONDS)
+        if timed_out:
+            timeout_message = (
+                f"\n[Tool timeout] {ToolNameConstant.EXECUTE_BASH} timed out after "
+                f"{self._BASH_TIMEOUT_SECONDS} seconds and was terminated. "
+            )
+            with stream_lock:
+                print(timeout_message, end="", flush=True)
+                output_chunks.append(timeout_message)
         return "".join(output_chunks)
 
-    def _execute_bash_with_hooks(self, command):
+    def _close_bash_streams(self, process: subprocess.Popen) -> None:
+        # 超时终止后关闭管道，确保 readline 不会继续阻塞。
+        for stream in (process.stdout, process.stderr):
+            if stream is None:
+                continue
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+    def _terminate_bash_process_tree(self, process: subprocess.Popen) -> None:
+        # 常驻服务通常由 shell 再启动子进程，必须终止整个进程树。
+        if process.poll() is not None:
+            return
+        if os.name == "nt":
+            ctrl_break = getattr(signal, "CTRL_BREAK_EVENT", None)
+            if ctrl_break is not None:
+                try:
+                    process.send_signal(ctrl_break)
+                    process.wait(timeout=self._BASH_TERMINATE_GRACE_SECONDS)
+                    return
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+            try:
+                process.kill()
+                process.wait(timeout=1)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+            return
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        except Exception:
+            process.terminate()
+        try:
+            process.wait(timeout=self._BASH_TERMINATE_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except Exception:
+                process.kill()
+
+    def _execute_bash_with_hooks(self, command, working_dir=None, cwd=None):
         args = {"command": command}
         # 任意 before hook 都可以拦截命令，避免危险命令进入 subprocess。
         for hook in self._bash_before_hooks:
             blocked, message = hook(args)
             if blocked:
                 return message or "Bash command was blocked."
-        result = self._run_bash_command(command)
+        try:
+            resolved_working_dir = self._resolve_working_dir(working_dir=working_dir, cwd=cwd)
+        except ValueError as error:
+            return str(error)
+        result = self._run_bash_command(command, resolved_working_dir)
         # after hook 用于日志、输出裁剪等后处理。
         for hook in self._bash_after_hooks:
             result = hook(result)
@@ -449,12 +789,7 @@ class ToolManager:
             stderr = b"" if result.stderr is None else result.stderr
         if isinstance(stdout, str) and isinstance(stderr, str):
             return stdout, stderr
-        for enc in ("utf-8", "gbk", "gb18030"):
-            try:
-                return stdout.decode(enc), stderr.decode(enc)
-            except UnicodeDecodeError:
-                continue
-        return stdout.decode("utf-8", errors="replace"), stderr.decode("utf-8", errors="replace")
+        return self._decode_output_bytes(stdout), self._decode_output_bytes(stderr)
 
     def read_file(self, path, offset=None, limit=None):
         # 返回带行号的片段，方便模型基于行定位修改内容。

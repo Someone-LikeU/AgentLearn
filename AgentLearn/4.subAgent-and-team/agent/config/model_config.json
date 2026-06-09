@@ -35,6 +35,12 @@
       "base_url_env": "LONGCAT_2_0_PREVIEW_BASE_URL",
       "api_key_env": "LONGCAT_2_0_PREVIEW_API_KEY",
       "max_model_context_token": 1000000
+    },
+    {
+      "name": "glm-4.7",
+      "base_url_env": "GLM_4_7_BASE_URL",
+      "api_key_env": "GLM_4_7_API_KEY",
+      "max_model_context_token": 200000
     }
   ]
 }
