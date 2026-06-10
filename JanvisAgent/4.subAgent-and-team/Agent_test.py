@@ -41,15 +41,6 @@ if __name__ == '__main__':
 			api_key=API_KEY,
 			mcp_client=mcp_client,
 		)
-		# use_plan = "--plan" in sys.argv
-		# if len(sys.argv) < 2:
-		# 	print("Usage: python agent_memory.py [--plan] 'your task here'")
-		# 	print("  --plan: Enable task planning and decomposition")
-		# 	sys.exit(1)
-		# task = " ".join(sys.argv[1:])
-		# task = "找到当前目录的上一级目录下的所有子目录的python文件中的TODO项并整理到上一级目录的'开发过程所有todo.md'文件中，要包含TODO所在代码文件的位置、TODO内容，并给每个TODO项预留一行由我来记录该TODO的结果，如果该文件已存在，就先删除它"
-		# task = "今天是周几？"
-		# myAgent.chat(task)
 		myAgent.run()
 	finally:
 		if mcp_client:
