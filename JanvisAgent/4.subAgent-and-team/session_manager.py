@@ -839,19 +839,65 @@ class SessionManager:
                 if path.exists():
                     return path
         # 索引不完整时最后再扫描目录。
-        for path in self.sessions_dir.rglob(f"{session_id}.jsonl"):
-            return path
-        return None
+        return self._find_session_file_by_id(session_id)
 
     def _session_record_file_exists(self, record: dict[str, Any]) -> bool:
         path_value = record.get("path")
         if path_value:
-            return Path(path_value).exists()
+            path = Path(path_value)
+            if path.exists():
+                return True
+            session_id = record.get("session_id")
+            repaired_path = self._find_session_file_by_id(session_id)
+            if repaired_path is None:
+                return False
+            record["path"] = str(repaired_path)
+            self._record_session_path_repair(session_id, repaired_path)
+            return True
         session_id = record.get("session_id")
         if not session_id:
             return False
         # 兼容极早期没有 path 字段的索引记录，必要时按 session_id 回退扫描。
-        return any(self.sessions_dir.rglob(f"{session_id}.jsonl"))
+        repaired_path = self._find_session_file_by_id(session_id)
+        if repaired_path is None:
+            return False
+        record["path"] = str(repaired_path)
+        self._record_session_path_repair(session_id, repaired_path)
+        return True
+
+    def _find_session_file_by_id(self, session_id: str | None) -> Path | None:
+        """
+        按 session_id 在当前 sessions 目录下查找会话文件。
+        :param session_id: 会话 id
+        :return: 找到的会话文件路径
+        """
+        if not session_id:
+            return None
+        for path in self.sessions_dir.rglob(f"{session_id}.jsonl"):
+            if path.name == self.index_file.name:
+                continue
+            return path
+        return None
+
+    def _record_session_path_repair(self, session_id: str | None, path: Path) -> None:
+        """
+        追加索引路径修复事件，不改变会话 updated_at 排序字段。
+        :param session_id: 会话 id
+        :param path: 当前可用的会话文件路径
+        :return:
+        """
+        if not session_id:
+            return
+        self._append_jsonl(
+            self.index_file,
+            {
+                "event": "session_index_update",
+                "session_id": session_id,
+                "path": str(path),
+                "path_repaired_at": self._now(),
+                "reason": "repair_missing_index_path",
+            },
+        )
 
     def _scan_session_files(self) -> list[dict[str, Any]]:
         records = []

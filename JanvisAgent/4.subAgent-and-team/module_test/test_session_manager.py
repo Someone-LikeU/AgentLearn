@@ -1,5 +1,6 @@
 # encoding: utf-8
 import json
+import shutil
 import sys
 import tempfile
 import unittest
@@ -332,6 +333,66 @@ class SessionManagerTest(unittest.TestCase):
 
             self.assertIn(kept_session_id, session_ids)
             self.assertNotIn(deleted_session_id, session_ids)
+
+    def test_list_sessions_repairs_stale_absolute_index_paths_after_project_move(self):
+        fixture_dir = PROJECT_ROOT / "module_test" / "session_path_repair"
+        fixture_paths = sorted(fixture_dir.glob("session_*.jsonl"))
+        self.assertGreaterEqual(len(fixture_paths), 3)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            sessions_dir = Path(tmp) / "sessions"
+            sessions_dir.mkdir(parents=True, exist_ok=True)
+            for fixture_path in fixture_paths[:3]:
+                shutil.copy2(fixture_path, sessions_dir / fixture_path.name)
+
+            manager = SessionManager(project_root=tmp, sessions_dir=sessions_dir)
+            old_project_root = Path(tmp) / "old_project_name" / "4.subAgent-and-team" / "sessions"
+            index_records = []
+            for index, fixture_path in enumerate(fixture_paths[:3], start=1):
+                events = manager._read_jsonl(sessions_dir / fixture_path.name)
+                session_start = next(event for event in events if event.get("event") == "session_start")
+                session_id = fixture_path.stem
+                index_records.append(
+                    {
+                        "event": "session_index",
+                        "session_id": session_id,
+                        "created_at": session_start.get("created_at") or session_start.get("timestamp"),
+                        "updated_at": f"2026-06-0{index}T10:00:00",
+                        "model": session_start.get("model"),
+                        "title": f"fixture-{index}",
+                        "title_source": "user",
+                        "path": str(old_project_root / fixture_path.name),
+                        "status": "ended",
+                        "has_user_task": True,
+                    }
+                )
+
+            manager.index_file.write_text(
+                "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in index_records),
+                encoding="utf-8",
+            )
+
+            sessions_before_load = manager.list_sessions(limit=10, include_empty=True)
+            self.assertEqual(len(sessions_before_load), 3)
+            self.assertTrue(all(Path(item["path"]).exists() for item in sessions_before_load))
+
+            target_session_id = sessions_before_load[0]["session_id"]
+            loaded_info = manager.switch_session(target_session_id)
+            self.assertEqual(loaded_info["session_id"], target_session_id)
+
+            sessions_after_load = manager.list_sessions(limit=10, include_empty=True)
+            self.assertEqual(
+                {item["session_id"] for item in sessions_after_load},
+                {item["session_id"] for item in sessions_before_load},
+            )
+            self.assertTrue(all(Path(item["path"]).exists() for item in sessions_after_load))
+
+            repair_events = [
+                event
+                for event in manager._read_jsonl(manager.index_file)
+                if event.get("reason") == "repair_missing_index_path"
+            ]
+            self.assertEqual(len(repair_events), 3)
 
     def test_session_title_update_and_user_priority(self):
         with tempfile.TemporaryDirectory() as tmp:
