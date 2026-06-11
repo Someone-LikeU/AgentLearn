@@ -27,6 +27,44 @@ JanvisAgent,纯Python实现的一个类ClaudeCode的Agent。Janvis意为**just a
 - `avalon_game.py`：阿瓦隆桌游多 Agent 编排实验，由程序主持一局游戏，Agent 玩家根据私有身份和公开日志行动。
 - `module_test/`：模块测试目录，覆盖会话、记忆、工具管理、token 统计、流式响应、history 命令和完成度保护等逻辑。
 
+## 部分运行时功能
+
+### 启动界面
+
+![启动界面](JanvisAgent/4.subAgent-and-team/module_test/测试截图/启动界面.png)
+
+### 工具列表
+
+![工具列表](JanvisAgent/4.subAgent-and-team/module_test/测试截图/工具列表.png)
+
+### status命令
+
+![status命令](JanvisAgent/4.subAgent-and-team/module_test/测试截图/status命令.png)
+
+### 测试天气和机票API同时调用
+
+![测试天气和机票API同时调用](JanvisAgent/4.subAgent-and-team/module_test/测试截图/测试天气和机票API同时调用.png)
+
+### session管理和删除所有会话
+
+![session管理和删除所有会话](JanvisAgent/4.subAgent-and-team/module_test/测试截图/session管理和删除所有会话.png)
+
+### 批量删除session
+
+![批量删除session](JanvisAgent/4.subAgent-and-team/module_test/测试截图/批量删除session.png)
+
+### 删除当前session然后更新token统计
+
+![删除当前session然后更新token统计](JanvisAgent/4.subAgent-and-team/module_test/测试截图/删除当前session然后更新token统计.png)
+
+### history命令查看任务详情
+
+![history命令查看任务详情](JanvisAgent/4.subAgent-and-team/module_test/测试截图/history命令查看任务详情.png)
+
+### history命令和删除历史任务
+
+![history命令和删除历史任务](JanvisAgent/4.subAgent-and-team/module_test/测试截图/history命令和删除历史任务.png)
+
 ## 启动方式
 
 优先在环境变量中设置你的OPENAI兼容的base_url和api_key，然后修改Agent_test.py中传入的这两个参数。
