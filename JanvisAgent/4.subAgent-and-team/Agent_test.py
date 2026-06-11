@@ -28,6 +28,7 @@ if __name__ == '__main__':
 	GLM_4_5_AIR_BASE_URL
 	"""
 	
+	# TODO 修改这里使用的环境变量，或直接在Agent初始化时传硬编码
 	API_KEY = os.environ.get("LONGCAT_2_0_PREVIEW_API_KEY", "NO")
 	BASE_URL = os.environ.get("LONGCAT_2_0_PREVIEW_BASE_URL", "NO")
 	MODEL = "LongCat-2.0-Preview"

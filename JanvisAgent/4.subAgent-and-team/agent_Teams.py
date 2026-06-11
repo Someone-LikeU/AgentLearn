@@ -3704,24 +3704,3 @@ class Agent:
         # 用户手动设置的标题优先级最高，后续异步自动标题不会覆盖它。
         self._set_session_title(title, source="user", silent=False)
         return True, False
-
-"""
-Team 类管理多个Agent，
-"""
-
-from multi_agent import (
-    Team,
-    TeamOrchestrator,
-    build_table_game_runtime_config,
-    create_table_game_orchestrator,
-    plan_team,
-    run_team,
-)
-
-if __name__ == "__main__":
-    from agent_run import AgentRunner
-    runner = AgentRunner(
-        model="minimax-m2.7:cloud",
-        mcp_mode="subprocess",
-    )
-    runner.run()
