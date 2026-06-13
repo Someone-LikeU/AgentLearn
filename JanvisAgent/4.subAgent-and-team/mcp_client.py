@@ -14,7 +14,7 @@ from rich.console import Console
 from spinner import Spinner
 
 
-class MCPClient:
+class LocalMCPManager:
 	"""
 	MCP 客户端实现，支持两种通信方式：
 	1. 子进程模式：服务器作为客户端的子进程运行（通过 STDIO 通信）
@@ -37,6 +37,7 @@ class MCPClient:
 		
 		self.process: subprocess.Popen[str] | None = None
 		self.socket: socket.socket | None = None
+		self.managed_server_process: subprocess.Popen[str] | None = None
 
 	def start(self):
 		"""
@@ -81,6 +82,11 @@ class MCPClient:
 			if self.socket:
 				self.socket.close()
 				self.socket = None
+			if self.managed_server_process and self.managed_server_process.poll() is None:
+				# 只关闭由当前管理器自动拉起的本地 TCP MCP 服务，避免影响用户手动启动的外部服务。
+				self.managed_server_process.terminate()
+				self.managed_server_process.wait(timeout=3)
+			self.managed_server_process = None
 
 	def _request(self, method: str, params: dict[str, Any] | None = None) -> Any:
 		"""
@@ -160,6 +166,9 @@ class MCPClient:
 		"""
 		return self._request("call_tool", {"name": name, "arguments": arguments})
 
+	def get_tool_counts(self) -> dict[str, int]:
+		return {"local": len(self.list_tools()), "remote": 0}
+
 	def __del__(self):
 		try:
 			self.close()
@@ -174,12 +183,12 @@ def _start_mcp_spinner(message: str) -> Spinner:
 	return spinner
 
 
-def create_tcp_mcp_client(
+def create_tcp_local_mcp_manager(
 	host: str = "127.0.0.1",
 	port: int = 7777,
 	server_script: str | None = None,
 	startup_wait: float = 1.0,
-) -> tuple[MCPClient, subprocess.Popen[str] | None]:
+) -> tuple[LocalMCPManager, subprocess.Popen[str] | None]:
 	"""
 	创建可用的 TCP MCP 客户端；如果服务端未启动，则先拉起本地服务端。
 	:param host: TCP 服务地址
@@ -189,7 +198,7 @@ def create_tcp_mcp_client(
 	:return: MCP 客户端，以及本函数自动启动的服务端进程；如果复用已有服务端，则进程为 None
 	"""
 	spinner = _start_mcp_spinner(f"正在连接 MCP 客户端（tcp {host}:{port}）...")
-	client = MCPClient(server_script=server_script, mode="tcp", host=host, port=port)
+	client = LocalMCPManager(server_script=server_script, mode="tcp", host=host, port=port)
 	try:
 		# 先尝试复用已经启动的 TCP 服务端，避免重复拉起服务进程。
 		client.start()
@@ -211,7 +220,8 @@ def create_tcp_mcp_client(
 	)
 	time.sleep(startup_wait)
 
-	client = MCPClient(server_script=str(server_path), mode="tcp", host=host, port=port)
+	client = LocalMCPManager(server_script=str(server_path), mode="tcp", host=host, port=port)
+	client.managed_server_process = server_process
 	try:
 		# 服务端由本函数启动后，再创建新的客户端连接并校验 ping。
 		client.start()
@@ -227,6 +237,24 @@ def create_tcp_mcp_client(
 	return client, server_process
 
 
+def create_tcp_mcp_client(
+	host: str = "127.0.0.1",
+	port: int = 7777,
+	server_script: str | None = None,
+	startup_wait: float = 1.0,
+) -> tuple[LocalMCPManager, subprocess.Popen[str] | None]:
+	# 兼容旧入口，后续新代码优先使用 create_tcp_local_mcp_manager。
+	return create_tcp_local_mcp_manager(
+		host=host,
+		port=port,
+		server_script=server_script,
+		startup_wait=startup_wait,
+	)
+
+
+MCPClient = LocalMCPManager
+
+
 if __name__ == '__main__':
 	import argparse
 	parser = argparse.ArgumentParser(description="MCP Client")
@@ -236,7 +264,7 @@ if __name__ == '__main__':
 	parser.add_argument("--port", type=int, default=7777, help="TCP server port")
 	args = parser.parse_args()
 
-	client = MCPClient(mode=args.mode, host=args.host, port=args.port)
+	client = LocalMCPManager(mode=args.mode, host=args.host, port=args.port)
 	client.start()
 	tools = client.list_tools()
 	print("mcp tool list:", tools)

@@ -117,14 +117,23 @@ class AgentRuntimeConfig:
 
 class Agent:
     
-    _DEFAULT_CONTEXT_WINDOW = 32768
+    # 默认上下文窗口，用于模型配置缺失时估算 token 使用情况。
+    _DEFAULT_CONTEXT_WINDOW = 258000
+    # 当上下文使用比例达到该阈值时触发消息压缩。
     _COMPACT_TRIGGER_RATIO = 0.8
+    # 中段压缩时保留的上下文比例，避免一次压缩丢失过多近期信息。
     _MIDDLE_COMPACT_RATIO = 0.3
+    # 压缩上下文时始终保留的最近消息数量。
     _KEEP_RECENT = 10
+    # 同一个工具连续失败达到该次数后，阻止模型继续重复调用。
     _MAX_CONSECUTIVE_TOOL_FAILURES = 2
+    # 同一个工具连续返回相同成功结果达到该次数后，阻止模型进入重复调用循环。
     _MAX_CONSECUTIVE_IDENTICAL_TOOL_RESULTS = 2
+    # 任务已经表现为完成后，最多允许模型继续补充检查的次数。
     _MAX_TASK_COMPLETION_CONTINUES = 2
+    # 等待异步记忆写入时的轮询间隔，单位为秒。
     _MEMORY_WAIT_POLL_SECONDS = 5
+    # 这些工具内部已经有进度输出，外层不再额外包一层 spinner。
     _TOOLS_WITH_OWN_PROGRESS_OUTPUT = {
         ToolNameConstant.WEB_SEARCH,
         ToolNameConstant.EXECUTE_BASH,
@@ -133,7 +142,6 @@ class Agent:
         ToolNameConstant.READ_BACKGROUND_COMMAND_OUTPUT,
         ToolNameConstant.STOP_BACKGROUND_COMMAND,
     }
-
     def __init__(self, model="qwen3.5:9b",
                  temperature: float = 0.1,
                  base_url: str = None,
@@ -281,8 +289,18 @@ class Agent:
         }
         self._all_tools_without_make_plan = self._build_tools_without_make_plan(self._all_tools)
         mcp_tool_count = len(self._mcp_tools) if self.mcp_client else 0
-        mcp_status = f"{mcp_tool_count} MCP tools" if self.mcp_client else "MCP disabled"
+        mcp_counts = self._mcp_tool_counts() if self.mcp_client else {}
+        if self.mcp_client:
+            local_mcp_tool_count = int(mcp_counts.get("local", 0))
+            remote_mcp_tool_count = int(mcp_counts.get("remote", 0))
+            mcp_status = (
+                f"{mcp_tool_count} MCP tools"
+                f"（本地 {local_mcp_tool_count}，远程 {remote_mcp_tool_count}）"
+            )
+        else:
+            mcp_status = "MCP disabled"
         self.console.print(f"[dim]工具加载完成：{len(self._local_tools)} local tools，{mcp_status}[/]")
+        self._print_mcp_start_errors()
 
         # 基础提示词，用于主 Agent。
         self._base_prompt_main_agent = self._resolve_base_prompt("base_main_agent.md")
@@ -475,6 +493,29 @@ class Agent:
             f"将只使用本地工具。最后错误：{last_error}[/]"
         )
         self.mcp_client = None
+
+    def _mcp_tool_counts(self) -> dict[str, int]:
+        get_counts = getattr(self.mcp_client, "get_tool_counts", None)
+        if not callable(get_counts):
+            return {}
+        try:
+            return get_counts()
+        except Exception:
+            return {}
+
+    def _print_mcp_start_errors(self):
+        get_errors = getattr(self.mcp_client, "get_start_errors", None) if self.mcp_client else None
+        if not callable(get_errors):
+            return
+        try:
+            errors = get_errors()
+        except Exception:
+            return
+        if not errors:
+            return
+        # 只打印加载失败的 MCP 来源，避免远程 API Key 未配置时静默降级。
+        error_text = "；".join(f"{name}: {message}" for name, message in errors.items())
+        self.console.print(f"[yellow]部分 MCP 来源加载失败：{error_text}[/]")
 
     def _model_config_file_path(self) -> Path:
         """
@@ -784,10 +825,17 @@ class Agent:
 
     def _extra_system_prompt_parts(self) -> list[str]:
         # 额外 prompt 按传入顺序拼接，桌游规则这类动态上下文放在基础人设之后。
-        return [
+        prompt_parts = [
             self._load_prompt_file(prompt_file)
             for prompt_file in self.runtime_config.extra_prompt_files
         ]
+        if self.runtime_config.enable_local_tools:
+            prompt_parts.append(
+                "Search priority: prefer remote/external MCP search tools such as Exa or Tavily. "
+                "Use local WEB_SEARCH only as a fallback when no other search tool is available "
+                "or those tools fail."
+            )
+        return prompt_parts
 
     def _load_model_context_window(self):
         config_path = Path(self._agent_file_path("agent/config/model_config.json"))

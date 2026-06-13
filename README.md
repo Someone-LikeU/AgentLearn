@@ -69,16 +69,21 @@ JanvisAgent,纯Python实现的一个类ClaudeCode的Agent。Janvis意为**just a
 
 优先在环境变量中设置你的OPENAI兼容的base_url和api_key，然后修改Agent_test.py中传入的这两个参数。
 或者直接传base_url和api_key的硬编码，需要注意信息安全风险。
-（运行示例）推荐使用本机的 Anaconda Python：
+（运行示例）推荐使用 Anaconda Python环境：
 
 ```powershell
 cd 项目目录
+python -m pip install -r requirements.txt
+
+cd JanvisAgent\4.subAgent-and-team
 
 $env:LONGCAT_2_0_PREVIEW_BASE_URL="你的 OpenAI 兼容接口地址"
 $env:LONGCAT_2_0_PREVIEW_API_KEY="你的 API Key"
 
 python Agent_test.py
 ```
+
+如果使用指定的 Anaconda Python，可把上面的 `python` 替换为 `指定目录的python`。
 
 `Agent_test.py` 默认使用：
 
@@ -127,6 +132,10 @@ python Agent_test.py
 - 时间与联网：`GET_TIME`、`WEB_SEARCH`
 - 记忆工具：`LOAD_FULL_MEMORY_CONTEXT`
 - 子 Agent：`SUB_AGENT`
+
+## MCP工具
+除了前面提到的本地实现的mcp工具（查天气和查机票），还引入了两个网络搜索相关的第三方工具Exa和Tavily，并基于本项目的实现方式进行了适配，这俩工具需要上官网注册账号获取API_KEY，
+然后放到环境变量里才能使用。官网注册账号时会送一点初始额度可以用。
 
 命令工具内置危险命令拦截，覆盖常见批量删除、格式化磁盘、管道下载脚本执行等高风险模式。
 

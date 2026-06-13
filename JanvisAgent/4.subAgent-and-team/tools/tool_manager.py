@@ -309,6 +309,14 @@ class ToolManager:
                     tool_name = tool.get("name")
                     if tool_name:
                         capabilities[tool_name] = dict(self._MCP_DEFAULT_CAPABILITY)
+                get_capabilities = getattr(self.mcp_client, "get_tool_capabilities", None)
+                if callable(get_capabilities):
+                    # 远程 MCP 聚合器可以按工具动态声明能力，配置文件仍可在后面覆盖。
+                    for tool_name, capability in get_capabilities().items():
+                        if isinstance(capability, dict):
+                            base = dict(self._MCP_DEFAULT_CAPABILITY)
+                            base.update(capability)
+                            capabilities[tool_name] = base
             except Exception:
                 # 能力配置加载失败不影响主流程，保持默认空字典即可。
                 return capabilities

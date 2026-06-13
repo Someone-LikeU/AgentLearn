@@ -15,7 +15,8 @@ configure_stdio_encoding()
 
 from agent_Teams import Agent
 
-from mcp_client import create_tcp_mcp_client
+from mcp_aggregator import create_aggregate_mcp_client
+
 
 if __name__ == '__main__':
 	"""
@@ -33,9 +34,8 @@ if __name__ == '__main__':
 	BASE_URL = os.environ.get("LONGCAT_2_0_PREVIEW_BASE_URL", "NO")
 	MODEL = "LongCat-2.0-Preview"
 	mcp_client = None
-	server_process = None
 	try:
-		mcp_client, server_process = create_tcp_mcp_client()
+		mcp_client = create_aggregate_mcp_client(project_root=os.path.dirname(__file__))
 		myAgent = Agent(
 			model=MODEL,
 			base_url=BASE_URL,
@@ -46,7 +46,3 @@ if __name__ == '__main__':
 	finally:
 		if mcp_client:
 			mcp_client.close()
-		if server_process and server_process.poll() is None:
-			# 只关闭本入口自动启动的 MCP server，不影响用户手动启动的外部服务。
-			server_process.terminate()
-			server_process.wait(timeout=3)

@@ -285,7 +285,7 @@
     "type": "function",
     "function": {
       "name": "WEB_SEARCH",
-      "description": "Search the web for information and summarize the results using the model.",
+      "description": "Lowest-priority fallback web search tool. When network search is needed, prefer other network search tools first. Use this only when no other network search tool is available, or when other network search tools fail, return errors, or cannot provide useful results. Searches the web and summarizes the results using the model.",
       "parameters": {
         "type": "object",
         "properties": {
