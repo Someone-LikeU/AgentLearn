@@ -1,6 +1,7 @@
 # encoding: utf-8
 import asyncio
 import json
+import logging
 import os
 import re
 import time
@@ -23,6 +24,7 @@ _OPENAI_TOOL_NAME_PATTERN = re.compile(r"[^A-Za-z0-9_-]")
 _TOOL_CALL_MAX_ATTEMPTS = 3
 _TOOL_CALL_RETRY_DELAY_SECONDS = 0.8
 _TAVILY_SEARCH_REST_URL = "https://api.tavily.com/search"
+_NOISY_MCP_TRANSPORT_LOGGERS = ("mcp.client.streamable_http",)
 _RETRYABLE_ERROR_NAMES = {
     "ConnectError",
     "ConnectTimeout",
@@ -33,6 +35,18 @@ _RETRYABLE_ERROR_NAMES = {
     "TimeoutError",
     "EndOfStream",
 }
+
+
+def _suppress_noisy_mcp_transport_logs() -> None:
+    for logger_name in _NOISY_MCP_TRANSPORT_LOGGERS:
+        logger = logging.getLogger(logger_name)
+        # MCP SDK 会在内部重试/清理时把 transport 异常栈直接打到控制台；调用方已把错误包装进工具结果。
+        logger.addHandler(logging.NullHandler())
+        logger.setLevel(logging.CRITICAL)
+        logger.propagate = False
+
+
+_suppress_noisy_mcp_transport_logs()
 
 
 @dataclass

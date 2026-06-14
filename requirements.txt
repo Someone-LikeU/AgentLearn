@@ -1,0 +1,23 @@
+# JanvisAgent core runtime
+openai
+rich
+PyYAML
+duckduckgo-search
+httpx
+prompt_toolkit
+mcp
+
+# Office/skill helper dependencies
+defusedxml
+lxml
+Pillow
+PyPDF2
+python-docx
+python-pptx
+
+# Local semantic-search skill dependencies
+chromadb
+sentence-transformers
+
+# Long-task Django demo dependency
+Django

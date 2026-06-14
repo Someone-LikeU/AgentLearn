@@ -2,7 +2,7 @@
   "exa|streamable_http|https://mcp.exa.ai/mcp": {
     "server": "exa",
     "transport": "streamable_http",
-    "updated_at": "2026-06-14 00:11:42",
+    "updated_at": "2026-06-14 22:53:08",
     "tools": [
       {
         "name": "web_search_exa",

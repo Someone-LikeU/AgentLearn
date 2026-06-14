@@ -185,6 +185,30 @@ class AgentStreamResponseTest(unittest.TestCase):
 		self.assertIn("重复请求", stop_reason)
 		self.assertIn("repeated_identical_call", appended_messages[-1][0]["content"])
 
+	def test_tool_exception_is_returned_as_short_tool_result(self):
+		agent = self._agent()
+		agent._should_wrap_tool_with_spinner = lambda _tool_name: False
+
+		def failing_tool(**_kwargs):
+			raise ExceptionGroup("transport failed", [RuntimeError("no running event loop")])
+
+		agent._available_functions = {"tavily_search": failing_tool}
+		task = ToolCallTask(
+			tool_call_id="call_1",
+			function_name="tavily_search",
+			raw_arguments='{"query":"x"}',
+			function_args={"query": "x"},
+		)
+
+		with redirect_stdout(io.StringIO()):
+			response = agent._invoke_tool_task(task)
+
+		self.assertFalse(response["ok"])
+		self.assertEqual(response["error_type"], "tool_exception")
+		self.assertTrue(response["retryable"])
+		self.assertIn("RuntimeError: no running event loop", response["message"])
+		self.assertNotIn("Traceback", response["message"])
+
 	def test_tool_call_chunks_are_merged_in_order(self):
 		agent = self._agent()
 		stream = [

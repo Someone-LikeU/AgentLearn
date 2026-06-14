@@ -1562,6 +1562,27 @@ class Agent:
             "message": message,
         }
 
+    def _summarize_tool_exception_for_model(self, error: BaseException) -> str:
+        """把工具异常压缩成模型可读的短消息，避免把 traceback 写进上下文。"""
+        leaf = self._leaf_tool_exception(error)
+        raw_message = str(leaf).strip() or type(leaf).__name__
+        first_line = raw_message.splitlines()[0] if raw_message else type(leaf).__name__
+        if len(first_line) > 300:
+            first_line = f"{first_line[:300]}..."
+        return f"{type(leaf).__name__}: {first_line}"
+
+    def _leaf_tool_exception(self, error: BaseException, seen: set[int] | None = None) -> BaseException:
+        seen = seen or set()
+        if id(error) in seen:
+            return error
+        seen.add(id(error))
+        if isinstance(error, BaseExceptionGroup) and error.exceptions:
+            return self._leaf_tool_exception(error.exceptions[0], seen)
+        cause = getattr(error, "__cause__", None)
+        if cause is not None:
+            return self._leaf_tool_exception(cause, seen)
+        return error
+
     def _request_next_model_message(self, active_tools):
         # 模型调用前先做上下文压缩，避免把压缩逻辑散在主循环里。
         self._compact_messages(active_tools)
@@ -2053,12 +2074,14 @@ class Agent:
                 if spinner is not None:
                     spinner.stop()
             return result
-        except Exception as error:
+        except BaseException as error:
+            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                raise
             return self._format_tool_failure_response(
                 task,
                 "tool_exception",
-                f"Error when calling '{task.function_name}': {error}",
-                retryable=False,
+                f"Error when calling '{task.function_name}': {self._summarize_tool_exception_for_model(error)}",
+                retryable=True,
             )
 
     def _build_system_prompt(self):
