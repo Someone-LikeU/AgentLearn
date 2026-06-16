@@ -553,6 +553,38 @@ class Agent:
         config_path.parent.mkdir(parents=True, exist_ok=True)
         config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    def _vision_model_config_file_path(self) -> Path:
+        return Path(self._agent_file_path("agent/config/local_vision_model.json"))
+
+    def _read_vision_model_config(self) -> dict:
+        config_path = self._vision_model_config_file_path()
+        try:
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+        except Exception:
+            return {"default_model": "gemma4:e4b", "models": [{"name": "qwen3.5:9b"}, {"name": "gemma4:e4b"}]}
+        if not isinstance(config, dict):
+            return {"default_model": "gemma4:e4b", "models": []}
+        if not isinstance(config.get("models"), list):
+            config["models"] = []
+        return config
+
+    def _write_vision_model_config(self, config: dict):
+        # 本地图片理解模型独立配置，避免和远程聊天模型配置混在一起。
+        config_path = self._vision_model_config_file_path()
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _vision_model_names_from_config(self, config: dict) -> list[str]:
+        model_names: list[str] = []
+        for item in config.get("models") or []:
+            if isinstance(item, dict):
+                name = str(item.get("name") or "").strip()
+            else:
+                name = str(item or "").strip()
+            if name and name not in model_names:
+                model_names.append(name)
+        return model_names
+
     def _get_model_config_by_name(self, model_name: str) -> dict | None:
         """
         根据模型名获取模型配置项。
@@ -1553,16 +1585,30 @@ class Agent:
         normalized_text = " ".join(str(result_text or "").split())
         return hashlib.sha256(normalized_text.encode("utf-8", errors="replace")).hexdigest()
 
+    def _coerce_tool_result_payload(self, function_response) -> dict[str, Any] | None:
+        if isinstance(function_response, dict):
+            return function_response
+        if isinstance(function_response, str):
+            try:
+                parsed = json.loads(function_response)
+            except Exception:
+                return None
+            if isinstance(parsed, dict):
+                return parsed
+        return None
+
     def _is_tool_call_failure(self, function_response) -> bool:
         """判断工具结果是否表示失败。"""
-        if isinstance(function_response, dict):
-            if function_response.get("ok") is False:
+        payload = self._coerce_tool_result_payload(function_response)
+        if payload is not None:
+            if payload.get("ok") is False:
                 return True
-            return bool(function_response.get("error") or function_response.get("error_type"))
+            return bool(payload.get("error") or payload.get("error_type"))
         text = str(function_response or "").strip()
         lowered = text.lower()
         return (
             lowered.startswith("error")
+            or '"ok": false' in lowered
             or "执行失败" in text
             or "failed" in lowered
             or "exception" in lowered
@@ -1650,9 +1696,10 @@ class Agent:
         return error
 
     def _tool_status_for_log(self, function_response: Any) -> str:
-        if isinstance(function_response, dict):
-            if function_response.get("ok") is False:
-                return str(function_response.get("error_type") or "failed")
+        payload = self._coerce_tool_result_payload(function_response)
+        if payload is not None:
+            if payload.get("ok") is False:
+                return str(payload.get("error_type") or "failed")
             return "ok"
         text = str(function_response or "")
         if "[Tool timeout]" in text or "timed out" in text.lower():
@@ -1740,11 +1787,12 @@ class Agent:
         self._record_response_usage(message, "assistant_response", message_id=message_id)
 
     def _append_tool_result(self, task: ToolCallTask, function_response):
+        content = function_response if isinstance(function_response, str) else json.dumps(function_response, ensure_ascii=False)
         self._append_message(
             {
                 "role": "tool",
                 "tool_call_id": task.tool_call_id,
-                "content": json.dumps(function_response, ensure_ascii=False),
+                "content": content,
             }
         )
 
@@ -2535,6 +2583,8 @@ class Agent:
             ("model", "查看模型相关命令"),
             ("model add", "新增模型配置并测试"),
             ("model <name|编号>", "切换到指定模型"),
+            ("vision model list", "列出本地图片理解模型"),
+            ("add vision model", "新增本地图片理解模型"),
             ("tools", "列出当前可用工具"),
             ("skills / skill_list", "列出当前已有 skill"),
             ("compact", "压缩当前会话上下文"),
@@ -2842,6 +2892,8 @@ class Agent:
             "models": self._handle_cmd_model_list,
             "model": self._handle_cmd_model_show_current,
             "model add": self._handle_cmd_model_add,
+            "vision model list": self._handle_cmd_vision_model_list,
+            "add vision model": self._handle_cmd_add_vision_model,
             "tools": self._handle_cmd_tools,
             "skills": self._handle_cmd_skill_list,
             "skill_list": self._handle_cmd_skill_list,
@@ -3182,6 +3234,38 @@ class Agent:
         models = self._read_model_config().get("models", [])
         return [model_info.get("name") for model_info in models if isinstance(model_info, dict) and model_info.get("name")]
 
+    def _handle_cmd_vision_model_list(self, _confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
+        config = self._read_vision_model_config()
+        model_names = self._vision_model_names_from_config(config)
+        if not model_names:
+            self.console.print("[yellow]当前没有可用的本地图片理解模型。[/]")
+            return True, False
+        default_model = config.get("default_model")
+        self.console.print("[dim]本地图片理解模型列表：[/]")
+        for index, model_name in enumerate(model_names, start=1):
+            marker = " [bold green]（默认）[/]" if model_name == default_model else ""
+            self.console.print(f"[bold green]{index}[/]. [bold cyan]{model_name}[/]{marker}")
+        self.console.print("[dim]模型调用前也可以让 Agent 使用 GET_VISION_MODELS 工具读取同一份列表。[/]")
+        return True, False
+
+    def _handle_cmd_add_vision_model(self, _confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
+        model_name = self.console.input("[bold cyan]请输入本地图片理解模型名：[/] ").strip()
+        if not model_name:
+            self.console.print("[yellow]模型名不能为空，已取消新增。[/]")
+            return True, False
+        config = self._read_vision_model_config()
+        model_names = self._vision_model_names_from_config(config)
+        if model_name in model_names:
+            self.console.print(f"[yellow]本地图片理解模型 {model_name} 已存在。[/]")
+            return True, False
+        config.setdefault("models", [])
+        config["models"].append({"name": model_name})
+        if not config.get("default_model"):
+            config["default_model"] = model_name
+        self._write_vision_model_config(config)
+        self.console.print(f"[green]已新增本地图片理解模型：{model_name}[/]")
+        return self._handle_cmd_vision_model_list(_confirm_choice)
+
     def _handle_cmd_model_list(self, _confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
         # 列出当前已配置模型；若暂无配置则先保留为空实现提示。
         available_models = self._load_available_models()
@@ -3208,6 +3292,8 @@ class Agent:
             "[dim] 或 [/][bold cyan]model[/] [bold cyan]gpt-4o-mini[/]"
         )
         self.console.print("[bold cyan]model add[/][dim]：新增模型配置[/]")
+        self.console.print("[bold cyan]vision model list[/][dim]：查看本地图片理解模型[/]")
+        self.console.print("[bold cyan]add vision model[/][dim]：新增本地图片理解模型[/]")
         self.console.print("[bold cyan]status[/][dim]：查看当前模型和 token 状态[/]")
         return True, False
 

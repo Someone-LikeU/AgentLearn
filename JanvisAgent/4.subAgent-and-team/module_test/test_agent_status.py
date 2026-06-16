@@ -109,6 +109,34 @@ class AgentStatusTest(unittest.TestCase):
             self.assertFalse(should_exit)
             self.assertIn("Alpha skill description", output.getvalue())
 
+    def test_vision_model_commands_read_and_append_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = io.StringIO()
+            agent = self._agent(output)
+            root = Path(tmp)
+            config_path = root / "agent" / "config" / "local_vision_model.json"
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text(
+                '{"default_model":"gemma4:e4b","models":[{"name":"gemma4:e4b"}]}',
+                encoding="utf-8",
+            )
+            agent._agent_file_path = lambda relative_path: str(root / relative_path)
+
+            handled, should_exit = agent._handle_user_command("vision model list", ())
+
+            self.assertTrue(handled)
+            self.assertFalse(should_exit)
+            self.assertIn("gemma4:e4b", output.getvalue())
+
+            output.seek(0)
+            output.truncate(0)
+            agent.console.input = lambda _prompt: "qwen3.5:9b"
+            handled, should_exit = agent._handle_user_command("add vision model", ())
+
+            self.assertTrue(handled)
+            self.assertFalse(should_exit)
+            self.assertIn("qwen3.5:9b", config_path.read_text(encoding="utf-8"))
+
     def test_status_shows_zero_after_only_task_is_deleted(self):
         with tempfile.TemporaryDirectory() as tmp:
             output = io.StringIO()

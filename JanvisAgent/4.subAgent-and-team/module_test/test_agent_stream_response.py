@@ -212,6 +212,13 @@ class AgentStreamResponseTest(unittest.TestCase):
 		self.assertIn("[Tool result] tool name: tavily_search", output.getvalue())
 		self.assertIn("status: tool_exception", output.getvalue())
 
+	def test_json_string_tool_result_failure_is_detected(self):
+		agent = self._agent()
+		result = '{"ok": false, "error_type": "RuntimeError", "error": "failed"}'
+
+		self.assertTrue(agent._is_tool_call_failure(result))
+		self.assertEqual(agent._tool_status_for_log(result), "RuntimeError")
+
 	def test_tool_call_chunks_are_merged_in_order(self):
 		agent = self._agent()
 		stream = [

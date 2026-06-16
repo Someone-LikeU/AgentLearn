@@ -367,5 +367,408 @@
         ]
       }
     }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "MEDIA_PROBE",
+      "description": "Inspect a local audio, image, or video file before deciding how to process it. Use this to get file type, size, dimensions, duration, and stream metadata.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Local media file path."
+          }
+        },
+        "required": [
+          "path"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "GET_VISION_MODELS",
+      "description": "List local vision models available for image understanding. Call this before IMAGE_DESCRIBE when you need to choose a model.",
+      "parameters": {
+        "type": "object",
+        "properties": {}
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "IMAGE_DESCRIBE",
+      "description": "Describe or answer questions about a local image. Use this when the task requires visual understanding beyond plain text extraction.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Local image file path."
+          },
+          "prompt": {
+            "type": "string",
+            "description": "Optional instruction for what to inspect in the image."
+          },
+          "model": {
+            "type": "string",
+            "description": "Optional vision model name from GET_VISION_MODELS. If omitted, the default vision model is used."
+          }
+        },
+        "required": [
+          "path"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "IMAGE_DOWNLOAD",
+      "description": "Download an image from a URL to a local file. Use this when an image is provided as a web address and later image tools need a local path.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "HTTP or HTTPS image URL."
+          },
+          "output_path": {
+            "type": "string",
+            "description": "Optional output path. Relative paths are written under runtime_output/media."
+          },
+          "max_mb": {
+            "type": "integer",
+            "default": 50,
+            "minimum": 1,
+            "maximum": 500
+          },
+          "timeout_seconds": {
+            "type": "integer",
+            "default": 60,
+            "minimum": 5,
+            "maximum": 600
+          }
+        },
+        "required": [
+          "url"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "IMAGE_OCR",
+      "description": "Extract readable text from a local image. Use this for screenshots, scanned documents, receipts, or images where text is the main target.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Local image file path."
+          },
+          "languages": {
+            "type": "string",
+            "description": "OCR language codes, such as eng+chi_sim.",
+            "default": "eng+chi_sim"
+          }
+        },
+        "required": [
+          "path"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "IMAGE_TRANSFORM",
+      "description": "Create a modified copy of a local image by cropping, resizing, rotating, changing format, or reducing size. Use this when a later step needs an adjusted image file.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "output_path": {
+            "type": "string",
+            "description": "Optional output path. Relative paths are written under runtime_output/media."
+          },
+          "format": {
+            "type": "string",
+            "description": "Output format such as png, jpg, webp."
+          },
+          "max_width": {
+            "type": "integer"
+          },
+          "max_height": {
+            "type": "integer"
+          },
+          "rotate_degrees": {
+            "type": "number",
+            "default": 0
+          },
+          "crop_box": {
+            "type": "array",
+            "items": {
+              "type": "integer"
+            },
+            "minItems": 4,
+            "maxItems": 4,
+            "description": "[left, top, right, bottom]"
+          },
+          "quality": {
+            "type": "integer",
+            "default": 90,
+            "minimum": 1,
+            "maximum": 100
+          }
+        },
+        "required": [
+          "path"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "AUDIO_TRANSCRIBE",
+      "description": "Transcribe speech from a local audio file. Choose txt for plain text, json for timestamped segments, or srt for subtitles; txt is the default.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "output_format": {
+            "type": "string",
+            "enum": [
+              "txt",
+              "json",
+              "srt"
+            ],
+            "default": "txt"
+          },
+          "model": {
+            "type": "string",
+            "description": "Optional transcription model name or local model path."
+          },
+          "language": {
+            "type": "string",
+            "description": "Optional language code such as en or zh."
+          },
+          "beam_size": {
+            "type": "integer",
+            "default": 5,
+            "minimum": 1,
+            "maximum": 10
+          }
+        },
+        "required": [
+          "path"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "AUDIO_CONVERT",
+      "description": "Create a converted or trimmed copy of a local audio file. Use this to change format, duration, sample rate, or channel count.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "output_path": {
+            "type": "string"
+          },
+          "format": {
+            "type": "string",
+            "description": "Output format such as wav, mp3, flac, m4a."
+          },
+          "start_seconds": {
+            "type": "number"
+          },
+          "duration_seconds": {
+            "type": "number"
+          },
+          "sample_rate": {
+            "type": "integer"
+          },
+          "channels": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "path"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "VIDEO_DOWNLOAD",
+      "description": "Download a video from a URL to a local file. Use this when a task provides a video link and later video tools need a local path.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "type": "string"
+          },
+          "output_path": {
+            "type": "string",
+            "description": "Optional output path. Relative paths are written under runtime_output/media."
+          },
+          "max_mb": {
+            "type": "integer",
+            "default": 500,
+            "minimum": 1,
+            "maximum": 5000
+          },
+          "timeout_seconds": {
+            "type": "integer",
+            "default": 120,
+            "minimum": 5,
+            "maximum": 1800
+          }
+        },
+        "required": [
+          "url"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "VIDEO_EXTRACT_FRAMES",
+      "description": "Extract image frames from a local video. Use timestamps for specific moments or interval_seconds for regular sampling.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "output_dir": {
+            "type": "string"
+          },
+          "timestamps": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Specific timestamps such as 12.5 or 00:01:02."
+          },
+          "interval_seconds": {
+            "type": "number",
+            "default": 5
+          },
+          "max_frames": {
+            "type": "integer",
+            "default": 20,
+            "minimum": 1,
+            "maximum": 200
+          },
+          "image_format": {
+            "type": "string",
+            "default": "jpg"
+          }
+        },
+        "required": [
+          "path"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "VIDEO_TRANSCRIBE",
+      "description": "Transcribe speech from a local video. Choose txt for plain text, json for timestamped segments, or srt for subtitles; txt is the default.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "output_format": {
+            "type": "string",
+            "enum": [
+              "txt",
+              "json",
+              "srt"
+            ],
+            "default": "txt"
+          },
+          "model": {
+            "type": "string",
+            "description": "Optional transcription model name or local model path."
+          },
+          "language": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "VIDEO_CONVERT",
+      "description": "Create a converted, trimmed, compressed, resized, or audio-only copy of a local video. Use this when a task needs a new media file for later processing or delivery.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "output_path": {
+            "type": "string"
+          },
+          "format": {
+            "type": "string",
+            "description": "Output video format such as mp4, webm, mkv, or audio format when extract_audio is true."
+          },
+          "start_seconds": {
+            "type": "number"
+          },
+          "duration_seconds": {
+            "type": "number"
+          },
+          "max_width": {
+            "type": "integer"
+          },
+          "crf": {
+            "type": "integer",
+            "default": 23,
+            "minimum": 0,
+            "maximum": 51
+          },
+          "preset": {
+            "type": "string",
+            "default": "medium"
+          },
+          "extract_audio": {
+            "type": "boolean",
+            "default": false
+          }
+        },
+        "required": [
+          "path"
+        ]
+      }
+    }
   }
 ]

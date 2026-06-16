@@ -19,6 +19,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from tools.base_tool import ToolSpec, FunctionTool
+from tools.media_tool import MediaTool
 from tools.tool_registry import ToolRegistry
 from tools.tool_names import ToolNameConstant
 from tools.web_tool import DDGS, WebTool
@@ -110,6 +111,8 @@ class ToolManager:
         ToolNameConstant.GREP,
         ToolNameConstant.READ_FILE,
         ToolNameConstant.LIST_DIR,
+        ToolNameConstant.MEDIA_PROBE,
+        ToolNameConstant.GET_VISION_MODELS,
         ToolNameConstant.CHECK_BACKGROUND_COMMAND,
         ToolNameConstant.READ_BACKGROUND_COMMAND_OUTPUT,
     }
@@ -121,6 +124,11 @@ class ToolManager:
         ToolNameConstant.GREP,
         ToolNameConstant.READ_FILE,
         ToolNameConstant.LIST_DIR,
+        ToolNameConstant.MEDIA_PROBE,
+        ToolNameConstant.GET_VISION_MODELS,
+        ToolNameConstant.IMAGE_DESCRIBE,
+        ToolNameConstant.IMAGE_OCR,
+        ToolNameConstant.AUDIO_TRANSCRIBE,
         ToolNameConstant.LOAD_SKILL_DETAIL_BY_NAME,
         ToolNameConstant.LOAD_FULL_MEMORY_CONTEXT,
         ToolNameConstant.CHECK_BACKGROUND_COMMAND,
@@ -130,6 +138,13 @@ class ToolManager:
     _DESTRUCTIVE_TOOLS = {
         ToolNameConstant.WRITE_FILE,
         ToolNameConstant.EDIT,
+        ToolNameConstant.IMAGE_TRANSFORM,
+        ToolNameConstant.IMAGE_DOWNLOAD,
+        ToolNameConstant.AUDIO_CONVERT,
+        ToolNameConstant.VIDEO_DOWNLOAD,
+        ToolNameConstant.VIDEO_EXTRACT_FRAMES,
+        ToolNameConstant.VIDEO_TRANSCRIBE,
+        ToolNameConstant.VIDEO_CONVERT,
         ToolNameConstant.EXECUTE_BASH,
         ToolNameConstant.START_BACKGROUND_COMMAND,
         ToolNameConstant.STOP_BACKGROUND_COMMAND,
@@ -153,6 +168,18 @@ class ToolManager:
         ToolNameConstant.LOAD_FULL_MEMORY_CONTEXT: "memory",
         ToolNameConstant.MAKE_PLAN: "runtime",
         ToolNameConstant.SUB_AGENT: "agent",
+        ToolNameConstant.MEDIA_PROBE: "media",
+        ToolNameConstant.GET_VISION_MODELS: "media",
+        ToolNameConstant.IMAGE_DESCRIBE: "media",
+        ToolNameConstant.IMAGE_DOWNLOAD: "network",
+        ToolNameConstant.IMAGE_OCR: "media",
+        ToolNameConstant.IMAGE_TRANSFORM: "filesystem",
+        ToolNameConstant.AUDIO_TRANSCRIBE: "media",
+        ToolNameConstant.AUDIO_CONVERT: "filesystem",
+        ToolNameConstant.VIDEO_DOWNLOAD: "network",
+        ToolNameConstant.VIDEO_EXTRACT_FRAMES: "filesystem",
+        ToolNameConstant.VIDEO_TRANSCRIBE: "filesystem",
+        ToolNameConstant.VIDEO_CONVERT: "filesystem",
     }
     # Agent 层展示/兜底使用的单工具建议超时；具体工具内部可有更精确的硬超时。
     _TOOL_TIMEOUT_SECONDS = {
@@ -172,6 +199,18 @@ class ToolManager:
         ToolNameConstant.LOAD_SKILL_DETAIL_BY_NAME: 10,
         ToolNameConstant.LOAD_FULL_MEMORY_CONTEXT: 20,
         ToolNameConstant.MAKE_PLAN: 180,
+        ToolNameConstant.MEDIA_PROBE: 30,
+        ToolNameConstant.GET_VISION_MODELS: 5,
+        ToolNameConstant.IMAGE_DESCRIBE: 120,
+        ToolNameConstant.IMAGE_DOWNLOAD: 120,
+        ToolNameConstant.IMAGE_OCR: 60,
+        ToolNameConstant.IMAGE_TRANSFORM: 60,
+        ToolNameConstant.AUDIO_TRANSCRIBE: 600,
+        ToolNameConstant.AUDIO_CONVERT: 300,
+        ToolNameConstant.VIDEO_DOWNLOAD: 600,
+        ToolNameConstant.VIDEO_EXTRACT_FRAMES: 300,
+        ToolNameConstant.VIDEO_TRANSCRIBE: 900,
+        ToolNameConstant.VIDEO_CONVERT: 900,
     }
     # MCP 默认能力（保守策略）：未配置时按不可并发读处理。
     _MCP_DEFAULT_CAPABILITY = {
@@ -195,6 +234,7 @@ class ToolManager:
             model=self.model,
             spinner_factory=config.spinner_factory,
         )
+        self.media_tool = MediaTool(project_root=self.project_root, mcp_client=self.mcp_client)
 
         # 通过依赖注入方式注册“由 Agent 提供”的工具处理函数，
         # 这样 ToolManager 不需要直接依赖 Agent 具体实现。
@@ -244,6 +284,18 @@ class ToolManager:
             ToolNameConstant.GET_TIME: self.get_time,
             ToolNameConstant.WEB_SEARCH: self.web_search,
             ToolNameConstant.LIST_DIR: self.list_dir,
+            ToolNameConstant.MEDIA_PROBE: self.media_probe,
+            ToolNameConstant.GET_VISION_MODELS: self.get_vision_models,
+            ToolNameConstant.IMAGE_DESCRIBE: self.image_describe,
+            ToolNameConstant.IMAGE_DOWNLOAD: self.image_download,
+            ToolNameConstant.IMAGE_OCR: self.image_ocr,
+            ToolNameConstant.IMAGE_TRANSFORM: self.image_transform,
+            ToolNameConstant.AUDIO_TRANSCRIBE: self.audio_transcribe,
+            ToolNameConstant.AUDIO_CONVERT: self.audio_convert,
+            ToolNameConstant.VIDEO_DOWNLOAD: self.video_download,
+            ToolNameConstant.VIDEO_EXTRACT_FRAMES: self.video_extract_frames,
+            ToolNameConstant.VIDEO_TRANSCRIBE: self.video_transcribe,
+            ToolNameConstant.VIDEO_CONVERT: self.video_convert,
         }
         if self._make_plan_handler is not None:
             functions[ToolNameConstant.MAKE_PLAN] = self._make_plan_handler
@@ -907,6 +959,169 @@ class ToolManager:
         result = self.web_tool.web_search(query, max_results)
         self.last_web_search_results = self.web_tool.last_web_search_results
         return result
+
+    def media_probe(self, path: str) -> str:
+        return self.media_tool.media_probe(path)
+
+    def image_describe(
+            self,
+            path: str,
+            prompt: str | None = None,
+            model: str | None = None,
+    ) -> str:
+        return self.media_tool.image_describe(
+            path,
+            prompt=prompt,
+            model=model,
+        )
+
+    def get_vision_models(self) -> str:
+        return self.media_tool.get_vision_models()
+
+    def image_ocr(self, path: str, languages: str = "eng+chi_sim") -> str:
+        return self.media_tool.image_ocr(path, languages=languages)
+
+    def image_download(
+            self,
+            url: str,
+            output_path: str | None = None,
+            max_mb: int = 50,
+            timeout_seconds: int = 60,
+    ) -> str:
+        return self.media_tool.image_download(
+            url,
+            output_path=output_path,
+            max_mb=max_mb,
+            timeout_seconds=timeout_seconds,
+        )
+
+    def image_transform(
+            self,
+            path: str,
+            output_path: str | None = None,
+            format: str | None = None,
+            max_width: int | None = None,
+            max_height: int | None = None,
+            rotate_degrees: float = 0,
+            crop_box: list[int] | None = None,
+            quality: int = 90,
+    ) -> str:
+        return self.media_tool.image_transform(
+            path,
+            output_path=output_path,
+            format=format,
+            max_width=max_width,
+            max_height=max_height,
+            rotate_degrees=rotate_degrees,
+            crop_box=crop_box,
+            quality=quality,
+        )
+
+    def audio_transcribe(
+            self,
+            path: str,
+            output_format: str = "txt",
+            model: str | None = None,
+            language: str | None = None,
+            beam_size: int = 5,
+    ) -> str:
+        return self.media_tool.audio_transcribe(
+            path,
+            output_format=output_format,
+            model=model,
+            language=language,
+            beam_size=beam_size,
+        )
+
+    def audio_convert(
+            self,
+            path: str,
+            output_path: str | None = None,
+            format: str | None = None,
+            start_seconds: float | None = None,
+            duration_seconds: float | None = None,
+            sample_rate: int | None = None,
+            channels: int | None = None,
+    ) -> str:
+        return self.media_tool.audio_convert(
+            path,
+            output_path=output_path,
+            format=format,
+            start_seconds=start_seconds,
+            duration_seconds=duration_seconds,
+            sample_rate=sample_rate,
+            channels=channels,
+        )
+
+    def video_download(
+            self,
+            url: str,
+            output_path: str | None = None,
+            max_mb: int = 500,
+            timeout_seconds: int = 120,
+    ) -> str:
+        return self.media_tool.video_download(
+            url,
+            output_path=output_path,
+            max_mb=max_mb,
+            timeout_seconds=timeout_seconds,
+        )
+
+    def video_extract_frames(
+            self,
+            path: str,
+            output_dir: str | None = None,
+            timestamps: list[Any] | None = None,
+            interval_seconds: float | None = None,
+            max_frames: int = 20,
+            image_format: str = "jpg",
+    ) -> str:
+        return self.media_tool.video_extract_frames(
+            path,
+            output_dir=output_dir,
+            timestamps=timestamps,
+            interval_seconds=interval_seconds,
+            max_frames=max_frames,
+            image_format=image_format,
+        )
+
+    def video_transcribe(
+            self,
+            path: str,
+            output_format: str = "txt",
+            model: str | None = None,
+            language: str | None = None,
+    ) -> str:
+        return self.media_tool.video_transcribe(
+            path,
+            output_format=output_format,
+            model=model,
+            language=language,
+        )
+
+    def video_convert(
+            self,
+            path: str,
+            output_path: str | None = None,
+            format: str | None = None,
+            start_seconds: float | None = None,
+            duration_seconds: float | None = None,
+            max_width: int | None = None,
+            crf: int = 23,
+            preset: str = "medium",
+            extract_audio: bool = False,
+    ) -> str:
+        return self.media_tool.video_convert(
+            path,
+            output_path=output_path,
+            format=format,
+            start_seconds=start_seconds,
+            duration_seconds=duration_seconds,
+            max_width=max_width,
+            crf=crf,
+            preset=preset,
+            extract_audio=extract_audio,
+        )
 
     def list_dir(self, path):
         # 统一目录列表输出格式，显式区分文件与目录。

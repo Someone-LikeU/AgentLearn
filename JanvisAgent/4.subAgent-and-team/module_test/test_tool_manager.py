@@ -218,6 +218,55 @@ class ToolManagerLocalToolsTest(unittest.TestCase):
             out = self.tm.available_functions[ToolNameConstant.WEB_SEARCH](query="test", max_results=1)
         self.assertEqual(out, "总结结果")
 
+    def test_media_tools_registered_and_probe_image(self):
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as tmp:
+            image_path = Path(tmp) / "sample.png"
+            Image.new("RGB", (32, 16), color=(255, 0, 0)).save(image_path)
+
+            probe = json.loads(self.tm.available_functions[ToolNameConstant.MEDIA_PROBE](path=str(image_path)))
+            self.assertTrue(probe["ok"])
+            self.assertEqual(probe["image"]["width"], 32)
+            self.assertEqual(probe["image"]["height"], 16)
+
+            models = json.loads(self.tm.available_functions[ToolNameConstant.GET_VISION_MODELS]())
+            self.assertTrue(models["ok"])
+            self.assertIn("gemma4:e4b", models["models"])
+
+            with patch.object(
+                self.tm.media_tool,
+                "_describe_with_ollama_vision",
+                return_value={"ok": True, "backend": "local_ollama", "model": "gemma4:e4b", "text": "red image"},
+            ):
+                described = json.loads(
+                    self.tm.available_functions[ToolNameConstant.IMAGE_DESCRIBE](
+                        path=str(image_path),
+                        prompt="describe",
+                        model="gemma4:e4b",
+                    )
+                )
+            self.assertTrue(described["ok"])
+            self.assertEqual(described["backend"], "local_ollama")
+            self.assertEqual(described["text"], "red image")
+
+    def test_audio_transcribe_defaults_to_txt_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audio_path = Path(tmp) / "empty.wav"
+            audio_path.write_bytes(b"")
+
+            with patch.object(
+                self.tm.media_tool,
+                "_run_audio_transcribe_worker",
+                return_value={"ok": True, "output_format": "txt", "model": "base", "content": "hello"},
+            ) as worker:
+                result = json.loads(self.tm.available_functions[ToolNameConstant.AUDIO_TRANSCRIBE](path=str(audio_path)))
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["output_format"], "txt")
+        self.assertEqual(result["model"], "base")
+        self.assertEqual(worker.call_args.kwargs["model_name"], "base")
+
     def test_web_search_fallback_to_bing(self):
         duck_search = Mock(side_effect=TimeoutError("timed out"))
         bing_search = Mock(
