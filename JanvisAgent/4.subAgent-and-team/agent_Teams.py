@@ -2536,6 +2536,7 @@ class Agent:
             ("model add", "新增模型配置并测试"),
             ("model <name|编号>", "切换到指定模型"),
             ("tools", "列出当前可用工具"),
+            ("skills / skill_list", "列出当前已有 skill"),
             ("compact", "压缩当前会话上下文"),
             ("memory compact", "整理长期记忆索引"),
             ("memory summarize sessions", "整理所有历史会话提炼长期记忆"),
@@ -2589,6 +2590,28 @@ class Agent:
 
         if not has_tools:
             self.console.print("[yellow]当前没有可用工具。[/]")
+
+    def _print_available_skills(self):
+        """
+        打印当前已有 skill 列表。
+        :return:
+        """
+        skills = self._load_skill_meta_infos()
+        if not skills:
+            self.console.print("[yellow]当前没有可用 skill。[/]")
+            return
+
+        skill_table = Table.grid(padding=(0, 2))
+        skill_table.add_column(justify="left", no_wrap=True)
+        skill_table.add_column(justify="left")
+        # 只展示元信息，避免把完整 SKILL.md 内容刷到终端。
+        for skill in sorted(skills, key=lambda item: str(item.get("name") or "")):
+            name = skill.get("name") or "UNKNOWN_SKILL"
+            description = skill.get("description") or "暂无描述"
+            skill_table.add_row(f"[bold cyan]{name}[/]", f"[dim]{description}[/]")
+
+        self.console.print("[bold]当前已有 Skills[/]")
+        self.console.print(skill_table)
 
     def _print_runtime_status(self):
         """
@@ -2820,6 +2843,8 @@ class Agent:
             "model": self._handle_cmd_model_show_current,
             "model add": self._handle_cmd_model_add,
             "tools": self._handle_cmd_tools,
+            "skills": self._handle_cmd_skill_list,
+            "skill_list": self._handle_cmd_skill_list,
             "clear": self._handle_cmd_clear_screen,
             "campact": self._handle_cmd_compact_history,
             "compact": self._handle_cmd_compact_history,
@@ -2853,6 +2878,11 @@ class Agent:
     def _handle_cmd_tools(self, _confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
         # 展示当前已加载的本地工具和 MCP 工具。
         self._print_available_tools()
+        return True, False
+
+    def _handle_cmd_skill_list(self, _confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
+        # 展示当前 skills 目录下已声明的 skill 名称和描述。
+        self._print_available_skills()
         return True, False
 
     def _handle_cmd_session_help(self, _confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:

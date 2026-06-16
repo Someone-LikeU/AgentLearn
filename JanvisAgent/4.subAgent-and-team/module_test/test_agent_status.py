@@ -75,6 +75,40 @@ class AgentStatusTest(unittest.TestCase):
 
         self.assertEqual(agent._used_token, 123)
 
+    def test_skill_list_commands_print_skill_meta(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = io.StringIO()
+            agent = self._agent(output)
+            skills_dir = Path(tmp) / "skills"
+            (skills_dir / "alpha").mkdir(parents=True)
+            (skills_dir / "beta").mkdir()
+            (skills_dir / "alpha" / "SKILL.md").write_text(
+                "---\nname: alpha\ndescription: Alpha skill description\n---\n# Alpha\n",
+                encoding="utf-8",
+            )
+            (skills_dir / "beta" / "SKILL.md").write_text(
+                "---\nname: beta\ndescription: Beta skill description\n---\n# Beta\n",
+                encoding="utf-8",
+            )
+            agent.skills_dir = str(skills_dir)
+            agent._skills_cache = {}
+
+            handled, should_exit = agent._handle_user_command("skills", ())
+            self.assertTrue(handled)
+            self.assertFalse(should_exit)
+            text = output.getvalue()
+            self.assertIn("alpha", text)
+            self.assertIn("Alpha skill description", text)
+            self.assertIn("beta", text)
+            self.assertIn("Beta skill description", text)
+
+            output.seek(0)
+            output.truncate(0)
+            handled, should_exit = agent._handle_user_command("skill_list", ())
+            self.assertTrue(handled)
+            self.assertFalse(should_exit)
+            self.assertIn("Alpha skill description", output.getvalue())
+
     def test_status_shows_zero_after_only_task_is_deleted(self):
         with tempfile.TemporaryDirectory() as tmp:
             output = io.StringIO()
