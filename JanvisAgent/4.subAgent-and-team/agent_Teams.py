@@ -1417,19 +1417,63 @@ class Agent:
         middle_size = max(1, int(len(old_messages) * self._MIDDLE_COMPACT_RATIO))
         return old_messages[-middle_size:]
 
-    def _compact_messages(self, tools=None):
-        if not self._should_compact_messages(tools):
+    def _message_records_for_current_context(self):
+        if self.session_manager is not None and self.session_manager.current_session_id:
+            records = self.session_manager.rebuild_message_records(self.session_manager.current_session_id)
+            if len(records) == len(self.messages):
+                current_records = []
+                for index, record in enumerate(records):
+                    item = dict(record)
+                    item["message"] = self.messages[index]
+                    current_records.append(item)
+                return current_records
+        return [{"message": message} for message in self.messages]
+
+    @staticmethod
+    def _covered_turn_ids_from_records(records: list[dict[str, Any]]) -> list[str]:
+        covered_turn_ids = []
+        for record in records:
+            for turn_id in [record.get("turn_id"), *(record.get("covered_turn_ids") or [])]:
+                if turn_id and turn_id not in covered_turn_ids:
+                    covered_turn_ids.append(turn_id)
+        return covered_turn_ids
+
+    def _record_compacted_context(
+            self,
+            message_records: list[dict[str, Any]],
+            covered_turn_ids: list[str],
+            context_tokens: int,
+            reason: str,
+    ) -> None:
+        if self.session_manager is None or self.session_manager.current_session_id is None:
             return
+        try:
+            self.session_manager.record_conversation_compacted(
+                message_records=message_records,
+                covered_turn_ids=covered_turn_ids,
+                context_tokens=context_tokens,
+                reason=reason,
+            )
+        except Exception as error:
+            self.console.print(f"[yellow]压缩快照写入失败：{error}[/]")
+
+    def _compact_messages(self, tools=None, force: bool = False, reason: str = "auto") -> bool:
+        if not force and not self._should_compact_messages(tools):
+            return False
 
         system_msg = self.messages[0]
         recent_start = self._find_recent_start()
+        current_records = self._message_records_for_current_context()
         old_messages = self.messages[1: recent_start]
         recent_messages = self.messages[recent_start:]
         if not old_messages:
-            return
+            return False
 
         archived_task_reference = self._load_archived_task_reference_for_compaction()
         summary_messages = self._select_messages_for_compaction_summary(old_messages, recent_start)
+        old_records = current_records[1: recent_start]
+        recent_records = current_records[recent_start:] if len(current_records) == len(self.messages) else []
+        covered_turn_ids = self._covered_turn_ids_from_records(old_records)
         old_text = (
             "Archived task references for older completed tasks:\n"
             f"{archived_task_reference}\n\n"
@@ -1452,19 +1496,41 @@ class Agent:
         self._update_and_record_response_usage(summary_response, "compaction_summary")
         summary = summary_response.choices[0].message.content
 
+        archived_reference_message = {
+            "role": "user",
+            "content": (
+                "[Archived completed-task references]\n"
+                f"{archived_task_reference}\n\n"
+                "For details from an archived task, call LOAD_FULL_MEMORY_CONTEXT with the task_id."
+            ),
+        }
+        summary_message = {
+            "role": "user",
+            "content": load_prompt("conversation_compaction_summary_message.md", summary=summary),
+        }
         self.messages = [
             system_msg,
-            {
-                "role": "user",
-                "content": (
-                    "[Archived completed-task references]\n"
-                    f"{archived_task_reference}\n\n"
-                    "For details from an archived task, call LOAD_FULL_MEMORY_CONTEXT with the task_id."
-                ),
-            },
-            {"role": "user", "content": load_prompt("conversation_compaction_summary_message.md", summary=summary)},
+            archived_reference_message,
+            summary_message,
             *recent_messages
         ]
+        compacted_records = [
+            {"message": system_msg},
+            {
+                "message": archived_reference_message,
+                "covered_turn_ids": covered_turn_ids,
+                "synthetic": True,
+            },
+            {
+                "message": summary_message,
+                "covered_turn_ids": covered_turn_ids,
+                "synthetic": True,
+            },
+        ]
+        compacted_records.extend(recent_records or [{"message": message} for message in recent_messages])
+        context_tokens = self._ensure_token_tracker().set_estimated_usage(self.messages, self._all_tools)
+        self._record_compacted_context(compacted_records, covered_turn_ids, context_tokens, reason)
+        return True
 
     def _tool_call_failure_key(self, task: ToolCallTask) -> tuple[str, str]:
         """生成工具失败去重 key，用于识别同一工具和同一参数的连续失败。"""
@@ -1582,6 +1648,40 @@ class Agent:
         if cause is not None:
             return self._leaf_tool_exception(cause, seen)
         return error
+
+    def _tool_status_for_log(self, function_response: Any) -> str:
+        if isinstance(function_response, dict):
+            if function_response.get("ok") is False:
+                return str(function_response.get("error_type") or "failed")
+            return "ok"
+        text = str(function_response or "")
+        if "[Tool timeout]" in text or "timed out" in text.lower():
+            return "tool_timeout"
+        if self._is_tool_call_failure(function_response):
+            return "failed"
+        return "ok"
+
+    def _tool_timeout_for_log(self, tool_name: str) -> Any:
+        try:
+            profile = self._tool_manager.get_tool_runtime_profile(tool_name)
+        except Exception:
+            return None
+        return profile.get("timeout_seconds")
+
+    def _print_tool_timing(
+            self,
+            task: ToolCallTask,
+            started_at: float,
+            function_response: Any,
+            timeout_seconds: Any = None,
+    ) -> None:
+        elapsed_seconds = time.perf_counter() - started_at
+        status = self._tool_status_for_log(function_response)
+        timeout_text = f", timeout: {timeout_seconds:g}s" if isinstance(timeout_seconds, (int, float)) else ""
+        print(
+            f"[Tool result] tool name: {task.function_name}, "
+            f"status: {status}, elapsed: {self._format_elapsed_time(elapsed_seconds)}{timeout_text}"
+        )
 
     def _request_next_model_message(self, active_tools):
         # 模型调用前先做上下文压缩，避免把压缩逻辑散在主循环里。
@@ -2064,6 +2164,8 @@ class Agent:
                 task.function_args["_argument_error"],
                 retryable=False,
             )
+        started_at = time.perf_counter()
+        timeout_seconds = self._tool_timeout_for_log(task.function_name)
         try:
             print(f"[Tool call] tool name: {task.function_name}, tool arguments: {task.raw_arguments}")
             spinner = self._start_spinner(preset=Spinner.TOOL, tool_name=task.function_name) \
@@ -2073,16 +2175,19 @@ class Agent:
             finally:
                 if spinner is not None:
                     spinner.stop()
+            self._print_tool_timing(task, started_at, result, timeout_seconds)
             return result
         except BaseException as error:
             if isinstance(error, (KeyboardInterrupt, SystemExit)):
                 raise
-            return self._format_tool_failure_response(
+            function_response = self._format_tool_failure_response(
                 task,
                 "tool_exception",
                 f"Error when calling '{task.function_name}': {self._summarize_tool_exception_for_model(error)}",
                 retryable=True,
             )
+            self._print_tool_timing(task, started_at, function_response, timeout_seconds)
+            return function_response
 
     def _build_system_prompt(self):
         from prompt_builder import build_system_prompt
@@ -3254,8 +3359,11 @@ class Agent:
 
     def _handle_cmd_compact_history(self, _confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
         # 主动触发当前会话历史压缩。
-        self._compact_messages(self._all_tools)
-        self.console.print("[dim]已执行会话压缩检查（达到阈值时会执行压缩）。[/]")
+        compacted = self._compact_messages(self._all_tools, force=True, reason="manual")
+        if compacted:
+            self.console.print("[dim]已压缩并持久化当前会话上下文。[/]")
+        else:
+            self.console.print("[dim]当前没有可压缩的历史上下文。[/]")
         return True, False
 
     def _handle_cmd_memory_compact(self, _confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
@@ -3338,13 +3446,13 @@ class Agent:
         return candidates
 
     def _handle_cmd_status(self, _confirm_choice: tuple[str, ...]) -> tuple[bool, bool]:
-        # 展示当前模型状态，优先使用 session 中最新 assistant_response 的真实 usage。
+        # 展示当前模型状态，优先使用 session 中最新可恢复的上下文 token。
         tracker = self._ensure_token_tracker()
         session_usage = self._restore_session_usage_summary()
-        if session_usage.get("has_real_usage"):
+        if session_usage.get("has_context_usage") or session_usage.get("has_real_usage"):
             used_tokens = int(session_usage.get("total_tokens") or 0)
         else:
-            # status 只展示模型 API 返回的真实 usage；还没有模型调用时消耗为 0。
+            # 还没有模型调用或压缩快照时，当前会话上下文消耗按 0 展示。
             used_tokens = 0
         # status 命令展示 token 使用柱状图，直观反馈使用率。
         usage_ratio = tracker.calculate_usage_ratio(used_tokens, self._max_context_tokens)

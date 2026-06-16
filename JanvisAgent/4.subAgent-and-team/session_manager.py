@@ -218,6 +218,47 @@ class SessionManager:
             event["metadata"] = metadata
         return self.append_event(event)
 
+    def record_conversation_compacted(
+        self,
+        message_records: list[dict[str, Any]],
+        covered_turn_ids: list[str] | None = None,
+        context_tokens: int | None = None,
+        reason: str = "auto",
+    ) -> dict[str, Any]:
+        """
+        持久化一次短期上下文压缩快照。
+        :param message_records: 压缩后的模型上下文记录
+        :param covered_turn_ids: 被摘要覆盖的历史 turn_id
+        :param context_tokens: 压缩后上下文 token 估算值
+        :param reason: 压缩触发原因
+        :return: 实际写入的事件
+        """
+        normalized_records = []
+        for record in message_records or []:
+            message = self._compact_message_for_storage(record.get("message"))
+            if not message:
+                continue
+            item = {"message": message}
+            if record.get("turn_id"):
+                item["turn_id"] = record.get("turn_id")
+            covered = [turn_id for turn_id in (record.get("covered_turn_ids") or []) if turn_id]
+            if covered:
+                item["covered_turn_ids"] = covered
+            if record.get("synthetic"):
+                item["synthetic"] = True
+            normalized_records.append(item)
+
+        event = {
+            "event": "conversation_compacted",
+            "compacted_at": self._now(),
+            "reason": reason or "auto",
+            "message_records": normalized_records,
+            "covered_turn_ids": [turn_id for turn_id in (covered_turn_ids or []) if turn_id],
+        }
+        if isinstance(context_tokens, int) and context_tokens >= 0:
+            event["context_tokens"] = context_tokens
+        return self.append_event(event)
+
     def calculate_session_usage(self, session_id: str | None = None, include_deleted: bool = False) -> dict[str, Any]:
         """
         读取当前主会话上下文的真实模型 usage。
@@ -235,6 +276,22 @@ class SessionManager:
 
         deleted_turn_ids = self._deleted_turn_ids(events)
         latest_delete_index = self._latest_turn_deleted_index(events)
+        compact_index = self._latest_valid_compaction_index(events, deleted_turn_ids)
+        if compact_index >= 0:
+            usage_start_index = max(compact_index, latest_delete_index)
+            post_compact_summary = self._assistant_usage_summary(
+                events[usage_start_index + 1:],
+                deleted_turn_ids=deleted_turn_ids,
+            )
+            if post_compact_summary.get("has_real_usage"):
+                return post_compact_summary
+            if latest_delete_index > compact_index:
+                summary["is_stale"] = True
+                return summary
+            compact_summary = self._compaction_usage_summary(events[compact_index])
+            if compact_summary.get("has_context_usage"):
+                return compact_summary
+
         if latest_delete_index < 0:
             return self._assistant_usage_summary(events, deleted_turn_ids=deleted_turn_ids)
 
@@ -666,36 +723,30 @@ class SessionManager:
         :param session_id: 会话 id
         :return: OpenAI messages
         """
+        return [record["message"] for record in self.rebuild_message_records(session_id)]
+
+    def rebuild_message_records(self, session_id: str) -> list[dict[str, Any]]:
+        """
+        从 session 事件重建带来源信息的 messages。
+        :param session_id: 会话 id
+        :return: 带 message/turn_id 的上下文记录
+        """
         events = self._events_after_latest_session_clear(self.load_session(session_id))
         deleted_turn_ids = self._deleted_turn_ids(events)
-        messages: list[dict[str, Any]] = []
+        compact_index = self._latest_valid_compaction_index(events, deleted_turn_ids)
+        if compact_index >= 0:
+            return self._rebuild_message_records_from_compaction(events, compact_index, deleted_turn_ids)
+
+        records: list[dict[str, Any]] = []
         for event in events:
             turn_id = event.get("turn_id")
             # 被软删除的用户任务整轮跳过，包含其 user、assistant 和 tool 消息。
             if turn_id in deleted_turn_ids:
                 continue
-            event_type = event.get("event")
-            if event_type == "message":
-                role = event.get("role")
-                # 普通 message 只恢复 system/user；assistant/tool 使用更具体的事件恢复。
-                if role in {"system", "user"}:
-                    messages.append({"role": role, "content": event.get("content")})
-            elif event_type == "assistant_message":
-                message = {"role": "assistant", "content": event.get("content")}
-                # 只有真实存在 tool_calls 字段时才回填，避免无工具回复多出 None 字段。
-                if "tool_calls" in event:
-                    message["tool_calls"] = event.get("tool_calls")
-                messages.append(message)
-            elif event_type == "tool_result":
-                # tool 消息必须保留 tool_call_id，OpenAI 上下文校验依赖这个字段。
-                messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": event.get("tool_call_id"),
-                        "content": event.get("content"),
-                    }
-                )
-        return messages
+            record = self._message_record_from_event(event)
+            if record:
+                records.append(record)
+        return records
 
     def list_tasks(self, session_id: str | None = None) -> list[dict[str, Any]]:
         """
@@ -828,6 +879,108 @@ class SessionManager:
             return None
         return number if number >= 0 else None
 
+    @classmethod
+    def _compact_message_for_storage(cls, message: Any) -> dict[str, Any] | None:
+        normalized = cls.normalize_message(message)
+        role = normalized.get("role")
+        if not role:
+            return None
+        stored = {"role": role, "content": normalized.get("content") or ""}
+        tool_calls = normalized.get("tool_calls")
+        if tool_calls is not None:
+            stored["tool_calls"] = tool_calls
+        tool_call_id = normalized.get("tool_call_id")
+        if tool_call_id is not None:
+            stored["tool_call_id"] = tool_call_id
+        return stored
+
+    @staticmethod
+    def _message_from_event(event: dict[str, Any]) -> dict[str, Any] | None:
+        event_type = event.get("event")
+        if event_type == "message":
+            role = event.get("role")
+            # 普通 message 只恢复 system/user；assistant/tool 使用更具体的事件恢复。
+            if role in {"system", "user"}:
+                return {"role": role, "content": event.get("content")}
+        elif event_type == "assistant_message":
+            message = {"role": "assistant", "content": event.get("content") or ""}
+            # 只有真实存在 tool_calls 字段时才回填，避免无工具回复多出 None 字段。
+            if "tool_calls" in event:
+                message["tool_calls"] = event.get("tool_calls")
+            return message
+        elif event_type == "tool_result":
+            # tool 消息必须保留 tool_call_id，OpenAI 上下文校验依赖这个字段。
+            return {
+                "role": "tool",
+                "tool_call_id": event.get("tool_call_id"),
+                "content": event.get("content"),
+            }
+        return None
+
+    def _message_record_from_event(self, event: dict[str, Any]) -> dict[str, Any] | None:
+        message = self._message_from_event(event)
+        if not message:
+            return None
+        record = {"message": message}
+        if event.get("turn_id"):
+            record["turn_id"] = event.get("turn_id")
+        return record
+
+    def _rebuild_message_records_from_compaction(
+        self,
+        events: list[dict[str, Any]],
+        compact_index: int,
+        deleted_turn_ids: set[str],
+    ) -> list[dict[str, Any]]:
+        compact_event = events[compact_index]
+        records: list[dict[str, Any]] = []
+        for record in compact_event.get("message_records") or []:
+            if record.get("turn_id") in deleted_turn_ids:
+                continue
+            message = self._compact_message_for_storage(record.get("message"))
+            if message:
+                item = {"message": message}
+                if record.get("turn_id"):
+                    item["turn_id"] = record.get("turn_id")
+                covered = [turn_id for turn_id in (record.get("covered_turn_ids") or []) if turn_id]
+                if covered:
+                    item["covered_turn_ids"] = covered
+                if record.get("synthetic"):
+                    item["synthetic"] = True
+                records.append(item)
+
+        for event in events[compact_index + 1:]:
+            turn_id = event.get("turn_id")
+            if turn_id in deleted_turn_ids:
+                continue
+            record = self._message_record_from_event(event)
+            if record:
+                records.append(record)
+        return records
+
+    def _latest_valid_compaction_index(self, events: list[dict[str, Any]], deleted_turn_ids: set[str]) -> int:
+        for index in range(len(events) - 1, -1, -1):
+            event = events[index]
+            if event.get("event") != "conversation_compacted":
+                continue
+            deleted_after = self._turns_deleted_after_index(events, index)
+            covered_turn_ids = set(event.get("covered_turn_ids") or [])
+            if covered_turn_ids & deleted_after:
+                # 摘要覆盖的旧任务被删除后，不能继续使用可能包含该任务内容的摘要。
+                continue
+            if not (event.get("message_records") or []):
+                continue
+            return index
+        return -1
+
+    @staticmethod
+    def _turns_deleted_after_index(events: list[dict[str, Any]], index: int) -> set[str]:
+        deleted_turn_ids = set()
+        for event in events[index + 1:]:
+            if event.get("event") == "turn_deleted" and event.get("turn_id"):
+                deleted_turn_ids.add(event.get("turn_id"))
+        return deleted_turn_ids
+
     def _resolve_session_path(self, session_id: str) -> Path | None:
         # 当前会话优先返回内存中的路径，避免刚创建但索引尚未重读时查找失败。
         if self.current_session_id == session_id and self.current_session_path is not None:
@@ -940,7 +1093,20 @@ class SessionManager:
             "response_count": 0,
             "has_real_usage": False,
             "is_stale": False,
+            "has_context_usage": False,
+            "usage_source": None,
         }
+
+    def _compaction_usage_summary(self, event: dict[str, Any]) -> dict[str, Any]:
+        summary = self._empty_usage_summary()
+        context_tokens = self._normalize_token_value(event.get("context_tokens"))
+        if context_tokens is None:
+            return summary
+        summary["prompt_tokens"] = context_tokens
+        summary["total_tokens"] = context_tokens
+        summary["has_context_usage"] = True
+        summary["usage_source"] = "conversation_compacted"
+        return summary
 
     def _assistant_usage_summary(
             self,
@@ -983,6 +1149,8 @@ class SessionManager:
             summary["total_tokens"] = latest_usage.get("total_tokens", prompt_tokens + completion_tokens)
             summary["response_count"] = assistant_response_count
             summary["has_real_usage"] = True
+            summary["has_context_usage"] = True
+            summary["usage_source"] = "assistant_response"
         return summary
 
     @staticmethod

@@ -135,6 +135,165 @@ class SessionManagerTest(unittest.TestCase):
             self.assertEqual(usage["prompt_tokens"], 20)
             self.assertEqual(usage["total_tokens"], 22)
 
+    def test_conversation_compaction_rebuilds_messages_without_affecting_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = SessionManager(project_root=tmp)
+            session_id = manager.start_session("test-model")
+            first_turn_id = manager.create_turn_id()
+            second_turn_id = manager.create_turn_id()
+
+            manager.append_message({"role": "system", "content": "system prompt"})
+            manager.append_message(
+                {"role": "user", "content": "第一个任务"},
+                turn_id=first_turn_id,
+                metadata={"is_task_entry": True},
+            )
+            manager.append_message({"role": "assistant", "content": "第一个结果"}, turn_id=first_turn_id)
+            manager.append_message(
+                {"role": "user", "content": "第二个任务"},
+                turn_id=second_turn_id,
+                metadata={"is_task_entry": True},
+            )
+            manager.append_message({"role": "assistant", "content": "第二个结果"}, turn_id=second_turn_id)
+
+            manager.record_conversation_compacted(
+                message_records=[
+                    {"message": {"role": "system", "content": "system prompt"}},
+                    {
+                        "message": {"role": "user", "content": "第一个任务摘要"},
+                        "covered_turn_ids": [first_turn_id],
+                        "synthetic": True,
+                    },
+                    {"message": {"role": "user", "content": "第二个任务"}, "turn_id": second_turn_id},
+                    {"message": {"role": "assistant", "content": "第二个结果"}, "turn_id": second_turn_id},
+                ],
+                covered_turn_ids=[first_turn_id],
+                context_tokens=42,
+                reason="manual",
+            )
+
+            messages = manager.rebuild_messages(session_id)
+            tasks = manager.list_tasks(session_id)
+            usage = manager.calculate_session_usage(session_id)
+
+            self.assertEqual([message["content"] for message in messages], ["system prompt", "第一个任务摘要", "第二个任务", "第二个结果"])
+            self.assertEqual([task["content"] for task in tasks], ["第一个任务", "第二个任务"])
+            self.assertEqual(usage["total_tokens"], 42)
+            self.assertTrue(usage["has_context_usage"])
+            self.assertEqual(usage["usage_source"], "conversation_compacted")
+
+    def test_assistant_usage_after_compaction_overrides_compacted_context_tokens(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = SessionManager(project_root=tmp)
+            session_id = manager.start_session("test-model")
+            turn_id = manager.create_turn_id()
+
+            manager.append_message({"role": "system", "content": "system prompt"})
+            manager.append_message(
+                {"role": "user", "content": "任务"},
+                turn_id=turn_id,
+                metadata={"is_task_entry": True},
+            )
+            manager.record_conversation_compacted(
+                message_records=[
+                    {"message": {"role": "system", "content": "system prompt"}},
+                    {"message": {"role": "user", "content": "任务摘要"}, "covered_turn_ids": [turn_id]},
+                ],
+                covered_turn_ids=[turn_id],
+                context_tokens=42,
+                reason="manual",
+            )
+            manager.record_response_usage(
+                turn_id=turn_id,
+                usage={"prompt_tokens": 100, "completion_tokens": 5, "total_tokens": 105},
+                response_kind="assistant_response",
+            )
+
+            usage = manager.calculate_session_usage(session_id)
+
+            self.assertEqual(usage["total_tokens"], 105)
+            self.assertTrue(usage["has_real_usage"])
+            self.assertEqual(usage["usage_source"], "assistant_response")
+
+    def test_conversation_compaction_filters_deleted_recent_turn(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = SessionManager(project_root=tmp)
+            session_id = manager.start_session("test-model")
+            first_turn_id = manager.create_turn_id()
+            second_turn_id = manager.create_turn_id()
+
+            manager.append_message({"role": "system", "content": "system prompt"})
+            manager.append_message(
+                {"role": "user", "content": "第一个任务"},
+                turn_id=first_turn_id,
+                metadata={"is_task_entry": True},
+            )
+            manager.append_message(
+                {"role": "user", "content": "第二个任务"},
+                turn_id=second_turn_id,
+                metadata={"is_task_entry": True},
+            )
+            manager.record_conversation_compacted(
+                message_records=[
+                    {"message": {"role": "system", "content": "system prompt"}},
+                    {
+                        "message": {"role": "user", "content": "第一个任务摘要"},
+                        "covered_turn_ids": [first_turn_id],
+                        "synthetic": True,
+                    },
+                    {"message": {"role": "user", "content": "第二个任务"}, "turn_id": second_turn_id},
+                ],
+                covered_turn_ids=[first_turn_id],
+                reason="manual",
+            )
+            manager.mark_turn_deleted(second_turn_id)
+
+            messages = manager.rebuild_messages(session_id)
+            tasks = manager.list_tasks(session_id)
+
+            self.assertEqual([message["content"] for message in messages], ["system prompt", "第一个任务摘要"])
+            self.assertEqual([task["content"] for task in tasks], ["第一个任务"])
+
+    def test_conversation_compaction_invalidates_when_deleted_turn_is_in_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = SessionManager(project_root=tmp)
+            session_id = manager.start_session("test-model")
+            first_turn_id = manager.create_turn_id()
+            second_turn_id = manager.create_turn_id()
+
+            manager.append_message({"role": "system", "content": "system prompt"})
+            manager.append_message(
+                {"role": "user", "content": "第一个任务"},
+                turn_id=first_turn_id,
+                metadata={"is_task_entry": True},
+            )
+            manager.append_message({"role": "assistant", "content": "第一个结果"}, turn_id=first_turn_id)
+            manager.append_message(
+                {"role": "user", "content": "第二个任务"},
+                turn_id=second_turn_id,
+                metadata={"is_task_entry": True},
+            )
+            manager.record_conversation_compacted(
+                message_records=[
+                    {"message": {"role": "system", "content": "system prompt"}},
+                    {
+                        "message": {"role": "user", "content": "第一个任务摘要"},
+                        "covered_turn_ids": [first_turn_id],
+                        "synthetic": True,
+                    },
+                    {"message": {"role": "user", "content": "第二个任务"}, "turn_id": second_turn_id},
+                ],
+                covered_turn_ids=[first_turn_id],
+                reason="manual",
+            )
+            manager.mark_turn_deleted(first_turn_id)
+
+            messages = manager.rebuild_messages(session_id)
+            tasks = manager.list_tasks(session_id)
+
+            self.assertEqual([message["content"] for message in messages], ["system prompt", "第二个任务"])
+            self.assertEqual([task["content"] for task in tasks], ["第二个任务"])
+
     def test_response_usage_uses_latest_assistant_response_for_context(self):
         with tempfile.TemporaryDirectory() as tmp:
             manager = SessionManager(project_root=tmp)

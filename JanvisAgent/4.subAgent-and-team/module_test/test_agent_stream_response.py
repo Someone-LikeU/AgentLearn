@@ -200,7 +200,8 @@ class AgentStreamResponseTest(unittest.TestCase):
 			function_args={"query": "x"},
 		)
 
-		with redirect_stdout(io.StringIO()):
+		output = io.StringIO()
+		with redirect_stdout(output):
 			response = agent._invoke_tool_task(task)
 
 		self.assertFalse(response["ok"])
@@ -208,6 +209,8 @@ class AgentStreamResponseTest(unittest.TestCase):
 		self.assertTrue(response["retryable"])
 		self.assertIn("RuntimeError: no running event loop", response["message"])
 		self.assertNotIn("Traceback", response["message"])
+		self.assertIn("[Tool result] tool name: tavily_search", output.getvalue())
+		self.assertIn("status: tool_exception", output.getvalue())
 
 	def test_tool_call_chunks_are_merged_in_order(self):
 		agent = self._agent()

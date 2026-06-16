@@ -23,6 +23,16 @@ _ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 _OPENAI_TOOL_NAME_PATTERN = re.compile(r"[^A-Za-z0-9_-]")
 _TOOL_CALL_MAX_ATTEMPTS = 3
 _TOOL_CALL_RETRY_DELAY_SECONDS = 0.8
+_DEFAULT_EXTERNAL_TOOL_TIMEOUT_SECONDS = 30
+_EXTERNAL_TOOL_TIMEOUT_SECONDS = {
+    ("exa", "web_search_exa"): 30,
+    ("exa", "web_fetch_exa"): 60,
+    ("tavily", "tavily_search"): 30,
+    ("tavily", "tavily_extract"): 60,
+    ("tavily", "tavily_crawl"): 90,
+    ("tavily", "tavily_map"): 60,
+    ("tavily", "tavily_research"): 120,
+}
 _TAVILY_SEARCH_REST_URL = "https://api.tavily.com/search"
 _NOISY_MCP_TRANSPORT_LOGGERS = ("mcp.client.streamable_http",)
 _RETRYABLE_ERROR_NAMES = {
@@ -47,6 +57,10 @@ def _suppress_noisy_mcp_transport_logs() -> None:
 
 
 _suppress_noisy_mcp_transport_logs()
+
+
+class ExternalMCPToolTimeoutError(TimeoutError):
+    """外部 MCP 工具超过 Agent 侧硬超时。"""
 
 
 @dataclass
@@ -167,11 +181,23 @@ class ExternalMCPManager:
             raise ValueError(f"Unknown external MCP tool '{name}'")
         # Agent 传入的是公开工具名，真正调用远端时必须还原成该 MCP Server 的原始工具名。
         last_error: Exception | None = None
+        started_at = time.perf_counter()
+        timeout_seconds = self._tool_timeout_seconds(route.server, route.raw_name)
         for attempt in range(1, _TOOL_CALL_MAX_ATTEMPTS + 1):
             try:
-                return self._run_async(self._call_tool_on_server(route.server, route.raw_name, arguments))
+                result = self._run_async(
+                    self._call_tool_on_server_with_timeout(
+                        route.server,
+                        route.raw_name,
+                        arguments,
+                        timeout_seconds,
+                    )
+                )
+                return self._attach_call_metadata(result, started_at, attempt, timeout_seconds)
             except Exception as error:
                 last_error = error
+                if isinstance(error, ExternalMCPToolTimeoutError):
+                    break
                 if attempt >= _TOOL_CALL_MAX_ATTEMPTS or not self._is_retryable_external_error(error):
                     break
                 # 远程 MCP 的 streamable HTTP 连接偶发被提前关闭时，短暂等待后重建 session。
@@ -180,10 +206,14 @@ class ExternalMCPManager:
                 last_error is not None
                 and route.server.name == "tavily"
                 and route.raw_name == "tavily_search"
-                and self._is_retryable_external_error(last_error)
+                and (
+                    isinstance(last_error, ExternalMCPToolTimeoutError)
+                    or self._is_retryable_external_error(last_error)
+                )
         ):
             try:
-                return self._call_tavily_search_rest(route.server, arguments, last_error)
+                result = self._call_tavily_search_rest(route.server, arguments, last_error)
+                return self._attach_call_metadata(result, started_at, attempt, timeout_seconds)
             except Exception as fallback_error:
                 return self._format_call_error(
                     route.server,
@@ -191,12 +221,16 @@ class ExternalMCPManager:
                     fallback_error,
                     attempts=attempt,
                     fallback_error=last_error,
+                    started_at=started_at,
+                    timeout_seconds=timeout_seconds,
                 )
         return self._format_call_error(
             route.server,
             route.raw_name,
             last_error or RuntimeError("External MCP tool call failed"),
             attempts=attempt,
+            started_at=started_at,
+            timeout_seconds=timeout_seconds,
         )
 
     def get_tool_counts(self) -> dict[str, int]:
@@ -212,6 +246,10 @@ class ExternalMCPManager:
                 "is_read_only": True,
                 "is_destructive": False,
                 "side_effect_scope": "network",
+                "timeout_seconds": self._tool_timeout_seconds(
+                    self._tool_routes[tool["name"]].server,
+                    self._tool_routes[tool["name"]].raw_name,
+                ),
             }
             for tool in self._tools
         }
@@ -330,16 +368,21 @@ class ExternalMCPManager:
         self._write_tool_cache(cache)
 
     @asynccontextmanager
-    async def _open_session(self, server: ExternalMCPServerConfig) -> AsyncIterator[ClientSession]:
+    async def _open_session(
+            self,
+            server: ExternalMCPServerConfig,
+            timeout_seconds: float | None = None,
+    ) -> AsyncIterator[ClientSession]:
         # 每次连接前解析环境变量，保证用户运行前新设置的 API Key 能立即生效。
         runtime_server = self._resolve_runtime_config(server)
+        request_timeout = timeout_seconds or runtime_server.timeout_seconds
         if runtime_server.transport in {"streamable_http", "http"}:
             if not runtime_server.url:
                 raise ValueError(f"External MCP server '{server.name}' missing url")
             # 远程 MCP 走官方 streamable HTTP transport。
             http_client = create_mcp_http_client(
                 headers=runtime_server.headers or None,
-                timeout=httpx.Timeout(runtime_server.timeout_seconds, read=runtime_server.timeout_seconds),
+                timeout=httpx.Timeout(request_timeout, read=request_timeout),
             )
             async with http_client:
                 async with streamable_http_client(
@@ -390,8 +433,9 @@ class ExternalMCPManager:
             server: ExternalMCPServerConfig,
             raw_name: str,
             arguments: dict[str, Any],
+            timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
-        async with self._open_session(server) as session:
+        async with self._open_session(server, timeout_seconds=timeout_seconds) as session:
             result = await session.call_tool(raw_name, arguments or {})
 
         # MCP 返回内容可能包含 text/image/resource，统一转成可 JSON 序列化的数据。
@@ -402,9 +446,36 @@ class ExternalMCPManager:
             "tool": raw_name,
             "content": content,
         }
+        if result.isError:
+            payload["error_type"] = "mcp_tool_error"
+            payload["message"] = self._content_error_message(content)
         if result.structuredContent is not None:
             payload["structured_content"] = result.structuredContent
         return payload
+
+    def _content_error_message(self, content: list[dict[str, Any]]) -> str:
+        for item in content:
+            text = item.get("text") or item.get("value")
+            if text:
+                return str(text).splitlines()[0][:500]
+        return "MCP tool returned an error result"
+
+    async def _call_tool_on_server_with_timeout(
+            self,
+            server: ExternalMCPServerConfig,
+            raw_name: str,
+            arguments: dict[str, Any],
+            timeout_seconds: float,
+    ) -> dict[str, Any]:
+        try:
+            return await asyncio.wait_for(
+                self._call_tool_on_server(server, raw_name, arguments, timeout_seconds=timeout_seconds),
+                timeout=timeout_seconds,
+            )
+        except asyncio.TimeoutError as error:
+            raise ExternalMCPToolTimeoutError(
+                f"External MCP tool '{raw_name}' timed out after {timeout_seconds:g}s"
+            ) from error
 
     def _call_tavily_search_rest(
             self,
@@ -554,11 +625,33 @@ class ExternalMCPManager:
             return item.model_dump(by_alias=True, exclude_none=True)
         return {"type": type(item).__name__, "value": str(item)}
 
+    def _tool_timeout_seconds(self, server: ExternalMCPServerConfig, raw_name: str) -> float:
+        timeout_seconds = _EXTERNAL_TOOL_TIMEOUT_SECONDS.get(
+            (server.name, raw_name),
+            max(float(server.timeout_seconds or 0), _DEFAULT_EXTERNAL_TOOL_TIMEOUT_SECONDS),
+        )
+        return max(1.0, float(timeout_seconds))
+
+    def _attach_call_metadata(
+            self,
+            result: Any,
+            started_at: float,
+            attempts: int,
+            timeout_seconds: float,
+    ) -> Any:
+        if isinstance(result, dict):
+            result.setdefault("elapsed_seconds", round(time.perf_counter() - started_at, 3))
+            result.setdefault("attempts", attempts)
+            result.setdefault("timeout_seconds", timeout_seconds)
+        return result
+
     def _leaf_exception(self, error: BaseException, seen: set[int] | None = None) -> BaseException:
         seen = seen or set()
         if id(error) in seen:
             return error
         seen.add(id(error))
+        if isinstance(error, ExternalMCPToolTimeoutError):
+            return error
         if isinstance(error, BaseExceptionGroup) and error.exceptions:
             return self._leaf_exception(error.exceptions[0], seen)
         cause = getattr(error, "__cause__", None)
@@ -606,18 +699,26 @@ class ExternalMCPManager:
             *,
             attempts: int = 1,
             fallback_error: BaseException | None = None,
+            started_at: float | None = None,
+            timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
         leaf = self._leaf_exception(error)
         message = str(leaf).strip() or type(leaf).__name__
+        is_timeout = isinstance(leaf, ExternalMCPToolTimeoutError)
         payload = {
             "ok": False,
             "server": server.name,
             "tool": raw_name,
-            "error_type": type(leaf).__name__,
+            "error_type": "tool_timeout" if is_timeout else type(leaf).__name__,
+            "retryable": bool(is_timeout or self._is_retryable_external_error(error)),
             "message": message,
             "detail": self._summarize_exception(error),
             "attempts": attempts,
         }
+        if started_at is not None:
+            payload["elapsed_seconds"] = round(time.perf_counter() - started_at, 3)
+        if timeout_seconds is not None:
+            payload["timeout_seconds"] = timeout_seconds
         if fallback_error is not None:
             payload["mcp_error"] = self._summarize_exception(fallback_error)
         return payload

@@ -370,6 +370,7 @@ class WebTool:
                 messages=[{"role": "system", "content": summarization_prompt},
                           {"role": "user", "content": user_content}],
                 temperature=0,
+                timeout=120,
             )
             summary = summary_response.choices[0].message.content
             return summary if summary else "未能生成总结。"

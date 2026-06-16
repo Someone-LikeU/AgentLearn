@@ -154,12 +154,32 @@ class ToolManager:
         ToolNameConstant.MAKE_PLAN: "runtime",
         ToolNameConstant.SUB_AGENT: "agent",
     }
+    # Agent 层展示/兜底使用的单工具建议超时；具体工具内部可有更精确的硬超时。
+    _TOOL_TIMEOUT_SECONDS = {
+        ToolNameConstant.GET_TIME: 2,
+        ToolNameConstant.READ_FILE: 10,
+        ToolNameConstant.WRITE_FILE: 20,
+        ToolNameConstant.EDIT: 20,
+        ToolNameConstant.LIST_DIR: 10,
+        ToolNameConstant.GLOB: 30,
+        ToolNameConstant.GREP: 45,
+        ToolNameConstant.EXECUTE_BASH: _BASH_TIMEOUT_SECONDS + _BASH_TERMINATE_GRACE_SECONDS,
+        ToolNameConstant.START_BACKGROUND_COMMAND: 15,
+        ToolNameConstant.CHECK_BACKGROUND_COMMAND: 5,
+        ToolNameConstant.READ_BACKGROUND_COMMAND_OUTPUT: 5,
+        ToolNameConstant.STOP_BACKGROUND_COMMAND: 15,
+        ToolNameConstant.WEB_SEARCH: 90,
+        ToolNameConstant.LOAD_SKILL_DETAIL_BY_NAME: 10,
+        ToolNameConstant.LOAD_FULL_MEMORY_CONTEXT: 20,
+        ToolNameConstant.MAKE_PLAN: 180,
+    }
     # MCP 默认能力（保守策略）：未配置时按不可并发读处理。
     _MCP_DEFAULT_CAPABILITY = {
         "is_concurrency_safe": False,
         "is_read_only": False,
         "is_destructive": False,
         "side_effect_scope": "external",
+        "timeout_seconds": 60,
     }
 
     def __init__(self, *, config: ToolManagerConfig, handlers: AgentToolHandlers, mcp_client=None):
@@ -285,6 +305,7 @@ class ToolManager:
                 "is_concurrency_safe": tool.spec.is_concurrency_safe,
                 "is_destructive": tool.spec.is_destructive,
                 "side_effect_scope": tool.spec.side_effect_scope,
+                "timeout_seconds": self._TOOL_TIMEOUT_SECONDS.get(tool_name),
             }
         capability = self._mcp_capabilities.get(tool_name, self._MCP_DEFAULT_CAPABILITY)
         return {
@@ -292,6 +313,7 @@ class ToolManager:
             "is_concurrency_safe": bool(capability.get("is_concurrency_safe")),
             "is_destructive": bool(capability.get("is_destructive")),
             "side_effect_scope": str(capability.get("side_effect_scope", "external")),
+            "timeout_seconds": capability.get("timeout_seconds"),
         }
 
     def _load_mcp_capabilities(self) -> dict[str, dict[str, Any]]:

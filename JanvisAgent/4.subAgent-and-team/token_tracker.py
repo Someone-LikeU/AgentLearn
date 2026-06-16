@@ -16,6 +16,8 @@ class TokenTracker:
         self.session_total_tokens = 0
         self.session_response_count = 0
         self.session_has_real_usage = False
+        self.session_has_context_usage = False
+        self.session_usage_source = None
 
     def update_context_window(self, max_context_tokens: int) -> int:
         self.max_context_tokens = self._normalize_context_window(max_context_tokens)
@@ -84,6 +86,8 @@ class TokenTracker:
         self.session_total_tokens = int(summary.get("total_tokens") or 0)
         self.session_response_count = int(summary.get("response_count") or 0)
         self.session_has_real_usage = bool(summary.get("has_real_usage"))
+        self.session_has_context_usage = bool(summary.get("has_context_usage") or summary.get("has_real_usage"))
+        self.session_usage_source = summary.get("usage_source")
 
     def clear_session_usage(self) -> None:
         self.session_prompt_tokens = 0
@@ -91,6 +95,8 @@ class TokenTracker:
         self.session_total_tokens = 0
         self.session_response_count = 0
         self.session_has_real_usage = False
+        self.session_has_context_usage = False
+        self.session_usage_source = None
 
     def session_usage_summary(self) -> dict[str, Any]:
         return {
@@ -99,6 +105,8 @@ class TokenTracker:
             "total_tokens": self.session_total_tokens,
             "response_count": self.session_response_count,
             "has_real_usage": self.session_has_real_usage,
+            "has_context_usage": self.session_has_context_usage,
+            "usage_source": self.session_usage_source,
         }
 
     def estimate_text_tokens(self, text: str | None) -> int:
