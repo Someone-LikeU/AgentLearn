@@ -65,7 +65,21 @@ JanvisAgent,纯Python实现的一个类ClaudeCode的Agent。Janvis意为**just a
 
 ![history命令和删除历史任务](JanvisAgent/4.subAgent-and-team/module_test/测试截图/history命令和删除历史任务.png)
 
+### 测试视频下载、理解能力
+
+![测试视频下载、理解能力](JanvisAgent/4.subAgent-and-team/module_test/测试截图/测试视频下载、理解能力.png)
+受本地部署的gemma模型qwen3.5模型大小的限制，图片描述的能力还不是很强，描述不是很准确，这里模型的执行过程还是可以的
+
+### 图片描述工具不给力你竟然就自己上网搜答案
+
+![图片描述工具不给力你竟然就自己上网搜答案](JanvisAgent/4.subAgent-and-team/module_test/测试截图/图片描述工具不给力你竟然就自己上网搜答案.png)
+图片描述工具多次执行的效果不一样，给模型造成了困惑，你竟然就转头想着上网搜答案，好家伙，歪打正着。
+
+
 ## 启动方式
+
+设计了使用本地llm的模式，如果使用本地的模型，需要先安装Ollama，在启动Agent之前先打开Ollama客户端或者在终端里运行命令"ollama serve"启动ollama
+否则使用请求本地模型时会报错。建议先手动运行![OllamaTest.py](JanvisAgent/OllamaTest.py)试试。
 
 优先在环境变量中设置你的OPENAI兼容的base_url和api_key，然后修改Agent_test.py中传入的这两个参数。
 或者直接传base_url和api_key的硬编码，需要注意信息安全风险。
@@ -84,6 +98,26 @@ python Agent_test.py
 ```
 
 如果使用指定的 Anaconda Python，可把上面的 `python` 替换为 `指定目录的python`。
+
+### 媒体工具依赖
+
+如果需要使用图片、音频、视频相关工具，除基础依赖外还需要安装以下软件或 Python 三方库：
+图片描述工具可以在安装Ollama并下载对应支持的模型后，修改local_vision_model.json中的配置名称
+- `ffmpeg` / `ffprobe`：用于视频、音频转码、抽帧和媒体元数据检测，需要加入系统 `PATH`。
+- `faster-whisper`：用于 `AUDIO_TRANSCRIBE` 和 `VIDEO_TRANSCRIBE`。
+- `transformers`：本地多模态和视觉模型相关依赖。
+- `easyocr`：用于 `IMAGE_OCR`，当前作为默认 OCR 后端使用。
+- `yt-dlp`：用于 YouTube 视频下载，优先下载 MP4/M4A 并合并为 MP4。
+- `you-get`：用于非 YouTube 的网页型视频下载。
+- `Deno` 或 `Node.js`：用于辅助 `yt-dlp` 处理 YouTube JS challenge，建议加入系统 `PATH`。
+
+推荐安装命令示例：
+
+```powershell
+指定目录的python -m pip install transformers faster-whisper easyocr yt-dlp you-get
+```
+
+YouTube 下载如果遇到登录或反机器人校验，需要导出有效 cookie 文件，并在工具调用时传入 `cookie_path`，例如 `D:\youtube_cookies.txt`。
 
 `Agent_test.py` 默认使用：
 

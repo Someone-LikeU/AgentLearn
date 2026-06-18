@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import mimetypes
 import os
@@ -74,7 +75,12 @@ class MediaTool:
     def image_ocr(self, path: str, languages: str = "eng+chi_sim") -> str:
         try:
             image_path = self._resolve_input_path(path)
-            payload = self._image_ocr_payload(image_path, languages=languages)
+            timeout_seconds = int(os.environ.get("JANVIS_IMAGE_OCR_TIMEOUT_SECONDS", "300"))
+            payload = self._run_image_ocr_worker(
+                image_path=image_path,
+                languages=languages,
+                timeout_seconds=timeout_seconds,
+            )
             payload["ok"] = bool(payload.get("text"))
             payload["backend"] = payload.get("ocr_backend")
             return self._json(payload)
@@ -229,45 +235,67 @@ class MediaTool:
             output_path: str | None = None,
             max_mb: int = 500,
             timeout_seconds: int = 120,
+            cookie_path: str | None = None,
     ) -> str:
         try:
             parsed = urllib.parse.urlparse(url)
             if parsed.scheme not in ("http", "https"):
                 raise ValueError("Only http and https URLs are supported.")
-            default_name = self._filename_from_url(parsed) or f"video_{self._now_stamp()}.mp4"
+            default_name = self._video_output_name(parsed)
             output = self._resolve_output_path(output_path or default_name, Path(default_name).stem, Path(default_name).suffix or ".mp4")
-            part_path = output.with_suffix(output.suffix + ".part")
-            request = urllib.request.Request(url, headers={"User-Agent": "JanvisAgent/1.0"})
-            max_bytes = int(max_mb) * 1024 * 1024
-            downloaded = 0
-            started = time.perf_counter()
-            with urllib.request.urlopen(request, timeout=int(timeout_seconds)) as response, open(part_path, "wb") as file:
-                while True:
-                    chunk = response.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    downloaded += len(chunk)
-                    if downloaded > max_bytes:
-                        return self._json(
-                            {
-                                "ok": False,
-                                "error_type": "FileTooLarge",
-                                "error": f"Download exceeded max_mb={max_mb}.",
-                                "partial_path": str(part_path),
-                                "downloaded_bytes": downloaded,
-                            }
-                        )
-                    file.write(chunk)
-            os.replace(part_path, output)
-            return self._json(
-                {
-                    "ok": True,
-                    "url": url,
-                    "path": str(output),
-                    "size_bytes": output.stat().st_size,
-                    "elapsed_seconds": round(time.perf_counter() - started, 3),
-                }
-            )
+            cookie_file = self._resolve_video_cookie_path(cookie_path)
+            if self._is_youtube_url(parsed):
+                downloader_result = self._download_video_with_ytdlp(
+                    url,
+                    output,
+                    max_mb=max_mb,
+                    timeout_seconds=timeout_seconds,
+                    cookie_path=cookie_file,
+                )
+                if downloader_result.get("ok") or downloader_result.get("requires_user_action"):
+                    return self._json(downloader_result)
+                direct_result = self._download_video_direct(url, output, max_mb=max_mb, timeout_seconds=timeout_seconds)
+                if direct_result.get("ok"):
+                    direct_result["fallback_from"] = "yt-dlp"
+                    return self._json(direct_result)
+                downloader_result["direct_fallback"] = self._compact_failed_tool_payload(direct_result)
+                return self._json(downloader_result)
+
+            if self._should_use_media_downloader_for_video_url(parsed):
+                downloader_result = self._download_video_with_you_get(
+                    url,
+                    output,
+                    max_mb=max_mb,
+                    timeout_seconds=timeout_seconds,
+                    cookie_path=cookie_file,
+                )
+                if downloader_result.get("ok") or downloader_result.get("requires_user_action"):
+                    return self._json(downloader_result)
+                direct_result = self._download_video_direct(url, output, max_mb=max_mb, timeout_seconds=timeout_seconds)
+                if direct_result.get("ok"):
+                    direct_result["fallback_from"] = "you-get"
+                    return self._json(direct_result)
+                downloader_result["direct_fallback"] = self._compact_failed_tool_payload(direct_result)
+                return self._json(downloader_result)
+
+            direct_result = self._download_video_direct(url, output, max_mb=max_mb, timeout_seconds=timeout_seconds)
+            if direct_result.get("ok"):
+                return self._json(direct_result)
+            if direct_result.get("error_type") in {"NonVideoResponse", "InvalidVideoFile"}:
+                downloader_result = self._download_video_with_you_get(
+                    url,
+                    output,
+                    max_mb=max_mb,
+                    timeout_seconds=timeout_seconds,
+                    cookie_path=cookie_file,
+                )
+                if downloader_result.get("ok"):
+                    downloader_result["fallback_from"] = direct_result.get("error_type")
+                    return self._json(downloader_result)
+                if downloader_result.get("requires_user_action"):
+                    return self._json(downloader_result)
+                direct_result["you_get_fallback"] = self._compact_failed_tool_payload(downloader_result)
+            return self._json(direct_result)
         except Exception as error:
             return self._json(self._error_payload(error))
 
@@ -383,6 +411,423 @@ class MediaTool:
             return self._json(result)
         except Exception as error:
             return self._json(self._error_payload(error))
+
+    def _download_video_direct(self, url: str, output: Path, *, max_mb: int, timeout_seconds: int) -> dict[str, Any]:
+        part_path = output.with_suffix(output.suffix + ".part")
+        request = urllib.request.Request(url, headers={"User-Agent": "JanvisAgent/1.0"})
+        max_bytes = int(max_mb) * 1024 * 1024
+        downloaded = 0
+        started = time.perf_counter()
+        content_type = ""
+        final_url = url
+        try:
+            with urllib.request.urlopen(request, timeout=int(timeout_seconds)) as response:
+                content_type = response.headers.get("Content-Type", "")
+                final_url = response.geturl()
+                if self._is_obvious_non_video_content_type(content_type):
+                    head = response.read(1024)
+                    return {
+                        "ok": False,
+                        "error_type": "NonVideoResponse",
+                        "error": f"URL returned non-video content type: {content_type or 'unknown'}.",
+                        "url": url,
+                        "final_url": final_url,
+                        "content_type": content_type,
+                        "response_head": self._decode_bytes(head)[:500],
+                        "elapsed_seconds": round(time.perf_counter() - started, 3),
+                    }
+                with open(part_path, "wb") as file:
+                    while True:
+                        chunk = response.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        downloaded += len(chunk)
+                        if downloaded > max_bytes:
+                            return {
+                                "ok": False,
+                                "error_type": "FileTooLarge",
+                                "error": f"Download exceeded max_mb={max_mb}.",
+                                "partial_path": str(part_path),
+                                "downloaded_bytes": downloaded,
+                                "elapsed_seconds": round(time.perf_counter() - started, 3),
+                            }
+                        file.write(chunk)
+        except Exception as error:
+            return self._error_payload(error, url=url, backend="direct_http", elapsed_seconds=round(time.perf_counter() - started, 3))
+
+        validation = self._validate_downloaded_video(part_path)
+        if not validation.get("ok"):
+            validation.update(
+                {
+                    "url": url,
+                    "final_url": final_url,
+                    "content_type": content_type,
+                    "partial_path": str(part_path),
+                    "size_bytes": part_path.stat().st_size if part_path.exists() else 0,
+                    "response_head": self._file_text_head(part_path),
+                    "elapsed_seconds": round(time.perf_counter() - started, 3),
+                }
+            )
+            return validation
+
+        os.replace(part_path, output)
+        return {
+            "ok": True,
+            "backend": "direct_http",
+            "url": url,
+            "final_url": final_url,
+            "path": str(output),
+            "size_bytes": output.stat().st_size,
+            "content_type": content_type,
+            "video": validation.get("video"),
+            "elapsed_seconds": round(time.perf_counter() - started, 3),
+        }
+
+    def _download_video_with_ytdlp(
+            self,
+            url: str,
+            output: Path,
+            *,
+            max_mb: int,
+            timeout_seconds: int,
+            cookie_path: Path | None,
+    ) -> dict[str, Any]:
+        started = time.perf_counter()
+        command = self._build_ytdlp_command(
+            url,
+            output,
+            max_mb=max_mb,
+            timeout_seconds=timeout_seconds,
+            cookie_path=cookie_path,
+        )
+        result = self._run_command(command, timeout=max(10, int(timeout_seconds)), cwd=output.parent)
+        downloaded_path = self._locate_downloaded_video(output)
+        combined_output = "\n".join([result.get("stdout") or "", result.get("stderr") or ""])
+        if not result.get("ok"):
+            cookie_failure = self._cookie_failure_type(combined_output, cookie_path=cookie_path)
+            payload = {
+                "ok": False,
+                "error_type": cookie_failure or "YtDlpFailed",
+                "error": "yt-dlp failed to download the video.",
+                "backend": "yt-dlp",
+                "url": url,
+                "returncode": result.get("returncode"),
+                "stdout_tail": result.get("stdout_tail"),
+                "stderr_tail": result.get("stderr_tail"),
+                "cookie_path": str(cookie_path) if cookie_path else None,
+                "elapsed_seconds": round(time.perf_counter() - started, 3),
+            }
+            if cookie_failure:
+                payload.update(self._video_cookie_required_payload(cookie_failure, cookie_path))
+            if downloaded_path.exists():
+                payload["partial_path"] = str(downloaded_path)
+            return payload
+        if not downloaded_path.exists():
+            return {
+                "ok": False,
+                "error_type": "DownloadedFileMissing",
+                "error": "yt-dlp finished but no output file was found.",
+                "backend": "yt-dlp",
+                "url": url,
+                "stdout_tail": result.get("stdout_tail"),
+                "stderr_tail": result.get("stderr_tail"),
+                "elapsed_seconds": round(time.perf_counter() - started, 3),
+            }
+        if downloaded_path.stat().st_size > int(max_mb) * 1024 * 1024:
+            return {
+                "ok": False,
+                "error_type": "FileTooLarge",
+                "error": f"Download exceeded max_mb={max_mb}.",
+                "backend": "yt-dlp",
+                "path": str(downloaded_path),
+                "size_bytes": downloaded_path.stat().st_size,
+                "elapsed_seconds": round(time.perf_counter() - started, 3),
+            }
+
+        validation = self._validate_downloaded_video(downloaded_path)
+        if not validation.get("ok"):
+            validation.update(
+                {
+                    "backend": "yt-dlp",
+                    "url": url,
+                    "path": str(downloaded_path),
+                    "size_bytes": downloaded_path.stat().st_size if downloaded_path.exists() else 0,
+                    "stdout_tail": result.get("stdout_tail"),
+                    "stderr_tail": result.get("stderr_tail"),
+                    "elapsed_seconds": round(time.perf_counter() - started, 3),
+                }
+            )
+            return validation
+        return {
+            "ok": True,
+            "backend": "yt-dlp",
+            "url": url,
+            "path": str(downloaded_path),
+            "size_bytes": downloaded_path.stat().st_size,
+            "video": validation.get("video"),
+            "cookie_path": str(cookie_path) if cookie_path else None,
+            "elapsed_seconds": round(time.perf_counter() - started, 3),
+        }
+
+    def _build_ytdlp_command(
+            self,
+            url: str,
+            output: Path,
+            *,
+            max_mb: int,
+            timeout_seconds: int,
+            cookie_path: Path | None,
+    ) -> list[str]:
+        command = [
+            sys.executable,
+            "-m",
+            "yt_dlp",
+            "--no-playlist",
+            "--force-overwrites",
+            "--socket-timeout",
+            str(max(5, int(timeout_seconds))),
+            "--retries",
+            "3",
+            "--fragment-retries",
+            "3",
+            "-f",
+            self._build_ytdlp_format_selector(max_mb),
+            "-S",
+            "res,ext:mp4:m4a",
+            "--merge-output-format",
+            "mp4",
+            "-o",
+            str(output),
+        ]
+        js_runtime = self._resolve_ytdlp_js_runtime()
+        if js_runtime:
+            command += ["--js-runtimes", js_runtime]
+        if cookie_path:
+            command += ["--cookies", str(cookie_path)]
+        command.append(url)
+        return command
+
+    @staticmethod
+    def _build_ytdlp_format_selector(max_mb: int) -> str:
+        total_limit_mb = max(1, int(max_mb))
+        video_limit_mb = max(1, int(total_limit_mb * 0.75))
+        return (
+            f"bv*[ext=mp4][filesize<{video_limit_mb}M]+ba[ext=m4a]/"
+            f"b[ext=mp4][filesize<{total_limit_mb}M]/"
+            f"bv*[filesize<{video_limit_mb}M]+ba/"
+            f"b[filesize<{total_limit_mb}M]/best"
+        )
+
+    def _resolve_ytdlp_js_runtime(self) -> str | None:
+        configured = os.environ.get("JANVIS_YTDLP_JS_RUNTIME")
+        if configured:
+            return configured
+
+        for name in ("deno", "node"):
+            resolved = shutil.which(name)
+            if resolved:
+                return f"{name}:{resolved}"
+
+        home = Path.home()
+        candidates = [
+            ("deno", home / "AppData" / "Local" / "Microsoft" / "WinGet" / "Packages" / "DenoLand.Deno_Microsoft.Winget.Source_8wekyb3d8bbwe" / "deno.exe"),
+            ("deno", home / ".deno" / "bin" / "deno.exe"),
+            ("node", Path(os.environ.get("ProgramFiles", "C:\\Program Files")) / "nodejs" / "node.exe"),
+            ("node", home / "AppData" / "Local" / "Programs" / "nodejs" / "node.exe"),
+        ]
+        for name, path in candidates:
+            if path.exists():
+                return f"{name}:{path}"
+        return None
+
+    def _download_video_with_you_get(
+            self,
+            url: str,
+            output: Path,
+            *,
+            max_mb: int,
+            timeout_seconds: int,
+            cookie_path: Path | None,
+    ) -> dict[str, Any]:
+        started = time.perf_counter()
+        command = self._build_you_get_command(url, output, timeout_seconds=timeout_seconds, cookie_path=cookie_path)
+        result = self._run_command(command, timeout=max(10, int(timeout_seconds)), cwd=output.parent)
+        downloaded_path = self._locate_downloaded_video(output)
+        combined_output = "\n".join([result.get("stdout") or "", result.get("stderr") or ""])
+        if not result.get("ok"):
+            cookie_failure = self._you_get_cookie_failure_type(combined_output, cookie_path=cookie_path)
+            payload = {
+                "ok": False,
+                "error_type": cookie_failure or "YouGetFailed",
+                "error": "you-get failed to download the video.",
+                "backend": "you-get",
+                "url": url,
+                "returncode": result.get("returncode"),
+                "stdout_tail": result.get("stdout_tail"),
+                "stderr_tail": result.get("stderr_tail"),
+                "cookie_path": str(cookie_path) if cookie_path else None,
+                "elapsed_seconds": round(time.perf_counter() - started, 3),
+            }
+            if cookie_failure:
+                payload.update(self._video_cookie_required_payload(cookie_failure, cookie_path))
+            if downloaded_path.exists():
+                payload["partial_path"] = str(downloaded_path)
+            return payload
+        if not downloaded_path.exists():
+            return {
+                "ok": False,
+                "error_type": "DownloadedFileMissing",
+                "error": "you-get finished but no output file was found.",
+                "backend": "you-get",
+                "url": url,
+                "stdout_tail": result.get("stdout_tail"),
+                "stderr_tail": result.get("stderr_tail"),
+                "elapsed_seconds": round(time.perf_counter() - started, 3),
+            }
+        if downloaded_path.stat().st_size > int(max_mb) * 1024 * 1024:
+            return {
+                "ok": False,
+                "error_type": "FileTooLarge",
+                "error": f"Download exceeded max_mb={max_mb}.",
+                "backend": "you-get",
+                "path": str(downloaded_path),
+                "size_bytes": downloaded_path.stat().st_size,
+                "elapsed_seconds": round(time.perf_counter() - started, 3),
+            }
+
+        validation = self._validate_downloaded_video(downloaded_path)
+        if not validation.get("ok"):
+            validation.update(
+                {
+                    "backend": "you-get",
+                    "url": url,
+                    "path": str(downloaded_path),
+                    "size_bytes": downloaded_path.stat().st_size if downloaded_path.exists() else 0,
+                    "stdout_tail": result.get("stdout_tail"),
+                    "stderr_tail": result.get("stderr_tail"),
+                    "elapsed_seconds": round(time.perf_counter() - started, 3),
+                }
+            )
+            return validation
+        return {
+            "ok": True,
+            "backend": "you-get",
+            "url": url,
+            "path": str(downloaded_path),
+            "size_bytes": downloaded_path.stat().st_size,
+            "video": validation.get("video"),
+            "cookie_path": str(cookie_path) if cookie_path else None,
+            "elapsed_seconds": round(time.perf_counter() - started, 3),
+        }
+
+    def _build_you_get_command(
+            self,
+            url: str,
+            output: Path,
+            *,
+            timeout_seconds: int,
+            cookie_path: Path | None,
+    ) -> list[str]:
+        command = [
+            sys.executable,
+            "-m",
+            "you_get",
+            "--force",
+            "--timeout",
+            str(max(5, int(timeout_seconds))),
+            "--output-dir",
+            str(output.parent),
+            "--output-filename",
+            output.stem,
+        ]
+        if cookie_path:
+            command += ["--cookies", str(cookie_path)]
+        command.append(url)
+        return command
+
+    @staticmethod
+    def _you_get_cookie_failure_type(output: str, *, cookie_path: Path | None) -> str | None:
+        return MediaTool._cookie_failure_type(output, cookie_path=cookie_path)
+
+    @staticmethod
+    def _cookie_failure_type(output: str, *, cookie_path: Path | None) -> str | None:
+        lowered = (output or "").lower()
+        markers = (
+            "cookie",
+            "cookies",
+            "login",
+            "sign in",
+            "not a bot",
+            "captcha",
+            "forbidden",
+            "403",
+            "unauthorized",
+            "verify",
+            "需要登录",
+            "请登录",
+        )
+        if not any(marker in lowered for marker in markers):
+            return None
+        return "CookieInvalidOrExpired" if cookie_path else "CookieRequired"
+
+    def _video_cookie_required_payload(self, error_type: str, cookie_path: Path | None) -> dict[str, Any]:
+        if cookie_path:
+            message = (
+                f"视频站点仍然拒绝访问，当前 cookie 可能已失效或不匹配：{cookie_path}。"
+                "请重新导出有效 cookie 文件，并在下一次请求中提供新的 cookie_path。"
+            )
+        else:
+            message = (
+                "视频站点要求登录或 cookie，当前任务无法继续。"
+                "请导出 cookie 到本地文件，并在下一次请求中提供 cookie_path，例如 D:\\my_youtube_cookies.txt。"
+            )
+        return {
+            "requires_user_action": True,
+            "retryable_with_cookie": True,
+            "message": message,
+            "hint": message,
+        }
+
+    def _validate_downloaded_video(self, file_path: Path) -> dict[str, Any]:
+        if not file_path.exists():
+            return {"ok": False, "error_type": "DownloadedFileMissing", "error": "Downloaded video file was not created."}
+        if file_path.stat().st_size <= 0:
+            return {"ok": False, "error_type": "EmptyFile", "error": "Downloaded video file is empty."}
+        if self._file_starts_like_text(file_path):
+            return {"ok": False, "error_type": "NonVideoResponse", "error": "Downloaded content looks like text or HTML, not a video file."}
+
+        probe = self._ffprobe(file_path)
+        if not probe.get("available"):
+            return {"ok": True, "video": {"validation": "ffprobe_unavailable", "warning": probe.get("error")}}
+        streams = probe.get("streams") or []
+        if not any(stream.get("codec_type") == "video" for stream in streams if isinstance(stream, dict)):
+            return {
+                "ok": False,
+                "error_type": "InvalidVideoFile",
+                "error": "Downloaded file does not contain a video stream.",
+                "ffprobe": self._compact_failed_tool_payload(probe),
+            }
+        return {"ok": True, "video": self._video_probe_summary(probe)}
+
+    def _video_probe_summary(self, probe: dict[str, Any]) -> dict[str, Any]:
+        format_info = probe.get("format") or {}
+        streams = [
+            {
+                "codec_type": stream.get("codec_type"),
+                "codec_name": stream.get("codec_name"),
+                "width": stream.get("width"),
+                "height": stream.get("height"),
+                "duration": stream.get("duration"),
+            }
+            for stream in (probe.get("streams") or [])
+            if isinstance(stream, dict) and stream.get("codec_type") in {"video", "audio"}
+        ]
+        return {
+            "format_name": format_info.get("format_name"),
+            "duration": format_info.get("duration"),
+            "bit_rate": format_info.get("bit_rate"),
+            "streams": streams,
+        }
 
     def _describe_with_ollama_vision(self, image_path: Path, *, prompt: str, model: str) -> dict[str, Any]:
         import httpx
@@ -726,9 +1171,19 @@ class MediaTool:
         except Exception as first_error:
             try:
                 import easyocr
+                import numpy as np
+                from PIL import Image
 
                 reader = easyocr.Reader(self._easyocr_languages(languages), gpu=True)
-                text = "\n".join(reader.readtext(str(image_path), detail=0)).strip()
+                # easyocr 传路径时会走 OpenCV，Windows 中文路径可能读取失败；改用内存图像。
+                image = Image.open(image_path)
+                if image.mode == "RGBA":
+                    background = Image.new("RGB", image.size, "white")
+                    background.paste(image, mask=image.getchannel("A"))
+                    image = background
+                else:
+                    image = image.convert("RGB")
+                text = "\n".join(reader.readtext(np.array(image), detail=0)).strip()
                 return {"path": str(image_path), "metadata": metadata, "ocr_backend": "easyocr", "text": text}
             except Exception as second_error:
                 return {
@@ -783,10 +1238,15 @@ class MediaTool:
             command += ["-ss", str(start_seconds)]
         return command
 
-    def _run_command(self, command: list[str], timeout: int) -> dict[str, Any]:
+    def _run_command(self, command: list[str], timeout: int, cwd: Path | None = None) -> dict[str, Any]:
         started = time.perf_counter()
         try:
-            result = subprocess.run(command, capture_output=True, timeout=timeout)
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                timeout=timeout,
+                cwd=str(cwd) if cwd else None,
+            )
         except subprocess.TimeoutExpired as error:
             return {
                 "ok": False,
@@ -883,7 +1343,7 @@ class MediaTool:
                 "elapsed_seconds": round(time.perf_counter() - started, 3),
             }
         try:
-            payload = json.loads(result.stdout or "{}")
+            payload = self._parse_worker_json_output(result.stdout or "{}")
         except json.JSONDecodeError:
             return {
                 "ok": False,
@@ -906,6 +1366,104 @@ class MediaTool:
             "error": "Audio transcription worker returned an unexpected JSON value.",
             "model": model_name,
             "output_format": output_format,
+            "elapsed_seconds": round(time.perf_counter() - started, 3),
+        }
+
+    def _parse_worker_json_output(self, stdout: str) -> Any:
+        text = (stdout or "").strip()
+        try:
+            return json.loads(text or "{}")
+        except json.JSONDecodeError:
+            pass
+
+        decoder = json.JSONDecoder()
+        last_payload: Any = None
+        for index, char in enumerate(text):
+            if char != "{":
+                continue
+            try:
+                payload, _ = decoder.raw_decode(text[index:])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict):
+                last_payload = payload
+        if last_payload is not None:
+            return last_payload
+        raise json.JSONDecodeError("No JSON object found in worker stdout.", text, 0)
+
+    def _run_image_ocr_worker(
+            self,
+            *,
+            image_path: Path,
+            languages: str,
+            timeout_seconds: int,
+    ) -> dict[str, Any]:
+        payload = {
+            "project_root": str(self.project_root),
+            "path": str(image_path),
+            "languages": languages,
+        }
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUTF8"] = "1"
+        env["PYTHONPATH"] = str(self.project_root) + os.pathsep + env.get("PYTHONPATH", "")
+        # Anaconda + torch/easyocr 在 Windows 上可能重复加载 OpenMP runtime，放在子进程里隔离。
+        env.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+        started = time.perf_counter()
+        try:
+            result = subprocess.run(
+                [sys.executable, str(Path(__file__).resolve()), "--image-ocr-worker"],
+                input=json.dumps(payload, ensure_ascii=False),
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+                cwd=str(self.project_root),
+                env=env,
+                timeout=max(1, int(timeout_seconds)),
+            )
+        except subprocess.TimeoutExpired as error:
+            return {
+                "path": str(image_path),
+                "ocr_backend": None,
+                "text": "",
+                "ocr_error": f"IMAGE_OCR timed out after {timeout_seconds}s.",
+                "stdout_tail": self._decode_text(error.stdout)[-2000:],
+                "stderr_tail": self._decode_text(error.stderr)[-2000:],
+                "elapsed_seconds": round(time.perf_counter() - started, 3),
+            }
+        if result.returncode != 0:
+            return {
+                "path": str(image_path),
+                "ocr_backend": None,
+                "text": "",
+                "ocr_error": "Image OCR worker failed.",
+                "returncode": result.returncode,
+                "stdout_tail": (result.stdout or "")[-2000:],
+                "stderr_tail": (result.stderr or "")[-4000:],
+                "elapsed_seconds": round(time.perf_counter() - started, 3),
+            }
+        try:
+            payload = self._parse_worker_json_output(result.stdout or "{}")
+        except json.JSONDecodeError:
+            return {
+                "path": str(image_path),
+                "ocr_backend": None,
+                "text": "",
+                "ocr_error": "Image OCR worker returned non-JSON output.",
+                "stdout_tail": (result.stdout or "")[-4000:],
+                "stderr_tail": (result.stderr or "")[-4000:],
+                "elapsed_seconds": round(time.perf_counter() - started, 3),
+            }
+        if isinstance(payload, dict):
+            payload.setdefault("elapsed_seconds", round(time.perf_counter() - started, 3))
+            if result.stderr and not payload.get("text"):
+                payload["worker_stderr_tail"] = result.stderr[-2000:]
+            return payload
+        return {
+            "path": str(image_path),
+            "ocr_backend": None,
+            "text": "",
+            "ocr_error": "Image OCR worker returned an unexpected JSON value.",
             "elapsed_seconds": round(time.perf_counter() - started, 3),
         }
 
@@ -1031,6 +1589,29 @@ class MediaTool:
             raise ValueError(f"Path is not a file: {path}")
         return path
 
+    def _resolve_optional_file_path(self, raw_path: str | None) -> Path | None:
+        if not raw_path:
+            return None
+        path = Path(str(raw_path)).expanduser()
+        if not path.is_absolute():
+            path = self.project_root / path
+        path = path.resolve()
+        if not path.exists():
+            raise FileNotFoundError(f"File does not exist: {path}")
+        if not path.is_file():
+            raise ValueError(f"Path is not a file: {path}")
+        return path
+
+    def _resolve_video_cookie_path(self, raw_path: str | None) -> Path | None:
+        # cookie 参数优先，其次兼容不同下载后端的环境变量。
+        candidate = (
+                raw_path
+                or os.environ.get("JANVIS_VIDEO_COOKIE_FILE")
+                or os.environ.get("JANVIS_YTDLP_COOKIE_FILE")
+                or os.environ.get("JANVIS_YOU_GET_COOKIE_FILE")
+        )
+        return self._resolve_optional_file_path(candidate)
+
     def _resolve_output_path(self, raw_path: str | None, default_stem: str, suffix: str) -> Path:
         if raw_path:
             path = Path(str(raw_path)).expanduser()
@@ -1055,6 +1636,102 @@ class MediaTool:
         if not resolved:
             raise FileNotFoundError(f"{name} not found in PATH.")
         return resolved
+
+    def _video_output_name(self, parsed: urllib.parse.ParseResult) -> str:
+        name = self._filename_from_url(parsed)
+        if name and Path(name).suffix.lower() in self._video_file_suffixes():
+            return name
+        return f"video_{self._now_stamp()}.mp4"
+
+    def _should_use_media_downloader_for_video_url(self, parsed: urllib.parse.ParseResult) -> bool:
+        host = (parsed.netloc or "").lower()
+        path_suffix = Path(urllib.parse.unquote(parsed.path)).suffix.lower()
+        known_page_hosts = (
+            "youtube.com",
+            "youtu.be",
+            "vimeo.com",
+            "bilibili.com",
+            "twitter.com",
+            "x.com",
+            "tiktok.com",
+            "facebook.com",
+            "instagram.com",
+        )
+        if any(host == item or host.endswith(f".{item}") for item in known_page_hosts):
+            return True
+        if path_suffix in {".m3u8", ".mpd"}:
+            return True
+        return bool(parsed.path and path_suffix not in self._video_file_suffixes())
+
+    @staticmethod
+    def _video_file_suffixes() -> set[str]:
+        return {".mp4", ".m4v", ".mov", ".webm", ".mkv", ".avi", ".flv", ".wmv", ".mpeg", ".mpg", ".ts"}
+
+    @staticmethod
+    def _is_youtube_url(parsed: urllib.parse.ParseResult) -> bool:
+        host = (parsed.netloc or "").lower()
+        return host == "youtu.be" or host.endswith(".youtu.be") or host == "youtube.com" or host.endswith(".youtube.com")
+
+    @staticmethod
+    def _is_obvious_non_video_content_type(content_type: str) -> bool:
+        normalized = (content_type or "").split(";", 1)[0].strip().lower()
+        if not normalized:
+            return False
+        if normalized.startswith("text/"):
+            return True
+        return normalized in {
+            "application/json",
+            "application/xml",
+            "application/xhtml+xml",
+            "application/vnd.apple.mpegurl",
+            "application/x-mpegurl",
+            "audio/mpegurl",
+        }
+
+    def _file_starts_like_text(self, file_path: Path) -> bool:
+        head = file_path.read_bytes()[:512].lstrip()
+        lowered = head[:128].lower()
+        return (
+            lowered.startswith(b"<!doctype html")
+            or lowered.startswith(b"<html")
+            or lowered.startswith(b"<?xml")
+            or lowered.startswith(b"#extm3u")
+        )
+
+    def _file_text_head(self, file_path: Path, limit: int = 500) -> str:
+        try:
+            return self._decode_bytes(file_path.read_bytes()[:limit])
+        except Exception:
+            return ""
+
+    def _locate_downloaded_video(self, expected_path: Path) -> Path:
+        if expected_path.exists():
+            return expected_path
+        candidates = [
+            path
+            for path in expected_path.parent.glob(f"{expected_path.stem}*")
+            if path.is_file() and path.suffix not in {".part", ".ytdl", ".temp"}
+        ]
+        if not candidates:
+            return expected_path
+        video_candidates = [path for path in candidates if path.suffix.lower() in self._video_file_suffixes()]
+        return max(video_candidates or candidates, key=lambda path: path.stat().st_mtime)
+
+    @staticmethod
+    def _compact_failed_tool_payload(payload: dict[str, Any]) -> dict[str, Any]:
+        keys = (
+            "ok",
+            "error_type",
+            "error",
+            "message",
+            "returncode",
+            "path",
+            "partial_path",
+            "content_type",
+            "stdout_tail",
+            "stderr_tail",
+        )
+        return {key: payload.get(key) for key in keys if key in payload and payload.get(key) is not None}
 
     def _filename_from_url(self, parsed: urllib.parse.ParseResult) -> str | None:
         name = Path(urllib.parse.unquote(parsed.path)).name
@@ -1130,15 +1807,33 @@ def _audio_transcribe_worker_main() -> int:
     try:
         payload = json.loads(sys.stdin.read() or "{}")
         tool = MediaTool(project_root=str(payload.get("project_root") or Path(__file__).resolve().parents[1]))
-        result = tool._audio_transcribe_in_process(
-            audio_path=Path(str(payload["path"])),
-            output_format=str(payload.get("output_format") or "txt"),
-            model_name=str(payload.get("model") or "base"),
-            language=payload.get("language"),
-            beam_size=int(payload.get("beam_size") or 5),
-        )
+        # 第三方转写库可能把日志写到 stdout，worker 的 stdout 只保留最终 JSON。
+        with contextlib.redirect_stdout(sys.stderr):
+            result = tool._audio_transcribe_in_process(
+                audio_path=Path(str(payload["path"])),
+                output_format=str(payload.get("output_format") or "txt"),
+                model_name=str(payload.get("model") or "base"),
+                language=payload.get("language"),
+                beam_size=int(payload.get("beam_size") or 5),
+            )
     except Exception as error:
         result = {"ok": False, "error_type": type(error).__name__, "error": str(error)}
+    sys.stdout.write(json.dumps(result, ensure_ascii=False, default=str))
+    return 0
+
+
+def _image_ocr_worker_main() -> int:
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+        tool = MediaTool(project_root=str(payload.get("project_root") or Path(__file__).resolve().parents[1]))
+        # OCR 框架会打印模型下载和初始化日志，stdout 只保留最终 JSON。
+        with contextlib.redirect_stdout(sys.stderr):
+            result = tool._image_ocr_payload(
+                image_path=Path(str(payload["path"])),
+                languages=str(payload.get("languages") or "eng+chi_sim"),
+            )
+    except Exception as error:
+        result = {"path": "", "ocr_backend": None, "text": "", "ocr_error": f"{type(error).__name__}: {error}"}
     sys.stdout.write(json.dumps(result, ensure_ascii=False, default=str))
     return 0
 
@@ -1146,3 +1841,5 @@ def _audio_transcribe_worker_main() -> int:
 if __name__ == "__main__":
     if "--audio-transcribe-worker" in sys.argv:
         raise SystemExit(_audio_transcribe_worker_main())
+    if "--image-ocr-worker" in sys.argv:
+        raise SystemExit(_image_ocr_worker_main())

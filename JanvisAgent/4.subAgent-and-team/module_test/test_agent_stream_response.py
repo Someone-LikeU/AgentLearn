@@ -219,6 +219,34 @@ class AgentStreamResponseTest(unittest.TestCase):
 		self.assertTrue(agent._is_tool_call_failure(result))
 		self.assertEqual(agent._tool_status_for_log(result), "RuntimeError")
 
+	def test_tool_result_requiring_user_action_stops_turn(self):
+		agent = self._agent()
+		appended_messages = []
+		printed_messages = []
+		agent._append_message = lambda message, **kwargs: appended_messages.append((message, kwargs)) or {}
+		agent.console = SimpleNamespace(print=lambda message: printed_messages.append(message))
+		agent._session_interrupted_recorded = False
+		guard_state = ToolFailureGuardState(active_tools=[], disabled_tools=set())
+		task = ToolCallTask(
+			tool_call_id="call_1",
+			function_name="VIDEO_DOWNLOAD",
+			raw_arguments='{"url":"https://example.com"}',
+			function_args={"url": "https://example.com"},
+		)
+		result = {
+			"ok": False,
+			"error_type": "CookieRequired",
+			"requires_user_action": True,
+			"message": "请提供 cookie_path。",
+		}
+
+		stop_reason = agent._append_tool_result_and_check_guard(task, result, guard_state)
+
+		self.assertEqual(stop_reason, "请提供 cookie_path。")
+		self.assertEqual(guard_state.executed_tool_count, 1)
+		self.assertIn("请提供 cookie_path。", printed_messages[-1])
+		self.assertIn("CookieRequired", appended_messages[-1][0]["content"])
+
 	def test_tool_call_chunks_are_merged_in_order(self):
 		agent = self._agent()
 		stream = [

@@ -267,6 +267,92 @@ class ToolManagerLocalToolsTest(unittest.TestCase):
         self.assertEqual(result["model"], "base")
         self.assertEqual(worker.call_args.kwargs["model_name"], "base")
 
+    def test_audio_worker_output_extracts_json_from_noisy_stdout(self):
+        noisy_stdout = 'loading model...\n{"ok": true, "content": "hello", "output_format": "txt"}\nfinished'
+
+        result = self.tm.media_tool._parse_worker_json_output(noisy_stdout)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["content"], "hello")
+
+    def test_image_ocr_uses_worker_result(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            image_path = Path(tmp) / "ocr.png"
+            image_path.write_bytes(b"not-a-real-image")
+
+            with patch.object(
+                self.tm.media_tool,
+                "_run_image_ocr_worker",
+                return_value={"path": str(image_path), "ocr_backend": "easyocr", "text": "hello"},
+            ) as worker:
+                result = json.loads(self.tm.available_functions[ToolNameConstant.IMAGE_OCR](path=str(image_path)))
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["backend"], "easyocr")
+        self.assertEqual(result["text"], "hello")
+        self.assertEqual(worker.call_args.kwargs["languages"], "eng+chi_sim")
+
+    def test_you_get_command_includes_optional_cookie_path(self):
+        output = self.project_root / "runtime_output" / "media" / "video_test.mp4"
+        cookie_path = self.project_root / "cookies.txt"
+
+        command = self.tm.media_tool._build_you_get_command(
+            "https://www.youtube.com/watch?v=test",
+            output,
+            timeout_seconds=120,
+            cookie_path=cookie_path,
+        )
+
+        self.assertIn("you_get", command)
+        self.assertIn("--cookies", command)
+        self.assertIn(str(cookie_path), command)
+        self.assertIn("--output-dir", command)
+        self.assertIn(str(output.parent), command)
+        self.assertIn("--output-filename", command)
+        self.assertIn(output.stem, command)
+
+    def test_ytdlp_command_prefers_mp4_and_cookie_path(self):
+        output = self.project_root / "runtime_output" / "media" / "youtube_test.mp4"
+        cookie_path = self.project_root / "youtube_cookies.txt"
+
+        command = self.tm.media_tool._build_ytdlp_command(
+            "https://www.youtube.com/watch?v=test",
+            output,
+            max_mb=50,
+            timeout_seconds=120,
+            cookie_path=cookie_path,
+        )
+
+        self.assertIn("yt_dlp", command)
+        self.assertIn("--cookies", command)
+        self.assertIn(str(cookie_path), command)
+        self.assertIn("-f", command)
+        self.assertIn("filesize<37M", command[command.index("-f") + 1])
+        self.assertIn("filesize<50M", command[command.index("-f") + 1])
+        self.assertIn("-S", command)
+        self.assertEqual(command[command.index("-S") + 1], "res,ext:mp4:m4a")
+        self.assertIn("--merge-output-format", command)
+        self.assertEqual(command[command.index("--merge-output-format") + 1], "mp4")
+        self.assertIn(str(output), command)
+
+    def test_youtube_video_download_uses_ytdlp_backend(self):
+        with patch.object(
+            self.tm.media_tool,
+            "_download_video_with_ytdlp",
+            return_value={"ok": True, "backend": "yt-dlp", "path": "video.mp4"},
+        ) as ytdlp, patch.object(
+            self.tm.media_tool,
+            "_download_video_with_you_get",
+            return_value={"ok": True, "backend": "you-get", "path": "video.mp4"},
+        ) as you_get:
+            result = json.loads(self.tm.video_download("https://www.youtube.com/watch?v=test"))
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["backend"], "yt-dlp")
+        ytdlp.assert_called_once()
+        self.assertEqual(ytdlp.call_args.kwargs["max_mb"], 500)
+        you_get.assert_not_called()
+
     def test_web_search_fallback_to_bing(self):
         duck_search = Mock(side_effect=TimeoutError("timed out"))
         bing_search = Mock(

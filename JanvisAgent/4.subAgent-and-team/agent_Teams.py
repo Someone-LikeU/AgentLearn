@@ -1597,6 +1597,13 @@ class Agent:
                 return parsed
         return None
 
+    def _tool_user_action_message(self, function_response) -> str | None:
+        payload = self._coerce_tool_result_payload(function_response)
+        if not payload or payload.get("requires_user_action") is not True:
+            return None
+        message = payload.get("message") or payload.get("hint") or "工具需要用户补充信息后才能继续。"
+        return str(message)
+
     def _is_tool_call_failure(self, function_response) -> bool:
         """判断工具结果是否表示失败。"""
         payload = self._coerce_tool_result_payload(function_response)
@@ -1844,6 +1851,12 @@ class Agent:
     ):
         self._append_tool_result(task, function_response)
         guard_state.executed_tool_count += 1
+        user_action_message = self._tool_user_action_message(function_response)
+        if user_action_message:
+            self.console.print(f"[yellow]{user_action_message}[/]")
+            self._record_session_interrupted("tool_requires_user_action")
+            return user_action_message
+
         if not self._is_tool_call_failure(function_response):
             guard_state.last_failure_key = None
             guard_state.consecutive_failure_count = 0

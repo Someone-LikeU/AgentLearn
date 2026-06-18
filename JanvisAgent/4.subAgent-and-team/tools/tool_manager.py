@@ -203,7 +203,7 @@ class ToolManager:
         ToolNameConstant.GET_VISION_MODELS: 5,
         ToolNameConstant.IMAGE_DESCRIBE: 120,
         ToolNameConstant.IMAGE_DOWNLOAD: 120,
-        ToolNameConstant.IMAGE_OCR: 60,
+        ToolNameConstant.IMAGE_OCR: 300,
         ToolNameConstant.IMAGE_TRANSFORM: 60,
         ToolNameConstant.AUDIO_TRANSCRIBE: 600,
         ToolNameConstant.AUDIO_CONVERT: 300,
@@ -1059,12 +1059,14 @@ class ToolManager:
             output_path: str | None = None,
             max_mb: int = 500,
             timeout_seconds: int = 120,
+            cookie_path: str | None = None,
     ) -> str:
         return self.media_tool.video_download(
             url,
             output_path=output_path,
             max_mb=max_mb,
             timeout_seconds=timeout_seconds,
+            cookie_path=cookie_path,
         )
 
     def video_extract_frames(

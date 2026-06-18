@@ -617,7 +617,7 @@
     "type": "function",
     "function": {
       "name": "VIDEO_DOWNLOAD",
-      "description": "Download a video from a URL to a local file. Use this when a task provides a video link and later video tools need a local path.",
+      "description": "Download a video from a URL to a local file, preferring MP4 when available. Use this when a task provides a video link and later video tools need a local path. Some sites require cookies; if a previous call asks for cookies, ask the user to export a valid cookies file and pass its local path as cookie_path.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -639,6 +639,10 @@
             "default": 120,
             "minimum": 5,
             "maximum": 1800
+          },
+          "cookie_path": {
+            "type": "string",
+            "description": "Optional local cookies file path for sites that require login or cookies. Use this only when the user has provided a cookies file path or a previous VIDEO_DOWNLOAD result asked for cookies."
           }
         },
         "required": [
